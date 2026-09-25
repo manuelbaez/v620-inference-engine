@@ -73,6 +73,10 @@ void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
     const std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(from), prompt.end());
     drop_snapshots_after(slot, from);
     const auto caps = plan_captures(prompt, from);
+    if (store_) {  // pin the saves' memory while the GPUs prefill
+        const size_t n = prompt.size(), chunks = size_t((int64_t(n) - from + e_.prefill_chunk() - 1) / e_.prefill_chunk());
+        store_->reserve((n - size_t(from)) / BlockStore::BLOCK + 2 * (caps.size() + chunks), caps.size() + chunks);
+    }
     size_t next = 0;
     e_.prefill(
         slot, rest, nullptr,

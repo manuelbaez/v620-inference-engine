@@ -155,7 +155,8 @@ The state that makes a prefix reusable:
 | PLE conv tail + last 2 tokens | ~0.4 MB per snapshot | |
 
 - **Keys:** blocks of 256 tokens, each hashed with its parent's hash (a hash
-  chain), kept in a radix tree. A lookup walks the prompt's block hashes.
+  chain). A lookup walks the prompt's block hashes. (Implemented: see "Block
+  store" below.)
 - **KV blocks** live in three tiers: VRAM, then pinned host RAM, then NVMe on
   `/main-storage` (the ZFS pool, 1.2 TB free). They are evicted by LRU with
   prefix-aware refcounts, so a parent can't go while a live child needs it.
@@ -321,33 +322,61 @@ Measured on short prompts: 2.5-2.6 tokens per step, 24.4 ms verification +
 production vLLM with MTP: ~56-65). Through the server, 4 concurrent requests
 reach 180 tok/s aggregate.
 
-## Host-RAM tier of the prefix cache (2026-09-25)
+## Block store: the shared host tier of the prefix cache (2026-09-25)
 
-A slot holds one conversation; when a new, unrelated prompt takes the slot,
-the slot's longest recurrent-state snapshot (normally the end of its last
-prompt) is copied with the KV of its positions to pinned host memory
-(`Engine::export_state`: ~81 KB per token plus ~126 MB of recurrent state for
-all ranks; 0.5 GB for 4k tokens). A later prompt that extends a saved one is
-restored into a slot (`import_state`) and only the new tokens are
-prefilled. Measured: 4,000 tokens restored in 0.07-0.1 s against a 2.7 s
-prefill; the result is bit-identical to continuing in place
-(`tests/gpu/test_host_tier`). Budget `QW_HOST_CACHE_GB` (default 128, LRU),
-entries of at least 1,024 tokens.
+The first host tier kept whole conversations: a saved entry was reused only
+when all of it was a prefix of the new prompt. Two agent conversations sharing
+a 12k-token system prompt shared nothing. The block store
+(`src/session/block_store.cpp`) replaces it.
 
-Disk tier (`src/session/disk_tier.cpp`, `QW_DISK_CACHE_DIR`,
-`QW_DISK_CACHE_GB`, default 200): every entry saved to RAM is also written to
-a file by a background thread (header with a state-layout id, tokens, last
-logits, each rank's state; written to a temporary name and renamed). The
-directory is indexed at startup, and a prompt that extends a stored
-conversation loads it into the RAM tier and restores it. Measured on the dev
-box's ZFS: 0.46 GB written in 0.1 s, loaded and restored in 0.46 s after a
-simulated restart, bit-identical to continuing in place. On shutdown (SIGTERM)
-the server stops its scheduler and saves every slot's newest snapshot too
-(`qw_persist`; 0.7 s for 4 slots of ~3.4k tokens), so no conversation is
-lost across restarts. Measured through the server: follow-up turns after a
-restart come back with the whole previous prompt cached, 0.37 s vs ~2 s.
-Together this is the
-LMCache role (RAM and disk tiers behind the GPU prefix cache), in-process.
+- **Blocks.** Prompts are cut into 256-token blocks keyed by a hash chain
+  (parent key + tokens; the tokens are compared on a hit, so collisions are
+  harmless). A block holds its positions' KV for every rank: K, V, raw and
+  compressed indexer keys of the 12 QSA layers and the MTP layer, 5.2 MB per
+  rank (`Engine::export_kv` / `import_kv`).
+- **Snapshots.** The recurrent state can't be rebuilt from KV, so a prompt
+  resumes at a snapshot: the GDN states, conv and PLE rings and MTP input at
+  the end of some block (31.5 MB per rank). The last block on a snapshot's
+  path may be partial (a leaf), so snapshots sit at any position.
+- **Where snapshots come from.** Prefill captures the state at any position
+  inside a chunk without splitting it: the GDN scan writes its state after a
+  given token, small kernels copy the conv and PLE rings as they stand there,
+  and the MTP input is that token's hidden (`Engine::Capture`, at most 4 per
+  chunk). The session captures before every chat message start
+  (`<|im_start|>`, `qw_set_boundary_token`) at least `QW_SNAP_MIN_GAP` (1024)
+  tokens apart, plus every chunk end and the prompt end, and saves each to the
+  store as soon as its chunk is done.
+- **Resume** = the deepest snapshot on the prompt's path, whoever stored it;
+  only blocks the slot doesn't already hold are copied in.
+- **Memory.** Pinned buffers come from arenas of ~250 MB per rank, allocated
+  on demand and freed when empty (a spare is kept). Pinning costs ~0.05-0.1 s
+  per arena, so a prefill tells the store what its saves will need and the
+  arenas are pinned by a background thread while the GPUs work. Budget
+  `QW_HOST_CACHE_GB` (default 128); LRU over nodes whose children hold nothing
+  in RAM; evicting a snapshot also drops the ancestor blocks no other snapshot
+  needs.
+- **Disk tier** (`src/session/disk_tier.cpp`, `QW_DISK_CACHE_DIR`,
+  `QW_DISK_CACHE_GB`, default 200): every block and snapshot is also written
+  as a file by a background thread (`<hash>.qwb`, `<hash>.qws`; temp name +
+  rename). The index is rebuilt from the files at startup; a restore reads
+  whatever is only on disk. On shutdown the server saves every slot's newest
+  snapshot (`qw_persist`).
+
+Measured (`bench/prefix_cache_bench`, `tests/gpu/test_block_store`,
+`test_snapshot_capture`, `test_host_tier`):
+
+| | |
+|---|---|
+| second conversation sharing a 12k-token system prompt | 6.1 s -> **0.34 s** (0.06 s restore + 400 new tokens) |
+| first conversation's saves (50 blocks, 3 snapshots) | ~40 ms on a 6.0 s prefill |
+| prefill of 16k tokens with 8 captures (the maximum) | -1.3% tok/s |
+| restore of 4k tokens from RAM / from disk after a restart | 0.02 s / 0.55 s |
+
+A store restore is bit-identical to restoring the same capture in VRAM. A
+mid-chunk capture differs from the state after a prefill split at that
+position only by the rounding noise between different chunkings (relative
+difference 0.04-0.07, the same as splitting the prefix itself differently).
+Decode and speculative decoding are unchanged.
 
 ## Adaptive draft count
 

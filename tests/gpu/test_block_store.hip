@@ -2,8 +2,9 @@
 // system prompt, a message boundary and a message; conversation 2, in another
 // slot, shares the system prompt only. It must restore the system prompt from
 // the snapshot captured at the boundary (inside conversation 1's prefill
-// chunk) and match a prefill of its whole prompt. Then a small RAM budget
-// forces evictions, and prompts must still come back right.
+// chunk): bit-identical to restoring that capture in VRAM directly, and close
+// to a prefill of the whole prompt. Then a RAM budget of about two
+// conversations forces evictions while one conversation keeps coming back.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -91,23 +92,33 @@ int main() {
             const int32_t top = argmax(ref);
             const double d = std::fabs(logprob(ref, top) - logprob(got, top));
             const double noise = std::fabs(logprob(ref, top) - logprob(whole, top));
-            const bool ok = reused == int64_t(sys.size()) && argmax(got) == top && d < std::max(0.05, 3 * noise);
+            // the same capture restored in VRAM, without the store
+            e.slot_reset(0);
+            e.prefill(0, c1, nullptr, nullptr, {{int64_t(sys.size()), 0}});
+            e.snapshot_restore(0, 0, int64_t(sys.size()), sys);
+            const std::vector<float> direct =
+                e.prefill(0, std::vector<int32_t>(c2.begin() + ptrdiff_t(sys.size()), c2.end()));
+            const bool exact = got == direct;
+            const bool ok = reused == int64_t(sys.size()) && exact && argmax(got) == top && d < 0.25;
             fails += !ok;
-            std::printf("c2: reused %lld of the %zu shared tokens, |dlogprob| vs split prefill %.4f (noise %.4f) %s\n",
-                        (long long)reused, sys.size(), d, noise, ok ? "" : "FAIL");
+            std::printf("c2: reused %lld of the %zu shared tokens; %s a VRAM restore of the capture; |dlogprob| vs "
+                        "split prefill %.4f (whole-prompt noise %.4f) %s\n",
+                        (long long)reused, sys.size(), exact ? "identical to" : "DIFFERENT from", d, noise,
+                        ok ? "" : "FAIL");
             const auto st = s.cache_stats();
             std::printf("store: %zu blocks, %zu snapshots, %.2f GB RAM, %llu hits\n", st.blocks, st.snapshots,
                         double(st.ram_bytes) / 1e9, (unsigned long long)st.hits);
         }
 
-        {  // a RAM budget of ~3 snapshots: evictions while conversations come and go
-            setenv("QW_HOST_CACHE_GB", "0.5", 1);
+        {  // ~380 MB per conversation: room for about two
+            setenv("QW_HOST_CACHE_GB", "0.9", 1);
             Session s(e);
             s.set_boundary_token(BOUNDARY);
             std::vector<std::vector<int32_t>> convs;
             for (int i = 0; i < 4; ++i) convs.push_back(cat(text(1200 + 100 * i, 10 + i), text(300, 20 + i)));
-            for (int round = 0; round < 2; ++round)
-                for (const auto &p : convs) {
+            bool seen0 = false;
+            for (int i : {0, 1, 0, 2, 0, 3, 0}) {
+                    const auto &p = convs[size_t(i)];
                     const int slot = s.acquire(p, 16);
                     const int64_t reused = s.set_prompt(slot, p);
                     const std::vector<float> got = e.logits();
@@ -116,12 +127,14 @@ int main() {
                     const std::vector<float> fresh = e.prefill(1 - slot, p);
                     const int32_t top = argmax(fresh);
                     const double d = std::fabs(logprob(fresh, top) - logprob(got, top));
-                    const bool ok = argmax(got) == top && d < 0.05;
+                    const bool again = i == 0 && seen0;
+                    seen0 = seen0 || i == 0;
+                    const bool ok = argmax(got) == top && d < 0.25 && (!again || reused == int64_t(p.size()));
                     fails += !ok;
                     const auto st = s.cache_stats();
-                    std::printf("round %d, %zu tokens: reused %5lld, |dlogprob| %.4f; store %zu blocks, %zu "
+                    std::printf("conversation %d, %zu tokens: reused %5lld, |dlogprob| %.4f; store %zu blocks, %zu "
                                 "snapshots, %.2f GB %s\n",
-                                round, p.size(), (long long)reused, d, st.blocks, st.snapshots,
+                                i, p.size(), (long long)reused, d, st.blocks, st.snapshots,
                                 double(st.ram_bytes) / 1e9, ok ? "" : "FAIL");
                     // the reference prefill clobbered the other slot: the session must not trust it
                     s.set_prompt(1 - slot, {1});

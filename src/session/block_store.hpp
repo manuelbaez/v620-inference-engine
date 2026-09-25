@@ -54,6 +54,9 @@ public:
     // the snapshot (with the logits after its last token, if given).
     void save(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits);
     bool has_snapshot(const std::vector<int32_t> &tokens) const;
+    // Pins memory for that many new blocks and snapshots in the background
+    // (call before a prefill whose saves will need it).
+    void reserve(size_t blocks, size_t snapshots);
     void flush();  // waits for the disk writes
 
     struct Stats {

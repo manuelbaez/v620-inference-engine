@@ -10,7 +10,9 @@
 #include <vector>
 
 #include "core/common.hpp"
+#include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
+#include "engine/rank.hpp"
 
 using namespace qw;
 
@@ -31,6 +33,58 @@ static double logprob(const std::vector<float> &l, int32_t tok) {
     return double(l[size_t(tok)] - mx) - std::log(z);
 }
 
+// Relative L2 differences of two snapshots' recurrent states at c tokens,
+// per part; for the rings, only the cells the next token reads.
+static std::vector<double> state_diff(Engine &e, int a, int b, int64_t c) {
+    const size_t n = Engine::recurrent_rank_bytes() / 4;
+    Engine::RankBufs ba{}, bb{};
+    for (int r = 0; r < RANKS; ++r) {
+        ba[size_t(r)] = pinned<uint8_t>(n * 4);
+        bb[size_t(r)] = pinned<uint8_t>(n * 4);
+    }
+    e.export_recurrent(a, ba);
+    e.export_recurrent(b, bb);
+    e.host_copies_wait();
+    // is float i of part k read by the token at position c?
+    auto used = [&](int k, size_t i) {
+        if (k == 1) {  // GDN ring [N_GDN][GDN_RING][GDN_QKV_L]: positions c-3 .. c-1
+            const int64_t cell = int64_t(i / GDN_QKV_L % GDN_RING);
+            for (int64_t q = c - (GDN_CONV - 1); q < c; ++q)
+                if (q >= 0 && q % GDN_RING == cell) return true;
+            return false;
+        }
+        if (k == 2) {  // PLE ring [PLE_RING][XW]: positions c - 3 * dilation .. c - 1
+            const int64_t cell = int64_t(i / XW);
+            for (int64_t q = c - (PLE_CONV - 1) * PLE_DILATION; q < c; ++q)
+                if (q >= 0 && q % PLE_RING == cell) return true;
+            return false;
+        }
+        return true;
+    };
+    const size_t parts[] = {SLOT_S, SLOT_RING, SLOT_PLE, size_t(XW)};
+    std::vector<double> out;
+    size_t off = 0;
+    for (int k = 0; k < 4; ++k) {
+        double d = 0, z = 0;
+        for (int r = 0; r < RANKS; ++r) {
+            const float *x = reinterpret_cast<const float *>(ba[size_t(r)]) + off;
+            const float *y = reinterpret_cast<const float *>(bb[size_t(r)]) + off;
+            for (size_t i = 0; i < parts[k]; ++i)
+                if (used(k, i)) {
+                    d += double(x[i] - y[i]) * (x[i] - y[i]);
+                    z += double(y[i]) * y[i];
+                }
+        }
+        out.push_back(std::sqrt(d / std::max(z, 1e-30)));
+        off += parts[k];
+    }
+    for (int r = 0; r < RANKS; ++r) {
+        (void)hipHostFree(ba[size_t(r)]);
+        (void)hipHostFree(bb[size_t(r)]);
+    }
+    return out;
+}
+
 static int32_t argmax(const std::vector<float> &l) {
     return int32_t(std::max_element(l.begin(), l.end()) - l.begin());
 }
@@ -38,7 +92,7 @@ static int32_t argmax(const std::vector<float> &l) {
 int main() {
     try {
         EngineOptions opt;
-        opt.slot_tokens = {8192};
+        opt.slot_tokens = {8192, 8192};
         opt.warmup = false;
         Engine e(opt);
         const auto P = text(5000, 1), tail = text(64, 2);
@@ -69,6 +123,23 @@ int main() {
         e.prefill(0, P, nullptr, nullptr, {{cuts[0], 2}, {cuts[1], 3}});
         for (int i = 0; i < 2; ++i) {
             const int64_t c = cuts[i];
+            // direct comparison with the state after a prefill split at c; noise floor:
+            // the same split, with the first part in two pieces (other GEMM shapes)
+            e.slot_reset(1);
+            e.prefill(1, slice(0, c));
+            e.snapshot_save(4, 1);
+            e.slot_reset(1);
+            e.prefill(1, slice(0, c / 2));
+            e.prefill(1, slice(c / 2, c));
+            e.snapshot_save(5, 1);
+            const auto d_cap = state_diff(e, 2 + i, 4, c), d_noise = state_diff(e, 5, 4, c);
+            const char *names[] = {"GDN state", "GDN ring", "PLE ring", "MTP input"};
+            for (int k = 0; k < 4; ++k) {
+                const bool ok = d_cap[size_t(k)] < std::max(1e-4, 3 * d_noise[size_t(k)]);
+                fails += !ok;
+                std::printf("  capture at %lld, %-9s rel. diff vs split prefill %.2e (noise %.2e) %s\n", (long long)c,
+                            names[k], d_cap[size_t(k)], d_noise[size_t(k)], ok ? "" : "FAIL");
+            }
             e.snapshot_restore(2 + i, 0, c, slice(0, c));
             const auto got = e.prefill(0, with_tail(slice(c, int64_t(P.size()))));
             e.slot_reset(0);  // reference: the prompt prefilled with a split at c

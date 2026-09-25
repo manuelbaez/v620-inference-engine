@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 
 #include "core/common.hpp"
 #include "core/config.hpp"
@@ -11,6 +12,7 @@ namespace qw {
 namespace {
 constexpr int KV_ARENA_UNITS = 48;   // ~250 MB per rank
 constexpr int SNAP_ARENA_UNITS = 8;  // ~250 MB per rank
+constexpr size_t KV_LOW_WATER = 8, SNAP_LOW_WATER = 2;  // free units kept ahead of need
 }  // namespace
 
 struct BlockStore::Payload {
@@ -38,9 +40,9 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     : e_(e), ram_budget_(ram_budget), disk_budget_(disk_budget) {
     for (int r = 0; r < RANKS; ++r) {
         kv_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(e_.kv_rank_bytes(BLOCK), KV_ARENA_UNITS, e_.rank_device(r));
+            std::make_unique<PinnedPool>(e_.kv_rank_bytes(BLOCK), KV_ARENA_UNITS, e_.rank_device(r), 0);
         snap_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r));
+            std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r), 0);
     }
     nodes_[ROOT] = Node{};
     if (!disk_dir.empty()) {
@@ -238,6 +240,8 @@ bool BlockStore::restore(const Hit &h, const std::vector<int32_t> &prompt, int s
 }
 
 void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits) {
+    static const bool trace = std::getenv("QW_TRACE") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     const int64_t n = int64_t(tokens.size());
     QW_CHECK(n > 0, "BlockStore::save: no tokens");
     std::vector<uint64_t> path, fresh;
@@ -276,7 +280,12 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
         ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + target.logits.size() * 4;
         ++stats_.snapshots_saved;
     }
+    const auto t1 = std::chrono::steady_clock::now();
     e_.host_copies_wait();
+    if (trace)
+        log("prefix cache: saved %lld tokens (%zu new blocks%s): enqueue %.1f ms, copies %.1f ms", (long long)n,
+            fresh.size(), new_snap ? ", snapshot" : "", std::chrono::duration<double, std::milli>(t1 - t0).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());
     for (uint64_t k : path) nodes_.at(k).used = ++clock_;
     if (disk_) {
         for (uint64_t k : fresh) {
@@ -316,10 +325,13 @@ bool BlockStore::has_snapshot(const std::vector<int32_t> &tokens) const {
     return h != ROOT && nodes_.at(h).has_snap;
 }
 
+// Removes a node and its descendants, then the ancestors left without any
+// snapshot below them (their blocks could never be restored).
 void BlockStore::remove_subtree(uint64_t k) {
     std::vector<uint64_t> stack{k};
+    uint64_t up = nodes_.at(k).parent;
     {  // unlink from the parent
-        Node &par = nodes_.at(nodes_.at(k).parent);
+        Node &par = nodes_.at(up);
         par.children.erase(std::remove(par.children.begin(), par.children.end(), k), par.children.end());
     }
     while (!stack.empty()) {
@@ -334,6 +346,10 @@ void BlockStore::remove_subtree(uint64_t k) {
             if (nd.snap_disk) disk_->remove(c, true);
         }
         nodes_.erase(c);
+    }
+    if (up != ROOT) {
+        const Node &par = nodes_.at(up);
+        if (par.children.empty() && !par.has_snap) remove_subtree(up);
     }
 }
 
@@ -370,6 +386,13 @@ void BlockStore::enforce_budgets() {
             if (k != ROOT && nd.children.empty() && (!victim || older(nd, nodes_.at(victim)))) victim = k;
         if (!victim) break;
         remove_subtree(victim);
+    }
+}
+
+void BlockStore::reserve(size_t blocks, size_t snapshots) {
+    for (int r = 0; r < RANKS; ++r) {
+        kv_pool_[size_t(r)]->reserve(blocks + KV_LOW_WATER);
+        snap_pool_[size_t(r)]->reserve(snapshots + SNAP_LOW_WATER);
     }
 }
 
