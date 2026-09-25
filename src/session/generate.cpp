@@ -1,5 +1,8 @@
 // Generation steps with MTP speculative decoding (Session::generate).
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "core/common.hpp"
 #include "core/config.hpp"
@@ -12,7 +15,31 @@ void Session::set_stop_tokens(int slot, std::vector<int32_t> ids) {
     slots_[size_t(slot)].stop = std::move(ids);
 }
 
+namespace {
+// QW_TRACE: phase times of generate(), printed every 100 steps
+struct GenTrace {
+    bool on = std::getenv("QW_TRACE") != nullptr;
+    double t[5] = {};
+    int steps = 0;
+    std::chrono::steady_clock::time_point last;
+    void start() { last = std::chrono::steady_clock::now(); }
+    void lap(int i) {
+        const auto now = std::chrono::steady_clock::now();
+        t[i] += std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+    void step() {
+        if (!on || ++steps % 100) return;
+        std::printf("generate: first drafts %.2f, rows %.2f, decode %.2f, sample+accept %.2f, drafts %.2f ms/step\n",
+                    t[0] / steps, t[1] / steps, t[2] / steps, t[3] / steps, t[4] / steps);
+        std::fflush(stdout);
+    }
+};
+GenTrace g_trace;
+}  // namespace
+
 const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq> &reqs, int k) {
+    g_trace.start();
     out_.assign(reqs.size(), {});
     if (reqs.empty()) return out_;
     const int n = int(reqs.size());
@@ -40,6 +67,7 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         }
     }
 
+    g_trace.lap(0);
     // verification batch: pending token + drafts per request
     std::vector<Engine::Row> rows;
     std::vector<int> n_drafts(reqs.size(), 0);
@@ -53,7 +81,9 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         rows.push_back({rq.slot, rq.pending});
         for (int j = 0; j < n_drafts[i]; ++j) rows.push_back({rq.slot, si.drafts[size_t(j)]});
     }
+    g_trace.lap(1);
     decode(rows);
+    g_trace.lap(2);
 
     // sample rows while they confirm the drafts; keep that prefix
     std::vector<Engine::DraftReq> next;
@@ -86,6 +116,7 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
             which.push_back(i);
         }
     }
+    g_trace.lap(3);
     if (!next.empty()) {
         const auto &d = e_.draft(next, k_max);
         for (size_t j = 0; j < which.size(); ++j) {
@@ -94,6 +125,8 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
             si.drafts_for = out_[which[j]].tokens.back();
         }
     }
+    g_trace.lap(4);
+    g_trace.step();
     return out_;
 }
 

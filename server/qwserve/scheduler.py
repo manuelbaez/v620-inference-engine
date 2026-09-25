@@ -2,6 +2,7 @@
 
 import sys
 import threading
+import time
 
 from .engine import Sampling
 
@@ -43,6 +44,7 @@ class Scheduler:
     def __init__(self, engine, mtp_drafts=3):
         self.e = engine
         self.k = mtp_drafts if engine.has_mtp else 0
+        self.stats = {"steps": 0, "rows": 0, "tokens": 0, "time": 0.0}  # decode steps, request-steps, emitted tokens
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
@@ -115,7 +117,13 @@ class Scheduler:
             return
         batch = self.active[:16]
         self.active = self.active[16:] + batch  # round-robin past 16 requests (at most num_slots anyway)
+        t0 = time.time()
         res = self.e.generate([(r.slot, r.next, r.limit - r.generated, r.sampling) for r in batch], self.k)
+        st = self.stats
+        st["time"] += time.time() - t0
+        st["steps"] += 1
+        st["rows"] += len(batch)
+        st["tokens"] += sum(len(t) for t, _, _, _ in res)
         for r, (toks, lps, first, _) in zip(batch, res):
             for j, (tid, lp) in enumerate(zip(toks, lps)):
                 top = self.e.top_logprobs(first + j, r.want_top) if r.want_top else None

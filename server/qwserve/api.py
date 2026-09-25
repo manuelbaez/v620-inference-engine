@@ -61,7 +61,11 @@ class Server:
 
     # --- handlers
     async def health(self, _):
-        return web.json_response({"status": "ok"})
+        st = dict(self.sched.stats)
+        if st["rows"]:
+            st["tokens_per_request_step"] = round(st["tokens"] / st["rows"], 3)
+            st["ms_per_step"] = round(1e3 * st["time"] / st["steps"], 2)
+        return web.json_response({"status": "ok", "decode": st})
 
     async def models(self, _):
         return web.json_response({"object": "list", "data": [{
