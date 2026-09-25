@@ -147,7 +147,8 @@ void Engine::dispatch() {
         done_cv_.wait(lk, [&] { return done_ == RANKS; });
     }
     if (!error_.empty()) fail(error_);
-    if (comm_->error() || comm2_->error()) fail("collective timed out");
+    if (comm_->error()) fail("collective timed out: " + Comm::describe_error(comm_->error()));
+    if (comm2_->error()) fail("collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error()));
 }
 
 void Engine::slot_reset(int slot) {

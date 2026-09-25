@@ -94,33 +94,32 @@ void embed_T(float *X, const float *emb, int T, hipStream_t s) {
 }
 
 // ---- batched decode rows (one phase)
+// One block per (row, stream).
 __global__ __launch_bounds__(256) void hc_pre_B_kernel(float *X, const float *pend, const float *inj, const float *w1,
                                                        __half *y, float *send) {
     __shared__ float red[8];
-    const int r = blockIdx.x;
-    float *x = X + size_t(r) * XW;
-    __half *yr = y + size_t(r) * XW;
-    for (int s = 0; s < HC; ++s) {
-        const float wgt = pend ? 2.f * sigmoid(inj[r * HC + s] / HC) : 0.f;
-        float ss = 0.f;
-        for (int j = threadIdx.x; j < SH; j += blockDim.x) {
-            const int i = s * SH + j;
-            float v = x[i];
-            if (pend) {
-                v += pend[size_t(r) * SH + j] * wgt;
-                x[i] = v;
-            }
-            yr[i] = __float2half(v * w1[i]);
-            ss += v * v;
+    const int r = blockIdx.x, st = blockIdx.y;
+    float *x = X + size_t(r) * XW + st * SH;
+    __half *yr = y + size_t(r) * XW + st * SH;
+    const float *w = w1 + st * SH;
+    const float wgt = pend ? 2.f * sigmoid(inj[r * HC + st] / HC) : 0.f;
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < SH; j += blockDim.x) {
+        float v = x[j];
+        if (pend) {
+            v += pend[size_t(r) * SH + j] * wgt;
+            x[j] = v;
         }
-        ss = block_sum<8>(ss, red);
-        if (threadIdx.x == 0) send[size_t(r) * HC_SEND + s] = ss;
+        yr[j] = __float2half(v * w[j]);
+        ss += v * v;
     }
+    ss = block_sum<8>(ss, red);
+    if (threadIdx.x == 0) send[size_t(r) * HC_SEND + st] = ss;
 }
 
 void hc_pre_B(float *X, const float *pend, const float *inj, const float *w1, uint16_t *y, float *send, int M,
               hipStream_t s) {
-    hc_pre_B_kernel<<<M, 256, 0, s>>>(X, pend, inj, w1, reinterpret_cast<__half *>(y), send);
+    hc_pre_B_kernel<<<dim3(M, HC), 256, 0, s>>>(X, pend, inj, w1, reinterpret_cast<__half *>(y), send);
 }
 
 __global__ __launch_bounds__(256) void hc_up_mix_B_kernel(const float *red_all, const uint4 *up, const __half *y_all,

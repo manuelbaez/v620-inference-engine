@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -47,6 +48,8 @@ int main() {
         std::vector<std::vector<float>> par(RANKS), prs(RANKS);
         std::vector<std::vector<uint16_t>> pag(RANKS);
         const int iters = 2000;
+        // latency by payload: decode-batch shapes, fp32 vs fp16 (rank 0's timings)
+        std::vector<std::string> sweep;
         auto rank_fn = [&](int r) {
             CK(hipSetDevice(comm.device(r)));
             hipStream_t s;
@@ -105,6 +108,29 @@ int main() {
                 CK(hipStreamSynchronize(s));
                 flat_ms[size_t(r)] =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - f0).count() / 10 * 1e3;
+                uint32_t k = 7000;
+                auto time_us = [&](auto &&op) {
+                    CK(hipStreamSynchronize(s));
+                    const auto a = std::chrono::steady_clock::now();
+                    for (int i = 0; i < 200; ++i) op(k++);
+                    CK(hipStreamSynchronize(s));
+                    return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / 200 * 1e6;
+                };
+                for (int M : {1, 4, 16}) {
+                    const double a32 = time_us([&](uint32_t kk) { comm.allreduce(r, ps, pd, 1300, kk, s, M); });
+                    const double a16 = time_us([&](uint32_t kk) { comm.allreduce(r, hs, pd, 1304, kk, s, M, true); });
+                    const double r32 = time_us([&](uint32_t kk) { comm.reduce_scatter(r, ps, pd, 640, kk, s, M); });
+                    const double r16 =
+                        time_us([&](uint32_t kk) { comm.reduce_scatter(r, hs, pd, 640, kk, s, M, true); });
+                    if (r == 0) {
+                        char line[200];
+                        std::snprintf(line, sizeof line,
+                                      "M=%2d: HC allreduce fp32 %.1f / fp16 %.1f us, reduce-scatter fp32 %.1f / fp16 "
+                                      "%.1f us",
+                                      M, a32, a16, r32, r16);
+                        sweep.push_back(line);
+                    }
+                }
             }
             // latency: a chain of small allreduces (5.2 KB, the HC mix size)
             auto t0 = std::chrono::steady_clock::now();
@@ -116,6 +142,7 @@ int main() {
         for (int r = 0; r < RANKS; ++r) th.emplace_back(rank_fn, r);
         for (auto &t : th) t.join();
         QW_CHECK(comm.error() == 0, "a receive timed out");
+        for (auto &l : sweep) std::printf("%s\n", l.c_str());
 
         int bad = 0;
         for (int r = 0; r < RANKS; ++r) {

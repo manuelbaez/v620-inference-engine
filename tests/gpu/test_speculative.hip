@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -84,6 +85,13 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
             }
             q.steps += 1;
             q.accepted += keep - 1;
+            if (std::getenv("QW_SPEC_LOG")) {
+                std::printf("step %d len %zu drafts", q.steps, q.out.size());
+                for (int j = 0; j + 1 < n_rows[i]; ++j) std::printf(" %d", q.drafts[size_t(j)]);
+                std::printf(" | sampled");
+                for (int32_t t : next) std::printf(" %d", t);
+                std::printf("\n");
+            }
             t = now();
             e.accept(q.slot, keep);
             g_time.accept += now() - t;

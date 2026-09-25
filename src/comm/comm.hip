@@ -3,6 +3,7 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <string>
 
 #include "core/common.hpp"
@@ -90,8 +91,9 @@ struct RecvArgs {
     uint32_t k;
     int op;
     int wait;  // poll the flags here (else a preceding wait kernel did)
+    int rank;
     void *dst;
-    uint32_t *err;
+    uint32_t *err;  // shared by all ranks (coherent host memory)
 };
 
 // Polling is done by a handful of threads only: many blocks spinning on
@@ -103,8 +105,16 @@ __device__ void wait_flags(const RecvArgs &a, int par, uint32_t seq) {
         long spins = 0;
         while (__hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
             __builtin_amdgcn_s_sleep(2);
-            if (++spins > SPIN_LIMIT) {
-                *a.err = 1;
+            // after one timeout every wait gives up at once: the engine fails in
+            // seconds instead of timing out collective after collective
+            if ((++spins & 1023) == 0 && __hip_atomic_load(a.err, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM)) break;
+            if (spins > SPIN_LIMIT) {
+                // first timeout wins: waiting rank, missing source, sequence offset k
+                const uint32_t code = 0x80000000u | (uint32_t(a.rank) << 28) | (uint32_t(threadIdx.x) << 24) |
+                                      (a.k & 0xffffffu);
+                uint32_t expected = 0;
+                __hip_atomic_compare_exchange_strong(a.err, &expected, code, __ATOMIC_RELAXED, __ATOMIC_RELAXED,
+                                                     __HIP_MEMORY_SCOPE_SYSTEM);
                 break;
             }
         }
@@ -201,6 +211,12 @@ Comm::~Comm() {
     (void)hipHostFree(err_);
 }
 
+std::string Comm::describe_error(uint32_t e) {
+    if (!e) return "no error";
+    return "rank " + std::to_string((e >> 28) & 7) + " timed out waiting for rank " + std::to_string((e >> 24) & 15) +
+           " at collective offset " + std::to_string(e & 0xffffffu);
+}
+
 void Comm::set_base(int r, uint32_t base, hipStream_t s) {
     // The staging word is only rewritten after the previous step synchronized.
     *base_host_[size_t(r)] = base;
@@ -229,7 +245,11 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     pa.rank = r;
     const int blocks = int(std::min<size_t>(rows > 1 ? std::min<size_t>(MAX_BLOCKS, size_t(rows)) : MAX_BLOCKS,
                                             (bytes + BLOCK_BYTES - 1) / BLOCK_BYTES));
-    pa.concurrent = bytes <= BLOCK_BYTES;
+    // Measured (tests/gpu/test_comm): all peers at once wins up to ~32 KB;
+    // above that, rotating destinations is up to 2x faster.
+    static const size_t concurrent_max =
+        std::getenv("QW_COMM_CONCURRENT_MAX") ? size_t(std::atol(std::getenv("QW_COMM_CONCURRENT_MAX"))) : 32768;
+    pa.concurrent = bytes <= concurrent_max;
     push_kernel<<<pa.concurrent ? RANKS : std::max(blocks, 1), 256, 0, s>>>(pa);
     RecvArgs ra;
     ra.recv = recv_[size_t(r)];
@@ -240,9 +260,12 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     ra.base = base_[size_t(r)];
     ra.k = k;
     ra.op = int(op);
+    ra.rank = r;
     ra.dst = dst;
     ra.err = err_;
-    const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS / 16 + 4095) / 4096)));
+    static const size_t recv_bytes =
+        std::getenv("QW_COMM_RECV_BYTES") ? size_t(std::atol(std::getenv("QW_COMM_RECV_BYTES"))) : 65536;
+    const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS + recv_bytes - 1) / recv_bytes)));
     ra.wait = rblocks == 1;
     if (!ra.wait) wait_kernel<<<1, 64, 0, s>>>(ra);
     recv_kernel<<<rblocks, 256, 0, s>>>(ra);

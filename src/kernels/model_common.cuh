@@ -219,28 +219,33 @@ __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *
     }
 }
 
-// HEAD_DIM threads: merge the ATT_BLOCKS partials, apply the sigmoid gate.
+// One block of HEAD_DIM threads per (query, head h): merge the ATT_BLOCKS
+// partials of head h, apply the sigmoid gate. The per-block (m, l) pairs are
+// staged in shared memory in one parallel read, so the accumulator loads are
+// independent (no chain of dependent global reads).
 template <typename G>
-__device__ inline void combine_body(const float *partial, const G *gate, __half *out) {
+__device__ inline void combine_body(const float *partial, const G *gate, __half *out, int h) {
     constexpr int NH = QSA_LOCAL_HEADS;
+    __shared__ float sm[ATT_BLOCKS], sl[ATT_BLOCKS];
     const int d = threadIdx.x;
-    for (int h = 0; h < NH; ++h) {
-        float M = -INFINITY;
-        for (int b = 0; b < ATT_BLOCKS; ++b) {
-            const float *r = partial + (size_t(b) * NH + h) * ATT_REC;
-            if (r[1] > 0.f) M = fmaxf(M, r[0]);
-        }
-        float L = 0.f, o = 0.f;
-        for (int b = 0; b < ATT_BLOCKS; ++b) {
-            const float *r = partial + (size_t(b) * NH + h) * ATT_REC;
-            if (r[1] > 0.f) {
-                const float c = __expf(r[0] - M);
-                L += r[1] * c;
-                o += r[2 + d] * c;
-            }
-        }
-        out[h * HEAD_DIM + d] = __float2half(o / L * sigmoid(float(gate[h * HEAD_DIM + d])));
+    if (d < ATT_BLOCKS) {
+        const float *r = partial + (size_t(d) * NH + h) * ATT_REC;
+        sl[d] = r[1];
+        sm[d] = r[1] > 0.f ? r[0] : -INFINITY;
     }
+    __syncthreads();
+    float M = -INFINITY;
+#pragma unroll
+    for (int b = 0; b < ATT_BLOCKS; ++b) M = fmaxf(M, sm[b]);
+    float L = 0.f, o = 0.f;
+#pragma unroll
+    for (int b = 0; b < ATT_BLOCKS; ++b)
+        if (sl[b] > 0.f) {
+            const float c = __expf(sm[b] - M);
+            L += sl[b] * c;
+            o += partial[(size_t(b) * NH + h) * ATT_REC + 2 + d] * c;
+        }
+    out[h * HEAD_DIM + d] = __float2half(o / L * sigmoid(float(gate[h * HEAD_DIM + d])));
 }
 
 // 512 threads (one per expert): softmax over the router logits, then the

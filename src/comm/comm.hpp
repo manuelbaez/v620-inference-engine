@@ -27,6 +27,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 #include "core/shard.hpp"
 
@@ -64,8 +65,10 @@ public:
     // dst[t][q*bytes ..] = src_q[t][..]              (bytes per rank per row, multiple of 16)
     void allgather(int r, const void *src, void *dst, size_t bytes, uint32_t k, hipStream_t s, int rows = 1);
 
-    // Nonzero after a receive spun too long (a peer died or diverged).
+    // Nonzero after a receive spun too long (a peer died or diverged):
+    // 0x80000000 | waiting rank << 28 | missing source rank << 24 | sequence offset k.
     uint32_t error() const { return *err_; }
+    static std::string describe_error(uint32_t e);
 
 private:
     enum Op { SUM_F32 = 0, SUM_F16 = 1, CONCAT = 2 };

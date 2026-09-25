@@ -57,6 +57,114 @@ void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *
     moe_scatter_kernel<<<(T * TOP_K + 255) / 256, 256, 0, s>>>(tok_e, offsets, fill, T, tok_slot, pair_tok);
 }
 
+// Decode rows (M <= 32), one block: wave w routes row w (top-10 of its 512
+// logits by repeated wave argmax, ties to the lowest index; weights are the
+// softmax renormalized over the top-10, so the full softmax cancels out),
+// then the block counts pairs per local expert, scans the offsets and gives
+// each pair a deterministic slot (row-major order within an expert).
+__global__ __launch_bounds__(1024) void moe_route_B_kernel(const float *logits, int M, int first, int32_t *counts,
+                                                           int32_t *offsets, float *tok_w, int32_t *tok_slot,
+                                                           int32_t *pair_tok) {
+    constexpr int PER = N_EXPERTS / WAVE;  // 16 logits per lane
+    __shared__ int s_e[32 * TOP_K];
+    __shared__ int s_cnt[EXP_L], s_off[EXP_L + 1];
+    const int t = threadIdx.x, lane = t % WAVE, w = t / WAVE;
+    if (t < EXP_L) s_cnt[t] = 0;
+    if (w < M) {
+        float v[PER];
+        const float *l = logits + size_t(w) * N_EXPERTS;
+#pragma unroll
+        for (int i = 0; i < PER; ++i) v[i] = l[lane + WAVE * i];
+        float topv = 0.f, lmax = 0.f, sum = 0.f;
+        int topi = 0;
+        for (int k = 0; k < TOP_K; ++k) {
+            float bv = -INFINITY;
+            int bi = 0x7fffffff;
+#pragma unroll
+            for (int i = 0; i < PER; ++i)
+                if (v[i] > bv) {  // ascending index per lane: the first max wins
+                    bv = v[i];
+                    bi = lane + WAVE * i;
+                }
+#pragma unroll
+            for (int o = WAVE / 2; o > 0; o >>= 1) {
+                const float ov = __shfl_xor(bv, o, WAVE);
+                const int oi = __shfl_xor(bi, o, WAVE);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == bi % WAVE) {
+#pragma unroll
+                for (int i = 0; i < PER; ++i)
+                    if (i == bi / WAVE) v[i] = -INFINITY;
+            }
+            if (k == 0) lmax = bv;
+            const float e = __expf(bv - lmax);
+            sum += e;
+            if (lane == k) {
+                topv = e;
+                topi = bi;
+            }
+        }
+        if (lane < TOP_K) {
+            const bool local = topi >= first && topi < first + EXP_L;
+            s_e[w * TOP_K + lane] = local ? topi - first : -1;
+            tok_w[w * TOP_K + lane] = topv / sum;
+        }
+    }
+    __syncthreads();
+    const int n_pairs = M * TOP_K;
+    if (t < n_pairs && s_e[t] >= 0) atomicAdd(&s_cnt[s_e[t]], 1);
+    __syncthreads();
+    if (w == 0) {  // exclusive scan of 128 counts: 4 per lane
+        int c[EXP_L / WAVE], run = 0;
+#pragma unroll
+        for (int i = 0; i < EXP_L / WAVE; ++i) {
+            c[i] = s_cnt[lane * (EXP_L / WAVE) + i];
+            run += c[i];
+        }
+        int incl = run;
+#pragma unroll
+        for (int o = 1; o < WAVE; o <<= 1) {
+            const int n = __shfl_up(incl, o, WAVE);
+            if (lane >= o) incl += n;
+        }
+        int acc = incl - run;
+#pragma unroll
+        for (int i = 0; i < EXP_L / WAVE; ++i) {
+            const int e = lane * (EXP_L / WAVE) + i;
+            s_off[e] = acc;
+            offsets[e] = acc;
+            counts[e] = c[i];
+            acc += c[i];
+        }
+        if (lane == WAVE - 1) {
+            s_off[EXP_L] = acc;
+            offsets[EXP_L] = acc;
+        }
+    }
+    __syncthreads();
+    if (t < n_pairs) {
+        const int e = s_e[t];
+        if (e < 0) {
+            tok_slot[t] = -1;
+        } else {
+            int before = 0;
+            for (int j = 0; j < t; ++j) before += s_e[j] == e;
+            const int slot = s_off[e] + before;
+            tok_slot[t] = slot;
+            pair_tok[slot] = t / TOP_K;
+        }
+    }
+}
+
+void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t *offsets, float *tok_w,
+                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s) {
+    moe_route_B_kernel<<<1, 1024, 0, s>>>(logits, M, first, counts, offsets, tok_w, tok_slot, pair_tok);
+}
+
 __global__ void moe_combine_T_kernel(const __half *yp, const int32_t *tok_slot, const float *tok_w,
                                      const __half *shared, __half *out) {
     const int t = blockIdx.x;

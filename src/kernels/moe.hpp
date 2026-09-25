@@ -16,6 +16,11 @@ void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *t
 void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *offsets, int32_t *fill,
                    int32_t *tok_slot, int32_t *pair_tok, hipStream_t s);
 
+// Decode rows (M <= 32): routing, counts, offsets [129] and pair slots in one
+// kernel (the per-pair outputs of moe_route_T + moe_scatter_T, no pre-zeroing).
+void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t *offsets, float *tok_w,
+                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s);
+
 // ---- routed experts (moe_experts.hip, moe_w4a8.hip)
 // For every (token, expert) pair: h[slot] = silu(gate x) * up x,
 // yp[slot] = down h (fp16). tiles: scratch of 2*(T*10/32 + 128) + 1 ints.

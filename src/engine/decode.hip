@@ -81,9 +81,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
 
         mix(w.mlp_hc, b.out_attn, b.inj_attn, b.inj_mlp);
         gemv(w.router, N_EXPERTS, H, b.bin, b.router);
-        CK(hipMemsetAsync(b.ecounts, 0, EXP_L * 4, s));
-        gpu::moe_route_T(b.router, M, r * EXP_L, b.tok_e, b.tok_w, b.ecounts, s);
-        gpu::moe_scatter_T(b.tok_e, b.ecounts, M, b.offsets, b.fill, b.tok_slot, b.pair_tok, s);
+        gpu::moe_route_B(b.router, M, r * EXP_L, b.ecounts, b.offsets, b.tok_w, b.tok_slot, b.pair_tok, s);
         if (M <= moe_pair_max)
             gpu::moe_experts_P(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.offsets, b.pair_tok, b.bin, M, b.moe_h, b.yp,
                                s);
@@ -155,6 +153,25 @@ static void launch_graph(hipStream_t s, hipGraphExec_t &g, uint32_t &n_coll, con
     CK(hipGraphLaunch(g, s));
 }
 
+namespace {
+// QW_TRACE: host-side phases of decode steps, per row count
+struct DecodeTrace {
+    bool on = std::getenv("QW_TRACE") != nullptr;
+    double prep[17] = {}, graph[17] = {}, copy[17] = {}, total[17] = {};
+    int n[17] = {};
+    static double ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    }
+    void report(int M) {
+        if (++n[M] % 50) return;
+        std::printf("decode M=%d: host prep %.2f, graph %.2f (rank 0), copy %.2f (rank 0), total %.2f ms\n", M,
+                    prep[M] / n[M], graph[M] / n[M], copy[M] / n[M], total[M] / n[M]);
+        std::fflush(stdout);
+    }
+};
+DecodeTrace g_dtrace;
+}  // namespace
+
 void Engine::run_decode_rank(Rank &rk) {
     const int r = rk.r, M = djob_.M;
     hipStream_t s = rk.s;
@@ -179,8 +196,14 @@ void Engine::run_decode_rank(Rank &rk) {
     const int kind = djob_.save ? 1 : 0;
     auto &g = rk.graphs[size_t(kind)][size_t(M)];
     auto &nc = rk.n_coll[size_t(kind)][size_t(M)];
+    const auto t0 = std::chrono::steady_clock::now();
     launch_graph(s, g, nc, [&] { return record_batch(rk, M, kind); });
     rk.seq_base += nc;
+    if (g_dtrace.on && r == 0) {
+        CK(hipStreamSynchronize(s));
+        g_dtrace.graph[M] += DecodeTrace::ms(t0, std::chrono::steady_clock::now());
+    }
+    const auto t1 = std::chrono::steady_clock::now();
     CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
     CK(hipMemcpyAsync(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
     CK(hipStreamSynchronize(s));
@@ -188,6 +211,7 @@ void Engine::run_decode_rank(Rank &rk) {
     for (int i = 0; i < M; ++i)
         std::memcpy(dlogits_.data() + size_t(i) * VOCAB + size_t(r) * VOCAB_L, b.h_logits + size_t(i) * VOCAB_L,
                     VOCAB_L * 4);
+    if (g_dtrace.on && r == 0) g_dtrace.copy[M] += DecodeTrace::ms(t1, std::chrono::steady_clock::now());
 }
 
 void Engine::run_mtp_rank(Rank &rk) {
@@ -250,6 +274,7 @@ void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t>
 }
 
 const std::vector<float> &Engine::decode(const std::vector<Row> &rows) {
+    const auto t_start = std::chrono::steady_clock::now();
     const int M = int(rows.size());
     constexpr int MR = gpu::MAX_ROWS;
     std::vector<int64_t> pos(static_cast<size_t>(M));
@@ -281,6 +306,8 @@ const std::vector<float> &Engine::decode(const std::vector<Row> &rows) {
         for (int j = 0; j < H; ++j) dple_[size_t(i) * H + j] = f32_to_f16(e[size_t(j)]);
     }
     dlogits_.assign(size_t(M) * VOCAB, 0.f);
+    const auto t_disp = std::chrono::steady_clock::now();
+    if (g_dtrace.on) g_dtrace.prep[M] += DecodeTrace::ms(t_start, t_disp);
     job_ = Job::Decode;
     dispatch();
     dlse_.resize(size_t(M));
@@ -306,6 +333,10 @@ const std::vector<float> &Engine::decode(const std::vector<Row> &rows) {
         sh.hist.push_back(rows[size_t(i)].token);
         if (sh.hist.size() > 32) sh.hist.erase(sh.hist.begin());
         sh.pend_valid = mtp_;
+    }
+    if (g_dtrace.on) {
+        g_dtrace.total[M] += DecodeTrace::ms(t_start, std::chrono::steady_clock::now());
+        g_dtrace.report(M);
     }
     return dlogits_;
 }
