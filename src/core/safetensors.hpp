@@ -62,6 +62,11 @@ public:
 
     const std::vector<std::unique_ptr<MappedFile>> &files() const { return files_; }
     bool has(const std::string &name) const { return tensors_.count(name) != 0; }
+    // Unmaps every file (views into them become invalid).
+    void clear() {
+        tensors_.clear();
+        files_.clear();
+    }
     const TensorView &get(const std::string &name) const;
     // get() plus a dtype and shape check.
     const TensorView &get(const std::string &name, DType dt, std::vector<int64_t> shape) const;

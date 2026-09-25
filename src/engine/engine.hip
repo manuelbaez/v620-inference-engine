@@ -28,7 +28,8 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
-    ple_->pin_in_background();
+    // QW_PLE_PIN=1: lock the n-gram table in RAM instead of leaving it in page cache
+    ple_->pin_in_background(std::getenv("QW_PLE_PIN") != nullptr);
     const size_t slot = std::max<size_t>(64 * 1024, size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096);
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
     comm2_ = std::make_unique<Comm>(opt_.devices, slot);
@@ -52,6 +53,11 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         load_rank_weights(rk, st_, pool, mtp_);
         alloc_rank_buffers(rk, opt_, max_slot_tokens(), mtp_);
         log("rank %d loaded", r);
+    }
+    {  // keep the token embeddings (host-side lookups); unmap the checkpoint
+        const TensorView &emb = st_.get("model.language_model.embed_tokens.weight", DType::BF16, {VOCAB, H});
+        embed_.assign(emb.u16(), emb.u16() + size_t(VOCAB) * H);
+        st_.clear();
     }
     if (saturated_weights)
         log("warning: %lld bf16 weights saturated to fp16 range", (long long)saturated_weights.load());

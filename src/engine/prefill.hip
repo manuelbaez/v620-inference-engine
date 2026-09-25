@@ -271,7 +271,6 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];
     QW_CHECK(sh.len + int64_t(tokens.size()) <= slot_capacity(slot), "prefill exceeds the slot's capacity");
-    const TensorView &emb = st_.get("model.language_model.embed_tokens.weight");
     if (all_logits) all_logits->clear();
     const bool all = all_logits != nullptr;
     if (all) {  // lm_head output for a whole chunk
@@ -291,7 +290,7 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
         for (int t = 0; t < T; ++t) {
             QW_CHECK(chunk[size_t(t)] >= 0 && chunk[size_t(t)] < VOCAB, "token out of range");
             for (int j = 0; j < H; ++j)
-                pemb_[size_t(t) * H + j] = bf16_to_f32(emb.u16()[size_t(chunk[size_t(t)]) * H + j]);
+                pemb_[size_t(t) * H + j] = bf16_to_f32(embed_[size_t(chunk[size_t(t)]) * H + j]);
         }
         auto ids = hasher_.ids_for(sh.hist, chunk);
         std::vector<float> e(H);

@@ -173,11 +173,11 @@ void PleTable::prefetch() const {
         for (auto &f : s->files()) f->prefetch();
 }
 
-void PleTable::pin_in_background() {
-    pin_thread_ = std::thread([this] {
+void PleTable::pin_in_background(bool lock) {
+    pin_thread_ = std::thread([this, lock] {
         const auto t0 = std::chrono::steady_clock::now();
         size_t bytes = 0;
-        bool pinned = true;
+        bool pinned = lock;
         for (const auto &st : shards_)
             for (const auto &f : st->files()) {
                 if (stop_pin_) return;
@@ -187,7 +187,10 @@ void PleTable::pin_in_background() {
                 }
                 bytes += f->size();
             }
-        log("PLE table: %.1f GB %s in RAM in %.0f s", double(bytes) / 1e9, pinned ? "pinned" : "read (mlock refused)",
+        log("PLE table: %.1f GB %s in RAM in %.0f s", double(bytes) / 1e9,
+            pinned ? "pinned"
+            : lock ? "read (mlock refused)"
+                   : "read (page cache)",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     });
 }

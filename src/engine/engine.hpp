@@ -147,7 +147,8 @@ private:
     void dispatch();  // run the current job on every rank and wait
 
     EngineOptions opt_;
-    SafeTensors st_;
+    SafeTensors st_;               // checkpoint, mapped only while loading
+    std::vector<uint16_t> embed_;  // token embeddings, bf16 [VOCAB][H] (host-side lookups)
     std::unique_ptr<PleTable> ple_;
     NgramHasher hasher_;
     std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch

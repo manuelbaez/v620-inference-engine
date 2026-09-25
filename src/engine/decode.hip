@@ -253,7 +253,6 @@ void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t>
     djob_.i32.assign(5 * MR, 0);
     djob_.pos.assign(MR, 0);
     demb_.resize(size_t(M) * H);
-    const TensorView &emb = st_.get("model.language_model.embed_tokens.weight");
     int n_runs = 0;
     for (int i = 0; i < M; ++i) {
         const Row &row = rows[size_t(i)];
@@ -271,7 +270,7 @@ void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t>
         djob_.i32[size_t(MR + i)] = djob_.i32[size_t(2 * MR + n_runs - 1)];  // row_first
         djob_.pos[size_t(i)] = pos[size_t(i)];
         QW_CHECK(pos[size_t(i)] >= 0 && pos[size_t(i)] < slot_capacity(row.slot), "batch: slot is full");
-        for (int j = 0; j < H; ++j) demb_[size_t(i) * H + j] = bf16_to_f32(emb.u16()[size_t(row.token) * H + j]);
+        for (int j = 0; j < H; ++j) demb_[size_t(i) * H + j] = bf16_to_f32(embed_[size_t(row.token) * H + j]);
     }
 }
 

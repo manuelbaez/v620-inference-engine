@@ -51,10 +51,11 @@ public:
     void gather(const NgramIds &ids, float *out) const;
     // Asks the kernel to page the table in.
     void prefetch() const;
-    // Pins the table in RAM from a background thread, shard by shard (falls
-    // back to reading it once if mlock is refused). Decoding gathers random
-    // rows per token: an uncached table costs a disk read per row.
-    void pin_in_background();
+    // Reads the table into RAM from a background thread, shard by shard:
+    // decoding gathers random rows per token, and an uncached table costs a
+    // disk read per row. lock: also mlock it (never evicted, but the memory is
+    // taken for good); otherwise it is page cache the kernel may reclaim.
+    void pin_in_background(bool lock);
     ~PleTable();
 
 private:
