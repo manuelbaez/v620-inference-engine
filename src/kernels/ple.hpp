@@ -14,9 +14,10 @@ namespace qw::gpu {
 // ---- prefill: kv fp16 [T][3200]; send [T][16]
 void ple_stats_T(const uint16_t *kv, const float *X, const float *nk, const float *nq, int T, float *send,
                  hipStream_t s);
-// X += gv + silu(dilated_conv(norm_conv(gv))); ring by position.
+// X += gv + silu(dilated_conv(norm_conv(gv))); ring by position. Captures in
+// (start, start + T] get the ring as it stands at their position.
 void ple_apply_T(const uint16_t *kv, const float *red, const float *nc, const float *conv_w, float *ring, int64_t start,
-                 int T, float *ncbuf, float *X, hipStream_t s);
+                 int T, float *ncbuf, float *X, hipStream_t s, const Captures &cap = {});
 
 // ---- batched decode rows: kv f32 [M][3200]
 void ple_stats_B(const float *kv, const float *X, const float *nk, const float *nq, int M, float *send, hipStream_t s);

@@ -65,7 +65,26 @@ __global__ void gdn_ring_update_kernel(const __half *P, float *ring, int64_t sta
         ring[int(q % GDN_RING) * GDN_QKV_L + ch] = __half2float(P[size_t(q - start) * GDN_PROJ_L + ch]);
 }
 
-void gdn_ring_update_T(const uint16_t *P, float *ring, int64_t start, int T, hipStream_t s) {
+// The whole ring as it stands at position c (start < c <= start + T).
+__global__ void gdn_ring_capture_kernel(const __half *P, const float *ring, int64_t start, int64_t c, float *dst) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= GDN_QKV_L) return;
+    for (int64_t q = c - GDN_RING; q < c; ++q) {
+        const int cell = int((q + GDN_RING) % GDN_RING);
+        float x = 0.f;
+        if (q >= start)
+            x = __half2float(P[size_t(q - start) * GDN_PROJ_L + ch]);
+        else if (q >= 0)
+            x = ring[cell * GDN_QKV_L + ch];
+        dst[cell * GDN_QKV_L + ch] = x;
+    }
+}
+
+void gdn_ring_update_T(const uint16_t *P, float *ring, int64_t start, int T, hipStream_t s, const Captures &cap) {
+    for (int i = 0; i < cap.n; ++i)
+        if (cap.pos[i] > start && cap.pos[i] <= start + T)
+            gdn_ring_capture_kernel<<<GDN_QKV_L / 256, 256, 0, s>>>(reinterpret_cast<const __half *>(P), ring, start,
+                                                                     cap.pos[i], cap.dst[i]);
     gdn_ring_update_kernel<<<GDN_QKV_L / 256, 256, 0, s>>>(reinterpret_cast<const __half *>(P), ring, start, T);
 }
 
@@ -73,7 +92,7 @@ void gdn_ring_update_T(const uint16_t *P, float *ring, int64_t start, int T, hip
 // j = slice*32 + c, k-rows rg*16 .. +16. Columns of the delta-rule state are
 // independent, so slices need no communication.
 __global__ __launch_bounds__(256) void gdn_scan_T_kernel(const float *qkv, const float *gb, float *S, int T,
-                                                         float *o_raw) {
+                                                         float *o_raw, int64_t start, Captures cap) {
     __shared__ float red[8][32], red2[8][32];
     const int h = blockIdx.x / 4, slice = blockIdx.x % 4;
     const int kh = h / (GDN_V_HEADS / GDN_QK_HEADS);
@@ -115,13 +134,20 @@ __global__ __launch_bounds__(256) void gdn_scan_T_kernel(const float *qkv, const
             for (int g = 0; g < 8; ++g) o += red2[g][c];
             o_raw[size_t(t) * GDN_VL * GDN_DIM + h * GDN_DIM + j] = o;
         }
+        for (int i = 0; i < cap.n; ++i)
+            if (cap.pos[i] == start + t + 1) {
+                float *D = cap.dst[i] + size_t(h) * GDN_DIM * GDN_DIM;
+#pragma unroll
+                for (int k = 0; k < 16; ++k) D[(rg * 16 + k) * GDN_DIM + j] = s[k];
+            }
     }
 #pragma unroll
     for (int i = 0; i < 16; ++i) Sh[(rg * 16 + i) * GDN_DIM + j] = s[i];
 }
 
-void gdn_scan_T(const float *qkv, const float *gb, float *S, int T, float *o_raw, hipStream_t s) {
-    gdn_scan_T_kernel<<<GDN_VL * 4, 256, 0, s>>>(qkv, gb, S, T, o_raw);
+void gdn_scan_T(const float *qkv, const float *gb, float *S, int T, float *o_raw, hipStream_t s, int64_t start,
+                const Captures &cap) {
+    gdn_scan_T_kernel<<<GDN_VL * 4, 256, 0, s>>>(qkv, gb, S, T, o_raw, start, cap);
 }
 
 // grid (T, 12), 128 threads

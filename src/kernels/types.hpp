@@ -34,6 +34,16 @@ struct SlotPtrs {
     float *mtp_pend;  // [HC][SH] pre-final-mixer hidden of the slot's last token (MTP input)
 };
 
+// Recurrent-state captures inside a prefill chunk: dst[i] receives the state
+// as it stands after position pos[i] - 1 (a snapshot at pos[i] tokens),
+// laid out like the slot's copy of that state.
+constexpr int MAX_CAPTURES = 4;
+struct Captures {
+    int n = 0;
+    int64_t pos[MAX_CAPTURES] = {};
+    float *dst[MAX_CAPTURES] = {};
+};
+
 struct Rows {
     const int32_t *slot;       // [M]
     const int64_t *pos;        // [M]

@@ -27,6 +27,11 @@ class StepReq(ctypes.Structure):
     ]
 
 
+class CacheStats(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint64) for name in (
+        "hits", "tokens_restored", "snapshots_saved", "ram_bytes", "disk_bytes", "blocks", "snapshots")]
+
+
 class Engine:
     """ctypes wrapper of the slot C API. Not thread-safe: only the scheduler
     thread calls it."""
@@ -48,6 +53,8 @@ class Engine:
             "qw_top_logprobs": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int, I32P, FP]),
             "qw_has_mtp": (ctypes.c_int, [P]),
             "qw_persist": (ctypes.c_int, [P]),
+            "qw_set_boundary_token": (ctypes.c_int, [P, ctypes.c_int32]),
+            "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
                                            I32P, I32P]),
@@ -119,6 +126,15 @@ class Engine:
         self._check(self.lib.qw_generate(self.h, n, arr, k, toks, lps, counts, firsts, stopped))
         return [(list(toks[i * w:i * w + counts[i]]), list(lps[i * w:i * w + counts[i]]), firsts[i], bool(stopped[i]))
                 for i in range(n)]
+
+    def set_boundary_token(self, token_id):
+        """Token that starts a chat message: prefill snapshots the state before it."""
+        self._check(self.lib.qw_set_boundary_token(self.h, token_id))
+
+    def cache_stats(self):
+        s = CacheStats()
+        self._check(self.lib.qw_get_cache_stats(self.h, ctypes.byref(s)))
+        return {name: getattr(s, name) for name, _ in CacheStats._fields_}
 
     def persist(self):
         """Saves the slots' conversations to the disk prefix cache."""

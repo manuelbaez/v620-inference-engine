@@ -52,14 +52,25 @@ public:
     int64_t slot_capacity(int slot) const;
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
+    int prefill_chunk() const { return opt_.prefill_chunk; }
     // Empties a slot (its state is zeroed lazily by the next prefill/decode).
     void slot_reset(int slot);
 
+    // A recurrent-state snapshot taken during prefill at `pos` tokens of the
+    // slot (inside a chunk, without splitting it) into VRAM snapshot `snap`.
+    struct Capture {
+        int64_t pos;
+        int snap;
+    };
     // Appends tokens to a slot (chunked). Returns the logits after the last one;
     // with all_logits, also the logits after every token ([n][VOCAB]).
+    // Captures must lie in (len, len + tokens.size()], at most MAX_CAPTURES per
+    // prefill chunk.
     const std::vector<float> &prefill(int slot, const std::vector<int32_t> &tokens,
                                       std::vector<float> *all_logits = nullptr,
-                                      const std::function<void(int64_t)> &after_chunk = nullptr);
+                                      const std::function<void(int64_t)> &after_chunk = nullptr,
+                                      const std::vector<Capture> &captures = {});
+    static constexpr int MAX_CAPTURES = 4;
 
     struct Row {
         int slot;
@@ -107,21 +118,27 @@ public:
     void snapshot_save(int snap, int slot);
     void snapshot_restore(int snap, int slot, int64_t n, const std::vector<int32_t> &tail);
 
-    // ---- host-RAM tier (host_tier.hip): a slot's state at n tokens, copied
-    // to pinned host memory and back. The recurrent state comes from VRAM
-    // snapshot `snap` (taken at exactly n tokens of this slot), the KV from
-    // the slot's positions [0, n).
-    struct HostState;  // per-rank pinned buffers
-    std::shared_ptr<HostState> export_state(int slot, int snap, int64_t n);
-    // Makes `slot` hold the exported state (n tokens; tail: its last tokens).
-    void import_state(const HostState &hs, int slot, const std::vector<int32_t> &tail);
-    static size_t host_state_bytes(const HostState &hs);
-    // Raw access for persistence (the disk tier): an empty state for n tokens
-    // in this engine's layout, its size, and each rank's buffer.
-    std::shared_ptr<HostState> alloc_host_state(int64_t n);
-    static int64_t host_state_tokens(const HostState &hs);
-    static size_t host_state_rank_bytes(const HostState &hs);
-    static uint8_t *host_state_buffer(const HostState &hs, int rank);
+    // ---- host copies (host_tier.hip), for the block store of the prefix
+    // cache. Buffers are per rank, in pinned host memory. Copies are enqueued
+    // on the ranks' streams; host_copies_wait() waits for them.
+    using RankBufs = std::array<uint8_t *, RANKS>;
+    // The KV of positions [p0, p0 + n) of a slot (p0 a multiple of IDX_RATIO):
+    // per QSA layer (+ MTP) K and V (fp16 [n][256]), raw indexer keys (fp32
+    // [n][128]) and the compressed keys of the groups the range completes
+    // (fp16 [n/4][128]).
+    size_t kv_rank_bytes(int64_t n) const;
+    void export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst);
+    void import_kv(int slot, int64_t p0, int64_t n, const RankBufs &src);
+    // The recurrent state (GDN state and conv rings, PLE ring, MTP input) of
+    // VRAM snapshot `snap`.
+    static size_t recurrent_rank_bytes();
+    void export_recurrent(int snap, const RankBufs &dst);
+    // Makes `slot` hold n tokens: the recurrent state from src, the KV imported
+    // with import_kv (tail: the last tokens, for the n-gram context). Waits
+    // for the copies.
+    void import_recurrent(int slot, const RankBufs &src, int64_t n, const std::vector<int32_t> &tail);
+    void host_copies_wait();
+    int rank_device(int r) const;  // HIP device of rank r (the order of RankBufs)
     // Identifies the state layout (shapes, ring sizes, MTP layer): a saved
     // state is only loadable by an engine with the same id.
     uint64_t state_layout_id() const;
@@ -176,6 +193,7 @@ private:
         int slot = 0;
         bool reset = false;
         bool mtp_pend = false;  // the MTP pass may start one row early, from the slot's MTP input store
+        std::vector<Capture> captures;  // in (start, start + T]
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16

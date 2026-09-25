@@ -3,8 +3,6 @@
 #include <sys/stat.h>
 #include <utime.h>
 
-#include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -20,32 +18,13 @@ namespace {
 
 struct Header {
     char magic[8];
-    uint64_t layout;
-    int64_t n;
-    uint32_t ranks;
-    uint32_t vocab;
+    uint64_t layout, hash, parent;
+    int64_t ntok;
+    uint32_t ranks, nlogits;
     uint64_t rank_bytes;
 };
-constexpr char MAGIC[8] = {'Q', 'W', 'K', 'V', 'C', 'A', 'C', '1'};
-
-int64_t now_s() {
-    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-uint64_t token_hash(const std::vector<int32_t> &t) {
-    uint64_t h = 1469598103934665603ull;
-    for (int32_t v : t)
-        for (int b = 0; b < 4; ++b) {
-            h ^= (uint32_t(v) >> (8 * b)) & 0xff;
-            h *= 1099511628211ull;
-        }
-    return h;
-}
-
-bool is_prefix(const std::vector<int32_t> &a, const std::vector<int32_t> &b) {
-    return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin());
-}
+constexpr char MAGIC_BLOCK[8] = {'Q', 'W', 'B', 'L', 'O', 'C', 'K', '1'};
+constexpr char MAGIC_SNAP[8] = {'Q', 'W', 'S', 'N', 'A', 'P', 'S', '1'};
 
 bool read_all(std::FILE *f, void *p, size_t n) {
     return std::fread(p, 1, n, f) == n;
@@ -56,10 +35,8 @@ bool write_all(std::FILE *f, const void *p, size_t n) {
 
 }  // namespace
 
-DiskTier::DiskTier(Engine &e, std::string dir, size_t budget_bytes)
-    : e_(e), dir_(std::move(dir)), budget_(budget_bytes), layout_(e.state_layout_id()) {
+DiskTier::DiskTier(std::string dir, uint64_t layout) : dir_(std::move(dir)), layout_(layout) {
     fs::create_directories(dir_);
-    scan();
     writer_ = std::thread([this] { writer_loop(); });
 }
 
@@ -72,47 +49,63 @@ DiskTier::~DiskTier() {
     writer_.join();
 }
 
-// Index the directory: headers and tokens only; skip foreign or partial files.
-void DiskTier::scan() {
-    size_t skipped = 0;
+std::string DiskTier::path(uint64_t hash, bool snap) const {
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx.%s", (unsigned long long)hash, snap ? "qws" : "qwb");
+    return dir_ + "/" + name;
+}
+
+std::vector<DiskTier::Meta> DiskTier::scan() {
+    std::vector<Meta> out;
+    size_t dropped = 0;
     for (const auto &de : fs::directory_iterator(dir_)) {
-        if (!de.is_regular_file() || de.path().extension() != ".qwkv") continue;
+        if (!de.is_regular_file()) continue;
+        const auto ext = de.path().extension();
+        if (ext != ".qwb" && ext != ".qws") {  // temporaries of an interrupted write, old formats
+            std::error_code ec;
+            fs::remove(de.path(), ec);
+            ++dropped;
+            continue;
+        }
+        const bool snap = ext == ".qws";
         std::FILE *f = std::fopen(de.path().c_str(), "rb");
         if (!f) continue;
         Header h{};
-        Entry en;
-        bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, MAGIC, 8) == 0 && h.layout == layout_ && h.n > 0 &&
-                  h.vocab == uint32_t(cfg::VOCAB);
-        if (ok) {
-            en.tokens.resize(size_t(h.n));
-            ok = read_all(f, en.tokens.data(), en.tokens.size() * 4);
+        Meta m;
+        bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, snap ? MAGIC_SNAP : MAGIC_BLOCK, 8) == 0 &&
+                  h.layout == layout_ && h.ranks == uint32_t(RANKS);
+        if (ok && !snap) {
+            m.tokens.resize(size_t(h.ntok));
+            ok = h.ntok > 0 && read_all(f, m.tokens.data(), m.tokens.size() * 4);
         }
         std::fclose(f);
         if (!ok) {
-            ++skipped;
+            std::error_code ec;
+            fs::remove(de.path(), ec);
+            ++dropped;
             continue;
         }
-        en.path = de.path().string();
-        en.bytes = size_t(de.file_size());
+        m.hash = h.hash;
+        m.parent = h.parent;
+        m.snap = snap;
+        m.logits = h.nlogits > 0;
+        m.bytes = size_t(de.file_size());
         struct stat st{};
-        en.used = stat(en.path.c_str(), &st) == 0 ? int64_t(st.st_mtime) : 0;
-        bytes_ += en.bytes;
-        index_.push_back(std::move(en));
+        m.used = stat(de.path().c_str(), &st) == 0 ? int64_t(st.st_mtime) : 0;
+        out.push_back(std::move(m));
     }
-    enforce_budget();
-    log("disk tier: %s: %zu entries, %.1f GB%s", dir_.c_str(), index_.size(), double(bytes_) / 1e9,
-        skipped ? (" (" + std::to_string(skipped) + " unusable files skipped)").c_str() : "");
+    if (dropped) log("disk tier: removed %zu unusable files", dropped);
+    return out;
 }
 
-void DiskTier::store(const std::vector<int32_t> &tokens, const std::vector<float> &logits,
-                     std::shared_ptr<Engine::HostState> state) {
+size_t DiskTier::write(const Meta &m, std::vector<float> logits, const Engine::RankBufs &bufs, size_t rank_bytes,
+                       std::shared_ptr<const void> keep) {
+    const size_t bytes = sizeof(Header) + m.tokens.size() * 4 + logits.size() * 4 + size_t(RANKS) * rank_bytes;
     std::lock_guard<std::mutex> lk(mu_);
-    for (const Entry &en : index_)
-        if (en.tokens == tokens) return;
-    for (const Job &j : queue_)
-        if (j.tokens == tokens) return;
-    queue_.push_back({tokens, logits, std::move(state)});
+    pending_.insert({m.hash, m.snap});
+    queue_.push_back({m, std::move(logits), bufs, rank_bytes, std::move(keep)});
     cv_.notify_all();
+    return bytes;
 }
 
 void DiskTier::writer_loop() {
@@ -124,135 +117,83 @@ void DiskTier::writer_loop() {
             if (queue_.empty()) return;  // stopping, nothing left
             job = std::move(queue_.front());
             queue_.pop_front();
-            busy_ = true;
         }
-        Entry en;
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool ok = write_file(job, en);
-        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        job.state.reset();  // release the pinned buffers outside the lock
+        write_file(job);
+        job.keep.reset();  // release the buffers outside the lock
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (ok) {
-                bytes_ += en.bytes;
-                index_.push_back(std::move(en));
-                enforce_budget();
-                log("disk tier: wrote %zu tokens (%.2f GB in %.1f s); %zu entries, %.1f GB", job.tokens.size(),
-                    double(index_.back().bytes) / 1e9, dt, index_.size(), double(bytes_) / 1e9);
-            }
-            busy_ = false;
+            pending_.erase({job.m.hash, job.m.snap});
         }
-        idle_cv_.notify_all();
+        done_cv_.notify_all();
     }
 }
 
-bool DiskTier::write_file(const Job &j, Entry &out) {
-    const auto &hs = *j.state;
-    char name[64];
-    std::snprintf(name, sizeof name, "%016llx.qwkv", (unsigned long long)token_hash(j.tokens));
-    const std::string path = dir_ + "/" + name, tmp = path + ".tmp";
+bool DiskTier::write_file(const Job &j) {
+    const std::string p = path(j.m.hash, j.m.snap), tmp = p + ".tmp";
     std::FILE *f = std::fopen(tmp.c_str(), "wb");
     if (!f) {
         log("disk tier: cannot write %s", tmp.c_str());
         return false;
     }
     Header h{};
-    std::memcpy(h.magic, MAGIC, 8);
+    std::memcpy(h.magic, j.m.snap ? MAGIC_SNAP : MAGIC_BLOCK, 8);
     h.layout = layout_;
-    h.n = int64_t(j.tokens.size());
+    h.hash = j.m.hash;
+    h.parent = j.m.parent;
+    h.ntok = int64_t(j.m.tokens.size());
     h.ranks = uint32_t(RANKS);
-    h.vocab = uint32_t(j.logits.size());
-    h.rank_bytes = Engine::host_state_rank_bytes(hs);
-    bool ok = h.vocab == uint32_t(cfg::VOCAB) && Engine::host_state_tokens(hs) == h.n && write_all(f, &h, sizeof h) &&
-              write_all(f, j.tokens.data(), j.tokens.size() * 4) && write_all(f, j.logits.data(), j.logits.size() * 4);
-    for (int r = 0; ok && r < RANKS; ++r) ok = write_all(f, Engine::host_state_buffer(hs, r), h.rank_bytes);
+    h.nlogits = uint32_t(j.logits.size());
+    h.rank_bytes = j.rank_bytes;
+    bool ok = write_all(f, &h, sizeof h) && write_all(f, j.m.tokens.data(), j.m.tokens.size() * 4) &&
+              write_all(f, j.logits.data(), j.logits.size() * 4);
+    for (int r = 0; ok && r < RANKS; ++r) ok = write_all(f, j.bufs[size_t(r)], j.rank_bytes);
     ok = std::fclose(f) == 0 && ok;
-    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!ok || std::rename(tmp.c_str(), p.c_str()) != 0) {
         std::remove(tmp.c_str());
-        log("disk tier: write of %s failed", path.c_str());
+        log("disk tier: write of %s failed", p.c_str());
         return false;
     }
-    out.path = path;
-    out.tokens = j.tokens;
-    out.bytes = sizeof h + j.tokens.size() * 4 + j.logits.size() * 4 + size_t(RANKS) * h.rank_bytes;
-    out.used = now_s();
     return true;
 }
 
-void DiskTier::enforce_budget() {
-    while (bytes_ > budget_ && !index_.empty()) {
-        auto lru = std::min_element(index_.begin(), index_.end(),
-                                    [](const Entry &a, const Entry &b) { return a.used < b.used; });
-        std::remove(lru->path.c_str());
-        bytes_ -= lru->bytes;
-        index_.erase(lru);
-    }
+void DiskTier::wait_written(uint64_t hash, bool snap) {
+    std::unique_lock<std::mutex> lk(mu_);
+    done_cv_.wait(lk, [&] { return !pending_.count({hash, snap}); });
 }
 
-bool DiskTier::has(const std::vector<int32_t> &tokens) const {
-    std::lock_guard<std::mutex> lk(mu_);
-    for (const Entry &en : index_)
-        if (en.tokens == tokens) return true;
-    for (const Job &j : queue_)
-        if (j.tokens == tokens) return true;
-    return false;
-}
-
-size_t DiskTier::best(const std::vector<int32_t> &prompt, size_t at_least) const {
-    std::lock_guard<std::mutex> lk(mu_);
-    size_t best = 0;
-    for (const Entry &en : index_)
-        if (en.tokens.size() > std::max(at_least, best) && is_prefix(en.tokens, prompt)) best = en.tokens.size();
-    return best;
-}
-
-bool DiskTier::load(const std::vector<int32_t> &prompt, size_t len, std::vector<int32_t> &tokens,
-                    std::vector<float> &logits, std::shared_ptr<Engine::HostState> &state) {
-    std::string path;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        for (Entry &en : index_)
-            if (en.tokens.size() == len && is_prefix(en.tokens, prompt)) {
-                path = en.path;
-                en.used = now_s();
-                break;
-            }
-    }
-    if (path.empty()) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::FILE *f = std::fopen(path.c_str(), "rb");
+bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size_t rank_bytes,
+                    std::vector<float> *logits) {
+    wait_written(hash, snap);
+    const std::string p = path(hash, snap);
+    std::FILE *f = std::fopen(p.c_str(), "rb");
     if (!f) return false;
     Header h{};
-    bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, MAGIC, 8) == 0 && h.layout == layout_ &&
-              h.n == int64_t(len) && h.ranks == uint32_t(RANKS);
+    bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, snap ? MAGIC_SNAP : MAGIC_BLOCK, 8) == 0 &&
+              h.layout == layout_ && h.hash == hash && h.rank_bytes == rank_bytes && h.ranks == uint32_t(RANKS);
+    ok = ok && std::fseek(f, long(h.ntok) * 4, SEEK_CUR) == 0;
     if (ok) {
-        tokens.resize(size_t(h.n));
-        logits.resize(h.vocab);
-        state = e_.alloc_host_state(h.n);
-        ok = Engine::host_state_rank_bytes(*state) == h.rank_bytes && read_all(f, tokens.data(), tokens.size() * 4) &&
-             read_all(f, logits.data(), logits.size() * 4);
-        for (int r = 0; ok && r < RANKS; ++r) ok = read_all(f, Engine::host_state_buffer(*state, r), h.rank_bytes);
+        std::vector<float> l(h.nlogits);
+        ok = read_all(f, l.data(), l.size() * 4);
+        if (logits) *logits = std::move(l);
     }
+    for (int r = 0; ok && r < RANKS; ++r) ok = read_all(f, bufs[size_t(r)], rank_bytes);
     std::fclose(f);
     if (!ok) {
-        state.reset();
-        log("disk tier: %s is unreadable", path.c_str());
+        log("disk tier: %s is unreadable", p.c_str());
         return false;
     }
-    (void)utime(path.c_str(), nullptr);  // LRU across restarts
-    log("disk tier: loaded %zu tokens in %.2f s", tokens.size(),
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    (void)utime(p.c_str(), nullptr);  // LRU across restarts
     return true;
+}
+
+void DiskTier::remove(uint64_t hash, bool snap) {
+    wait_written(hash, snap);
+    std::remove(path(hash, snap).c_str());
 }
 
 void DiskTier::flush() {
     std::unique_lock<std::mutex> lk(mu_);
-    idle_cv_.wait(lk, [&] { return queue_.empty() && !busy_; });
-}
-
-size_t DiskTier::entries() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return index_.size();
+    done_cv_.wait(lk, [&] { return queue_.empty() && pending_.empty(); });
 }
 
 }  // namespace qw

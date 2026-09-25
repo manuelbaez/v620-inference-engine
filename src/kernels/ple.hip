@@ -95,12 +95,30 @@ __global__ void ple_ring_T_kernel(const float *ncbuf, float *ring, int64_t start
         ring[int(q % PLE_RING) * XW + c] = ncbuf[size_t(q - start) * XW + c];
 }
 
+// The whole ring as it stands at position c (start < c <= start + T).
+__global__ void ple_ring_capture_kernel(const float *ncbuf, const float *ring, int64_t start, int64_t c, float *dst) {
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= XW) return;
+    for (int64_t q = c - PLE_RING; q < c; ++q) {
+        const int cell = int((q + PLE_RING) % PLE_RING);
+        float v = 0.f;
+        if (q >= start)
+            v = ncbuf[size_t(q - start) * XW + ch];
+        else if (q >= 0)
+            v = ring[cell * XW + ch];
+        dst[cell * XW + ch] = v;
+    }
+}
+
 void ple_apply_T(const uint16_t *kv, const float *red, const float *nc, const float *conv_w, float *ring, int64_t start,
-                 int T, float *ncbuf, float *X, hipStream_t s) {
+                 int T, float *ncbuf, float *X, hipStream_t s, const Captures &cap) {
     const auto *k = reinterpret_cast<const __half *>(kv);
     const unsigned g = unsigned((size_t(T) * XW + 255) / 256);
     ple_nc_T_kernel<<<g, 256, 0, s>>>(k, red, nc, T, ncbuf);
     ple_conv_T_kernel<<<g, 256, 0, s>>>(k, red, conv_w, ring, ncbuf, start, T, X);
+    for (int i = 0; i < cap.n; ++i)
+        if (cap.pos[i] > start && cap.pos[i] <= start + T)
+            ple_ring_capture_kernel<<<XW / 256, 256, 0, s>>>(ncbuf, ring, start, cap.pos[i], cap.dst[i]);
     ple_ring_T_kernel<<<XW / 256, 256, 0, s>>>(ncbuf, ring, start, T);
 }
 

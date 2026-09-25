@@ -32,6 +32,16 @@ void qw_close(qw_handle *h);
 int qw_persist(qw_handle *h);
 const char *qw_error(qw_handle *h);
 
+/* ---- prefix cache */
+/* Token that starts a chat message (<|im_start|>): prefill snapshots the state
+ * before such tokens, so prompts sharing a prefix up to a message reuse it. */
+int qw_set_boundary_token(qw_handle *h, int32_t id);
+typedef struct qw_cache_stats {
+    uint64_t hits, tokens_restored, snapshots_saved;
+    uint64_t ram_bytes, disk_bytes, blocks, snapshots;
+} qw_cache_stats;
+int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out);
+
 int qw_num_slots(qw_handle *h);
 int64_t qw_slot_capacity(qw_handle *h, int slot);
 

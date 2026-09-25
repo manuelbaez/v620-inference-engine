@@ -16,11 +16,15 @@ namespace qw::gpu {
 // (indexed by position).
 void gdn_conv_T(const uint16_t *P, const float *ring, const float *conv_w, const float *A_log, const float *dt_bias,
                 int64_t start, int T, float *qkv, float *gb, hipStream_t s);
-// Copies the chunk's last pre-conv rows into the ring.
-void gdn_ring_update_T(const uint16_t *P, float *ring, int64_t start, int T, hipStream_t s);
+// Copies the chunk's last pre-conv rows into the ring. Captures in (start,
+// start + T] first get the ring as it stands at their position.
+void gdn_ring_update_T(const uint16_t *P, float *ring, int64_t start, int T, hipStream_t s,
+                       const Captures &cap = {});
 // Sequential delta rule over the chunk, parallel over (head, 32-column slice):
-// o_raw fp32 [T][1536], state S [12][128][128] updated in place.
-void gdn_scan_T(const float *qkv, const float *gb, float *S, int T, float *o_raw, hipStream_t s);
+// o_raw fp32 [T][1536], state S [12][128][128] updated in place. Captures in
+// (start, start + T] also get the state at their position.
+void gdn_scan_T(const float *qkv, const float *gb, float *S, int T, float *o_raw, hipStream_t s, int64_t start = 0,
+                const Captures &cap = {});
 // out[t][h*128+j] = fp16(rmsnorm(o_raw[t][h]) * w[j] * sigmoid(z[t][h*128+j]))
 void gdn_norm_T(const float *o_raw, const uint16_t *P, const float *norm_w, int T, uint16_t *out, hipStream_t s);
 

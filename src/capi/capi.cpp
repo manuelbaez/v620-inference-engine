@@ -139,6 +139,17 @@ int qw_persist(qw_handle *h) {
         -1);
 }
 
+int qw_set_boundary_token(qw_handle *h, int32_t id) {
+    h->session->set_boundary_token(id);
+    return 0;
+}
+
+int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out) {
+    const qw::BlockStore::Stats s = h->session->cache_stats();
+    *out = {s.hits, s.tokens_restored, s.snapshots_saved, s.ram_bytes, s.disk_bytes, s.blocks, s.snapshots};
+    return 0;
+}
+
 int qw_has_mtp(qw_handle *h) {
     return h->engine->has_mtp() ? 1 : 0;
 }

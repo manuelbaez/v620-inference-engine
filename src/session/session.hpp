@@ -3,11 +3,17 @@
 // sampling.
 //
 // For a new prompt in a slot it:
-//   1. continues in place when the prompt extends what the slot holds (the
+//   1. restores the deepest prefix of the prompt held by the block store (the
+//      host tier shared by every conversation, src/session/block_store.hpp)
+//      when that covers more than the slot itself can;
+//   2. continues in place when the prompt extends what the slot holds (the
 //      usual chat / agent turn: previous prompt + reply + new message);
-//   2. else restores the deepest snapshot of that slot that is a prefix of the
+//   3. else restores the deepest snapshot of that slot that is a prefix of the
 //      new prompt (e.g. the reply was re-rendered differently by the template);
-//   3. else starts the slot over.
+//   4. else starts the slot over.
+// While prefilling, it snapshots the state at chat message boundaries (inside
+// prefill chunks) and at chunk ends, and saves those with their blocks to the
+// block store, so later prompts sharing any of those prefixes reuse them.
 // KV is position-indexed, so a snapshot at n stays valid only while the slot's
 // positions < n are untouched: rewinding a slot to m drops its snapshots past m.
 #pragma once
@@ -19,7 +25,7 @@
 #include <vector>
 
 #include "engine/engine.hpp"
-#include "session/disk_tier.hpp"
+#include "session/block_store.hpp"
 #include "session/sampling.hpp"
 
 namespace qw {
@@ -56,8 +62,12 @@ public:
     void persist();
     // Blocks until the disk tier's queued writes are on disk (no-op without it).
     void flush_disk() {
-        if (disk_) disk_->flush();
+        if (store_) store_->flush();
     }
+    // Token that starts a chat message (<|im_start|>): prefill snapshots the
+    // state before such tokens. -1: no message boundaries.
+    void set_boundary_token(int32_t id) { boundary_ = id; }
+    BlockStore::Stats cache_stats() const { return store_ ? store_->stats() : BlockStore::Stats{}; }
     struct StepReq {
         int slot;
         int32_t pending;  // sampled, not decoded yet
@@ -100,19 +110,13 @@ private:
         int32_t drafts_for = -1;
         float accept = 0.8f;  // running per-draft acceptance (adaptive draft count)
     };
-    // host-RAM tier (host_tier.cpp)
-    struct HostEntry {
-        std::vector<int32_t> tokens;  // the state is exactly after these
-        std::vector<float> logits;    // after tokens.back()
-        std::shared_ptr<Engine::HostState> state;
-        size_t bytes = 0;
-        uint64_t used = 0;
-    };
-    void offload_slot(int slot, const std::vector<int32_t> &next_prompt);
-    void add_host_entry(HostEntry h);
-    bool promote_from_disk(const std::vector<int32_t> &prompt, size_t at_least);
-    int best_host_entry(const std::vector<int32_t> &prompt, size_t at_least) const;
-    void save_snapshot(int slot);
+    // prefix cache (prefix_cache.cpp)
+    bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
+    // Snapshot points inside the prefill of prompt[from..): message boundaries
+    // at least min_gap_ apart, at most Engine::MAX_CAPTURES per prefill chunk.
+    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from);
+    void prefill_rest(int slot, const std::vector<int32_t> &prompt);
+    int save_snapshot(int slot);  // returns the VRAM snapshot index
     void drop_snapshots_after(int slot, int64_t n);
     int draft_count(int slot, int k_max) const;
     int32_t sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known = NAN,
@@ -122,10 +126,10 @@ private:
     Engine &e_;
     std::vector<SlotInfo> slots_;
     std::vector<Snap> snaps_;
-    std::vector<HostEntry> host_;
-    size_t host_bytes_ = 0, host_budget_ = 0;
-    size_t host_min_tokens_ = 1024;
-    std::unique_ptr<DiskTier> disk_;  // declared after the tiers it feeds from: destroyed first
+    std::vector<int> reserved_;       // VRAM snapshots the running prefill captures into
+    std::unique_ptr<BlockStore> store_;
+    int32_t boundary_ = -1;
+    int64_t min_gap_ = 1024;          // tokens between snapshots (and the least a saved prefix holds)
     std::vector<int> row_slot_;       // slot of each row of the last decode
     std::vector<StepOut> out_;
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)

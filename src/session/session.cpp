@@ -12,13 +12,16 @@ namespace qw {
 
 Session::Session(Engine &e)
     : e_(e), slots_(size_t(e.num_slots())), snaps_(Engine::SNAPSHOTS), rng_(std::random_device{}()) {
+    // block store: QW_HOST_CACHE_GB (default 128, 0 = off); its disk tier:
+    // QW_DISK_CACHE_DIR (off when unset), QW_DISK_CACHE_GB (default 200)
     const char *gb = std::getenv("QW_HOST_CACHE_GB");
-    host_budget_ = size_t((gb ? std::atof(gb) : 128.0) * 1e9);
-    // disk tier: QW_DISK_CACHE_DIR (off when unset), QW_DISK_CACHE_GB (default 200)
-    if (const char *dir = std::getenv("QW_DISK_CACHE_DIR"); dir && *dir && host_budget_ > 0) {
+    const size_t budget = size_t((gb ? std::atof(gb) : 128.0) * 1e9);
+    if (budget > 0) {
+        const char *dir = std::getenv("QW_DISK_CACHE_DIR");
         const char *dgb = std::getenv("QW_DISK_CACHE_GB");
-        disk_ = std::make_unique<DiskTier>(e_, dir, size_t((dgb ? std::atof(dgb) : 200.0) * 1e9));
+        store_ = std::make_unique<BlockStore>(e_, budget, dir ? dir : "", size_t((dgb ? std::atof(dgb) : 200.0) * 1e9));
     }
+    if (const char *g = std::getenv("QW_SNAP_MIN_GAP")) min_gap_ = std::max<int64_t>(1, std::atoll(g));
 }
 
 void Session::drop_snapshots_after(int slot, int64_t n) {
@@ -26,24 +29,23 @@ void Session::drop_snapshots_after(int slot, int64_t n) {
         if (s.valid && s.slot == slot && int64_t(s.tokens.size()) > n) s.valid = false;
 }
 
-void Session::save_snapshot(int slot) {
+int Session::save_snapshot(int slot) {
     const auto &hist = slots_[size_t(slot)].hist;
     const int64_t n = int64_t(hist.size());
+    auto reserved = [&](int i) { return std::find(reserved_.begin(), reserved_.end(), i) != reserved_.end(); };
     int idx = -1;
     for (int i = 0; i < int(snaps_.size()); ++i)
         if (snaps_[size_t(i)].valid && snaps_[size_t(i)].slot == slot && int64_t(snaps_[size_t(i)].tokens.size()) == n)
             idx = i;  // refresh in place
     if (idx < 0)
         for (int i = 0; i < int(snaps_.size()); ++i)
-            if (!snaps_[size_t(i)].valid) {
+            if (!snaps_[size_t(i)].valid && !reserved(i)) {
                 idx = i;
                 break;
             }
-    if (idx < 0) {  // evict least recently used
-        idx = 0;
-        for (int i = 1; i < int(snaps_.size()); ++i)
-            if (snaps_[size_t(i)].used < snaps_[size_t(idx)].used) idx = i;
-    }
+    if (idx < 0)  // evict least recently used
+        for (int i = 0; i < int(snaps_.size()); ++i)
+            if (!reserved(i) && (idx < 0 || snaps_[size_t(i)].used < snaps_[size_t(idx)].used)) idx = i;
     e_.snapshot_save(idx, slot);
     Snap &s = snaps_[size_t(idx)];
     s.valid = true;
@@ -51,6 +53,7 @@ void Session::save_snapshot(int slot) {
     s.tokens = hist;
     s.logits = e_.logits();
     s.used = ++clock_;
+    return idx;
 }
 
 // Tokens of `prompt` a slot could reuse (in place or from one of its snapshots).
@@ -103,35 +106,11 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     size_t common = 0;
     while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) ++common;
 
-    // host tier: a saved conversation that covers more of the prompt than this slot can
-    // (offload the slot's own conversation first: saving may evict entries)
-    const size_t slot_reuse = reusable(slot, prompt);
-    {  // the disk tier's best, if it beats both the slot and the RAM tier, moves to RAM
-        const int rb = best_host_entry(prompt, slot_reuse);
-        const size_t ram_best = rb >= 0 ? host_[size_t(rb)].tokens.size() : slot_reuse;
-        if (disk_ && disk_->best(prompt, ram_best) > 0) {
-            offload_slot(slot, prompt);
-            promote_from_disk(prompt, ram_best);
-        }
-    }
-    if (best_host_entry(prompt, slot_reuse) >= 0) offload_slot(slot, prompt);
-    const int hb = best_host_entry(prompt, slot_reuse);
-    if (hb >= 0) {
-        HostEntry &h = host_[size_t(hb)];
-        h.used = ++clock_;
-        e_.import_state(*h.state, slot, h.tokens);
-        drop_snapshots_after(slot, 0);
-        hist = h.tokens;
-        common = hist.size();
-        if (common == prompt.size()) e_.set_logits(h.logits);
-        log("host tier: restored %zu tokens into slot %d", hist.size(), slot);
-        if (common == prompt.size()) {
-            slots_[size_t(slot)].prompt_end = int64_t(hist.size());
-            single_ = false;
-            return int64_t(common);
-        }
-    } else if (!(common == hist.size() && common > 0)) {
-        offload_slot(slot, prompt);  // the slot's conversation is about to be replaced
+    // the block store, when it holds more of the prompt than this slot can
+    if (restore_from_store(slot, prompt, reusable(slot, prompt), common) && common == prompt.size()) {
+        slots_[size_t(slot)].prompt_end = int64_t(common);
+        single_ = false;
+        return int64_t(common);
     }
 
     int64_t reused = 0;
@@ -192,14 +171,7 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
         }
     }
 
-    if (prompt.size() > hist.size()) {
-        std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(hist.size()), prompt.end());
-        drop_snapshots_after(slot, int64_t(hist.size()));
-        e_.prefill(slot, rest, nullptr, [&](int64_t pos) {
-            hist.insert(hist.end(), prompt.begin() + ptrdiff_t(hist.size()), prompt.begin() + ptrdiff_t(pos));
-            save_snapshot(slot);
-        });
-    }
+    if (prompt.size() > hist.size()) prefill_rest(slot, prompt);
     slots_[size_t(slot)].prompt_end = int64_t(hist.size());
     single_ = false;
     return reused;

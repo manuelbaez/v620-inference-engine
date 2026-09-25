@@ -1,11 +1,12 @@
-// Disk tier of the prefix cache: conversations saved to the host-RAM tier are
-// also written to files by a background thread, the directory is indexed at
-// startup, and a prompt that extends a stored conversation loads it back.
-// Survives restarts; LRU within a byte budget.
+// Disk tier of the prefix cache: the block store's blocks and snapshots as
+// files, written by a background thread and indexed at startup, so the cache
+// survives restarts. It only holds files; the block store decides what to
+// keep (LRU within its budget).
 //
-// File (native endian): Header, tokens int32[n], logits float[vocab], then each
-// rank's state (Engine::host_state_rank_bytes bytes). Written to a temporary
-// name and renamed, so a crash never leaves a partial entry.
+// Files (native endian), written to a temporary name and renamed so a crash
+// never leaves a partial file:
+//   <hash>.qwb  a block:    Header, tokens int32[n], each rank's KV
+//   <hash>.qws  a snapshot: Header, logits float[nlogits], each rank's recurrent state
 #pragma once
 
 #include <condition_variable>
@@ -13,8 +14,10 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "engine/engine.hpp"
@@ -23,52 +26,52 @@ namespace qw {
 
 class DiskTier {
 public:
-    DiskTier(Engine &e, std::string dir, size_t budget_bytes);
+    struct Meta {
+        uint64_t hash = 0, parent = 0;
+        bool snap = false;             // a snapshot file (else a block)
+        std::vector<int32_t> tokens;   // blocks only
+        bool logits = false;           // snapshots: logits after the last token are stored
+        size_t bytes = 0;              // file size
+        int64_t used = 0;              // mtime (last use), seconds since epoch
+    };
+
+    DiskTier(std::string dir, uint64_t layout);
     ~DiskTier();  // finishes queued writes
     DiskTier(const DiskTier &) = delete;
     DiskTier &operator=(const DiskTier &) = delete;
 
-    // Queues a write of a saved state (no-op if these exact tokens are stored or queued).
-    void store(const std::vector<int32_t> &tokens, const std::vector<float> &logits,
-               std::shared_ptr<Engine::HostState> state);
-    // Whether these exact tokens are stored or queued.
-    bool has(const std::vector<int32_t> &tokens) const;
-    // Tokens of the longest stored prefix of `prompt` that is longer than at_least, or 0.
-    size_t best(const std::vector<int32_t> &prompt, size_t at_least) const;
-    // Loads the stored entry with exactly `len` tokens of `prompt` into pinned memory.
-    bool load(const std::vector<int32_t> &prompt, size_t len, std::vector<int32_t> &tokens, std::vector<float> &logits,
-              std::shared_ptr<Engine::HostState> &state);
+    // Every usable file in the directory (removes unusable ones).
+    std::vector<Meta> scan();
+    // Queues a write of rank_bytes from each of bufs; `keep` holds the buffers
+    // alive until then. Returns the file's size.
+    size_t write(const Meta &m, std::vector<float> logits, const Engine::RankBufs &bufs, size_t rank_bytes,
+                 std::shared_ptr<const void> keep);
+    // Reads a file's payload into bufs (and its logits); waits for a queued write of it first.
+    bool read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size_t rank_bytes, std::vector<float> *logits);
+    void remove(uint64_t hash, bool snap);
     // Blocks until queued writes are on disk.
     void flush();
-    size_t entries() const;
 
 private:
-    struct Entry {
-        std::string path;
-        std::vector<int32_t> tokens;
-        size_t bytes = 0;
-        int64_t used = 0;  // last use (seconds since epoch), for LRU
-    };
     struct Job {
-        std::vector<int32_t> tokens;
+        Meta m;
         std::vector<float> logits;
-        std::shared_ptr<Engine::HostState> state;
+        Engine::RankBufs bufs;
+        size_t rank_bytes;
+        std::shared_ptr<const void> keep;
     };
-    void scan();
+    std::string path(uint64_t hash, bool snap) const;
     void writer_loop();
-    bool write_file(const Job &j, Entry &out);
-    void enforce_budget();  // with mu_ held
+    bool write_file(const Job &j);
+    void wait_written(uint64_t hash, bool snap);  // with lk held
 
-    Engine &e_;
     std::string dir_;
-    size_t budget_;
     uint64_t layout_;
-    mutable std::mutex mu_;
-    std::condition_variable cv_, idle_cv_;
-    std::vector<Entry> index_;
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
     std::deque<Job> queue_;
-    size_t bytes_ = 0;
-    bool busy_ = false, stop_ = false;
+    std::set<std::pair<uint64_t, bool>> pending_;  // queued or being written
+    bool stop_ = false;
     std::thread writer_;
 };
 

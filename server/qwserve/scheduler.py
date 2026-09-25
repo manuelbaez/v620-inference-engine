@@ -66,6 +66,7 @@ class Scheduler:
         self.e = engine
         self.k = mtp_drafts if engine.has_mtp else 0
         self.stats = {"steps": 0, "rows": 0, "tokens": 0, "time": 0.0}  # decode steps, request-steps, emitted tokens
+        self.cache_stats = engine.cache_stats()  # refreshed by the scheduler thread (the engine is not thread-safe)
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
@@ -135,6 +136,7 @@ class Scheduler:
                 r.t_admit = time.time()
                 cached = self.e.set_prompt(slot, r.prompt)
                 r.cached = cached
+                self.cache_stats = self.e.cache_stats()
                 r.emit("start", cached)
                 top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
                 tid, lp = self.e.sample_prompt(slot, r.sampling)

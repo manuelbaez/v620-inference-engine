@@ -27,6 +27,8 @@
 
 namespace qw {
 
+static_assert(Engine::MAX_CAPTURES == gpu::MAX_CAPTURES);
+
 // One prefill chunk (pjob_) on rank rk, as two micro-batches (A = first
 // half, B = second half) on two streams with separate collective channels, so
 // one half's collectives overlap the other half's compute. B depends on A only
@@ -110,6 +112,16 @@ void Engine::run_prefill_rank(Rank &rk) {
         gpu::hc_mix_T(b.g, b.xn, rows, b.bin_local, m.s);
         allgather(m, b.bin_local, b.bin, SH * 2, rows);
     };
+    // Snapshot captures of this chunk, as the per-layer destinations of one kind of state.
+    const auto &caps = pjob_.captures;
+    auto captures = [&](auto dst_of) {
+        gpu::Captures c;
+        for (const Capture &cp : caps) {
+            c.pos[c.n] = cp.pos;
+            c.dst[c.n++] = dst_of(rk.snaps[size_t(cp.snap)]);
+        }
+        return c;
+    };
     auto record = [&](MB &m, int l, int what) {
         if (split && &m == &mbs[0]) CK(hipEventRecord(rk.ev[size_t(l * 4 + what)], m.s));
     };
@@ -156,10 +168,13 @@ void Engine::run_prefill_rank(Rank &rk) {
             gemm(m, w.gdn_proj, GDN_PROJ_L, H, b.bin, H, T, b.P, GDN_PROJ_L, true);
             wait(m, l, 0);
             gpu::gdn_conv_T(b.P, ring, w.gdn_conv, w.gdn_A, w.gdn_dt, start, T, b.qkv, b.gb, s);
-            gpu::gdn_ring_update_T(b.P, ring, start, T, s);
+            gpu::gdn_ring_update_T(b.P, ring, start, T, s, captures([&](const Rank::Snap &sn) {
+                                       return sn.ring + size_t(gi) * GDN_RING * GDN_QKV_L;
+                                   }));
             record(m, l, 0);
             wait(m, l, 1);
-            gpu::gdn_scan_T(b.qkv, b.gb, sl.S + size_t(gi) * GDN_VL * GDN_DIM * GDN_DIM, T, b.o_raw, s);
+            gpu::gdn_scan_T(b.qkv, b.gb, sl.S + size_t(gi) * GDN_STATE, T, b.o_raw, s, start,
+                            captures([&](const Rank::Snap &sn) { return sn.S + size_t(gi) * GDN_STATE; }));
             record(m, l, 1);
             gpu::gdn_norm_T(b.o_raw, b.P, w.gdn_norm, T, b.act, s);
             gemm(m, w.gdn_out, H, GDN_VL * GDN_DIM, b.act, GDN_VL * GDN_DIM, T, b.part16, H, true);
@@ -197,7 +212,8 @@ void Engine::run_prefill_rank(Rank &rk) {
                 gpu::ple_stats_T(b.kv, b.X, rk.ple_nk, rk.ple_nq, m.T, b.ple_send, s);
                 allreduce(m, b.ple_send, b.ple_red, 16, m.T);
                 wait(m, l, 3);
-                gpu::ple_apply_T(b.kv, b.ple_red, rk.ple_nc, rk.ple_conv, sl.ple, m.start, m.T, b.ncbuf, b.X, s);
+                gpu::ple_apply_T(b.kv, b.ple_red, rk.ple_nc, rk.ple_conv, sl.ple, m.start, m.T, b.ncbuf, b.X, s,
+                                 captures([](const Rank::Snap &sn) { return sn.ple; }));
                 record(m, l, 3);
             }
             const bool qsa = is_qsa(l);
@@ -207,6 +223,10 @@ void Engine::run_prefill_rank(Rank &rk) {
     for (auto &m : mbs) {  // complete X: the pre-final-mixer hidden (lm_head and MTP input)
         gpu::hc_combine_T(m.b->X, m.pend, m.b->inj_mlp, m.T, m.s);
         m.pend = nullptr;
+        for (const Capture &cp : caps)  // a capture's MTP input: the hidden of its last token
+            if (cp.pos > m.start && cp.pos <= m.start + m.T)
+                CK(hipMemcpyAsync(rk.snaps[size_t(cp.snap)].pend, m.b->X + size_t(cp.pos - 1 - m.start) * XW, XW * 4,
+                                  hipMemcpyDeviceToDevice, m.s));
     }
     // MTP layer over the rows whose next token is known: row t of a
     // micro-batch pairs X[t] with token t + 1. The rows start one early, from
@@ -266,11 +286,15 @@ void Engine::run_prefill_rank(Rank &rk) {
 }
 
 const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &tokens, std::vector<float> *all_logits,
-                                          const std::function<void(int64_t)> &after_chunk) {
+                                          const std::function<void(int64_t)> &after_chunk,
+                                          const std::vector<Capture> &captures) {
     QW_CHECK(!tokens.empty(), "empty prefill");
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];
     QW_CHECK(sh.len + int64_t(tokens.size()) <= slot_capacity(slot), "prefill exceeds the slot's capacity");
+    for (const Capture &c : captures)
+        QW_CHECK(c.pos > sh.len && c.pos <= sh.len + int64_t(tokens.size()) && c.snap >= 0 && c.snap < SNAPSHOTS,
+                 "prefill: capture outside the new tokens");
     if (all_logits) all_logits->clear();
     const bool all = all_logits != nullptr;
     if (all) {  // lm_head output for a whole chunk
@@ -298,7 +322,10 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
             ple_->gather(ids[size_t(t)], e.data());
             for (int j = 0; j < H; ++j) pple_[size_t(t) * H + j] = f32_to_f16(e[size_t(j)]);
         }
-        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0};
+        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}};
+        for (const Capture &c : captures)
+            if (c.pos > sh.len && c.pos <= sh.len + T) pjob_.captures.push_back(c);
+        QW_CHECK(int(pjob_.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
         if (all) plogits_.assign(size_t(T) * VOCAB, 0.f);
         job_ = Job::Prefill;
         dispatch();

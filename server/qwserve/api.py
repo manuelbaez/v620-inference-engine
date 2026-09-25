@@ -29,6 +29,9 @@ class Server:
         self.engine = Engine(args.lib, opts)
         print(f"engine ready in {time.time() - t0:.1f}s, slots {self.engine.capacity}, "
               f"MTP drafts {args.mtp if self.engine.has_mtp else 0}", flush=True)
+        im_start = self.tok.token_to_id("<|im_start|>")
+        if im_start is not None:
+            self.engine.set_boundary_token(im_start)
         self.sched = Scheduler(self.engine, args.mtp)
 
     def render(self, body):
@@ -73,7 +76,7 @@ class Server:
         if st["rows"]:
             st["tokens_per_request_step"] = round(st["tokens"] / st["rows"], 3)
             st["ms_per_step"] = round(1e3 * st["time"] / st["steps"], 2)
-        return web.json_response({"status": "ok", "decode": st})
+        return web.json_response({"status": "ok", "decode": st, "prefix_cache": self.sched.cache_stats})
 
     async def models(self, _):
         return web.json_response({"object": "list", "data": [{
