@@ -15,6 +15,7 @@
 #include "core/threadpool.hpp"
 #include "engine/engine.hpp"
 #include "kernels/types.hpp"
+#include "vision/vision_encoder.hpp"
 
 namespace qw {
 
@@ -109,6 +110,7 @@ struct Rank {
         float *S = nullptr, *ring = nullptr, *ple = nullptr, *pend = nullptr;
     };
     std::array<Snap, Engine::SNAPSHOTS> snaps{};
+    std::unique_ptr<VisionEncoder> vit;  // this card's copy of the vision tower (null: text only)
     // CacheBlend experiment (blend.hip), allocated on first use: a chunk's GDN
     // transfer [N_GDN][12][128][128] and a scratch copy of a slot's state
     float *transfer = nullptr, *blend_tmp = nullptr;

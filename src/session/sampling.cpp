@@ -34,10 +34,10 @@ int32_t sample_token(const float *raw, const SamplingParams &p, const std::vecto
     if (penalties) {
         l.assign(raw, raw + V);
         std::unordered_map<int32_t, int> counts;
-        for (size_t i = size_t(prompt_end); i < n_hist; ++i) ++counts[hist[i]];
+        for (size_t i = size_t(prompt_end); i < n_hist; ++i) ++counts[cfg::real_token(hist[i])];
         if (p.repetition_penalty != 1.f) {
             std::vector<bool> seen(size_t(V), false);
-            for (size_t i = 0; i < n_hist; ++i) seen[size_t(hist[i])] = true;
+            for (size_t i = 0; i < n_hist; ++i) seen[size_t(cfg::real_token(hist[i]))] = true;  // vision tokens: their pad
             for (int i = 0; i < V; ++i)
                 if (seen[size_t(i)])
                     l[size_t(i)] =

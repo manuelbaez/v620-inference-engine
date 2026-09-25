@@ -45,6 +45,19 @@ public:
     // Makes `slot` hold exactly `prompt`, with logits for its last token
     // available to sample_prompt(). Returns the reused prompt tokens.
     int64_t set_prompt(int slot, const std::vector<int32_t> &prompt);
+
+    // An image or a video in a prompt: its patches and where its tokens sit
+    // (the prompt holds its pad token there). Its tokens' identity in the
+    // prefix cache comes from `hash`; the vision tower only runs for tokens
+    // that are prefilled (media/vision_cache.cpp).
+    struct Media {
+        uint64_t hash;
+        bool video;
+        int t, h, w;                  // grid in patches; t temporal slices of h*w patches
+        const float *patches;         // fp32 [t*h*w][1536], merge-window order
+        std::vector<int64_t> starts;  // first token of each slice (h*w/4 tokens each)
+    };
+    int64_t set_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media);
     // Samples the first token after set_prompt (before any other prefill).
     int32_t sample_prompt(int slot, const SamplingParams &p, float *logprob = nullptr);
 
@@ -129,6 +142,14 @@ private:
     void prefill_rest(int slot, const std::vector<int32_t> &prompt);
     int save_snapshot(int slot);  // returns the VRAM snapshot index
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
+    // vision (vision_cache.cpp): the prompt with its media tokens as content-derived ids, and the
+    // embeddings of the media tokens at positions >= from (encoding what the cache lacks)
+    std::vector<int32_t> media_keys(const std::vector<int32_t> &prompt, const std::vector<Media> &media) const;
+    std::vector<Engine::EmbedSpan> vision_embeds(int64_t from);
+    struct VisionEntry {
+        std::vector<float> rows;  // [h*w/4][H]
+        uint64_t used = 0;
+    };
     void drop_snapshots_after(int slot, int64_t n);
     int draft_count(int slot, int k_max) const;
     bool plain_step(int slot, int k_max);  // MTP off for this step?
@@ -143,6 +164,9 @@ private:
     std::unique_ptr<BlockStore> store_;
     int32_t boundary_ = -1;
     ReuseCounters counters_;
+    const std::vector<Media> *media_ = nullptr;  // of the prompt being set
+    std::unordered_map<uint64_t, VisionEntry> vision_cache_;  // (hash, slice) -> embeddings, LRU
+    size_t vision_bytes_ = 0, vision_budget_ = 0;
     std::unordered_map<uint64_t, uint64_t> seen_chunks_;  // chunk hash -> last prompt that had it
     int64_t min_gap_ = 1024;          // tokens between snapshots (and the least a saved prefix holds)
     std::vector<int> row_slot_;       // slot of each row of the last decode

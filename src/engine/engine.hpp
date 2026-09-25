@@ -65,11 +65,18 @@ public:
     // Appends tokens to a slot (chunked). Returns the logits after the last one;
     // with all_logits, also the logits after every token ([n][VOCAB]).
     // Captures must lie in (len, len + tokens.size()], at most MAX_CAPTURES per
-    // prefill chunk.
+    // prefill chunk. Vision tokens (negative ids, cfg::real_token) take their
+    // embeddings from `embeds`, which must cover every one of them.
+    struct EmbedSpan {
+        int64_t pos;         // slot position of rows[0]
+        int64_t n;           // rows
+        const float *rows;   // fp32 [n][H]
+    };
     const std::vector<float> &prefill(int slot, const std::vector<int32_t> &tokens,
                                       std::vector<float> *all_logits = nullptr,
                                       const std::function<void(int64_t)> &after_chunk = nullptr,
-                                      const std::vector<Capture> &captures = {});
+                                      const std::vector<Capture> &captures = {},
+                                      const std::vector<EmbedSpan> &embeds = {});
     static constexpr int MAX_CAPTURES = 4;
 
     struct Row {
@@ -168,6 +175,17 @@ public:
     void blend_compose(int dst, int snap_in, int snap_out, int64_t old_end, int64_t new_len,
                        const std::vector<int32_t> &tail, bool with_transfer = true);
 
+    // ---- vision (vision_job.hip): every card holds the vision tower and
+    // encodes whole slices (an image, or one temporal slice of a video); a
+    // batch of slices is spread over the cards, longest first.
+    bool has_vision() const { return vision_; }
+    struct VisionSlice {
+        const float *patches;  // fp32 [h*w][1536], merge-window order
+        int h, w;              // grid in patches
+        float *out;            // fp32 [h*w/4][2560]
+    };
+    void encode_vision(const std::vector<VisionSlice> &slices);
+
     // Single-sequence convenience API on slot 0 (tools, tests).
     void reset();
     const std::vector<float> &prefill(const std::vector<int32_t> &tokens, std::vector<float> *all_logits = nullptr,
@@ -184,6 +202,7 @@ private:
     void run_prefill_rank(Rank &rk);
     void run_decode_rank(Rank &rk);
     void run_mtp_rank(Rank &rk);
+    void run_vision_rank(Rank &rk);
     uint32_t record_batch(Rank &rk, int M, int kind);
     void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos);
     void dispatch();  // run the current job on every rank and wait
@@ -211,7 +230,9 @@ private:
     bool blend_transfer_ = false;
     int debug_layers_ = cfg::N_LAYERS;
     // current jobs (host side, read by every rank thread)
-    enum class Job { Prefill, Decode, Mtp } job_ = Job::Decode;
+    enum class Job { Prefill, Decode, Mtp, Vision } job_ = Job::Decode;
+    bool vision_ = false;
+    std::vector<std::vector<VisionSlice>> vjob_;  // per rank
     struct PrefillJob {
         int64_t start = 0;
         int T = 0;

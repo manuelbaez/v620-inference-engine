@@ -56,6 +56,21 @@ int qw_release(qw_handle *h, int slot);
 
 /* Makes `slot` hold exactly tokens[0..n). Returns the reused prompt tokens. */
 int64_t qw_set_prompt(qw_handle *h, int slot, const int32_t *tokens, int64_t n);
+/* ---- vision: an image or a video in a prompt (the prompt holds its pad token,
+ * <|image_pad|> or <|video_pad|>, at each of its token positions). */
+typedef struct qw_media {
+    uint64_t hash;          /* content hash: its tokens' identity in the prefix cache */
+    int32_t video;          /* 0 image, 1 video */
+    int32_t t, h, w;        /* grid in patches: t temporal slices of h x w */
+    const float *patches;   /* fp32 [t*h*w][1536], merge-window order */
+    const int64_t *starts;  /* first token of each slice (h*w/4 tokens each), t entries */
+} qw_media;
+/* 1 if the engine has the vision tower (images and videos accepted). */
+int qw_has_vision(qw_handle *h);
+/* qw_set_prompt with media; the vision tower runs on the cards for the media
+ * tokens that are not already cached. */
+int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media,
+                            int n_media);
 /* Samples the token after the prompt of the last qw_set_prompt. */
 int32_t qw_sample_prompt(qw_handle *h, int slot, const qw_sampling *p, float *lp);
 

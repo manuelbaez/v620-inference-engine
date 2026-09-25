@@ -27,6 +27,18 @@ class StepReq(ctypes.Structure):
     ]
 
 
+class MediaStruct(ctypes.Structure):
+    _fields_ = [
+        ("hash", ctypes.c_uint64),
+        ("video", ctypes.c_int32),
+        ("t", ctypes.c_int32),
+        ("h", ctypes.c_int32),
+        ("w", ctypes.c_int32),
+        ("patches", ctypes.POINTER(ctypes.c_float)),
+        ("starts", ctypes.POINTER(ctypes.c_int64)),
+    ]
+
+
 class CacheStats(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint64) for name in (
         "hits", "tokens_restored", "snapshots_saved", "ram_bytes", "disk_bytes", "blocks", "snapshots",
@@ -48,6 +60,9 @@ class Engine:
             "qw_acquire": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64]),
             "qw_release": (ctypes.c_int, [P, ctypes.c_int]),
             "qw_set_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64]),
+            "qw_set_prompt_media": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
+                                                      ctypes.POINTER(MediaStruct), ctypes.c_int]),
+            "qw_has_vision": (ctypes.c_int, [P]),
             "qw_sample_prompt": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
             "qw_decode": (ctypes.c_int, [P, ctypes.c_int, I32P, I32P]),
             "qw_sample_row": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
@@ -71,6 +86,7 @@ class Engine:
         self.capacity = [lib.qw_slot_capacity(self.h, i) for i in range(lib.qw_num_slots(self.h))]
         self.max_tokens = max(self.capacity)
         self.has_mtp = bool(lib.qw_has_mtp(self.h))
+        self.has_vision = bool(lib.qw_has_vision(self.h))
 
     def _err(self):
         return RuntimeError(self.lib.qw_error(self.h).decode(errors="replace"))
@@ -90,9 +106,23 @@ class Engine:
     def release(self, slot):
         self._check(self.lib.qw_release(self.h, slot))
 
-    def set_prompt(self, slot, tokens):
+    def set_prompt(self, slot, tokens, media=None):
+        """media: vision.Media items whose spans are set (their pads are in `tokens`)."""
         arr = (ctypes.c_int32 * len(tokens))(*tokens)
-        return self._check(self.lib.qw_set_prompt(self.h, slot, arr, len(tokens)))
+        if not media:
+            return self._check(self.lib.qw_set_prompt(self.h, slot, arr, len(tokens)))
+        import numpy as np
+        keep, items = [], []
+        for m in media:
+            patches = np.ascontiguousarray(m.patches, dtype=np.float32)
+            starts = np.asarray([s for s, _ in m.spans], dtype=np.int64)
+            keep += [patches, starts]
+            t, h, w = m.grid
+            items.append(MediaStruct(int.from_bytes(m.hash, "little"), int(m.kind == "video"), t, h, w,
+                                     patches.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                     starts.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))))
+        arr_m = (MediaStruct * len(items))(*items)
+        return self._check(self.lib.qw_set_prompt_media(self.h, slot, arr, len(tokens), arr_m, len(items)))
 
     def sample_prompt(self, slot, s):
         lp = ctypes.c_float()

@@ -14,6 +14,7 @@
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
 #include "engine/rank.hpp"
+#include "vision/vision_weights.hpp"
 #include "engine/weight_convert.hpp"
 
 namespace qw {
@@ -57,6 +58,15 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         alloc_rank_buffers(rk, opt_, max_slot_tokens(), mtp_);
         log("rank %d loaded", r);
     }
+    if (!std::getenv("QW_NO_VISION"))
+        if (auto hw = load_vision_weights(st_)) {  // a copy of the vision tower on every card
+            for (auto &rkp : ranks_) {
+                CK(hipSetDevice(rkp->dev));
+                rkp->vit = std::make_unique<VisionEncoder>(*hw, rkp->blas, rkp->s);
+            }
+            vision_ = true;
+            log("vision tower: %.2f GB per card", double(ranks_[0]->vit->weight_bytes()) / 1e9);
+        }
     {  // keep the token embeddings (host-side lookups); unmap the checkpoint
         const TensorView &emb = st_.get("model.language_model.embed_tokens.weight", DType::BF16, {VOCAB, H});
         embed_.assign(emb.u16(), emb.u16() + size_t(VOCAB) * H);
@@ -130,6 +140,8 @@ void Engine::rank_loop(int r) {
                 run_prefill_rank(rk);
             else if (job_ == Job::Mtp)
                 run_mtp_rank(rk);
+            else if (job_ == Job::Vision)
+                run_vision_rank(rk);
             else
                 run_decode_rank(rk);
         } catch (const std::exception &e) {

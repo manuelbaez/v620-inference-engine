@@ -17,6 +17,15 @@ constexpr int VOCAB = 248320;
 constexpr int EOS = 248044;
 constexpr float EPS = 1e-6f;
 
+// Vision tokens. Inside the engine a vision token is a negative id (its
+// embedding is supplied by the prefill; the session derives the id from the
+// image's content hash, so the prefix cache tells images apart): odd for
+// images, even for videos. The n-gram table sees the pad token instead.
+constexpr int32_t IMAGE_PAD = 248056, VIDEO_PAD = 248057;
+constexpr int32_t real_token(int32_t t) {
+    return t >= 0 ? t : ((-t) & 1 ? IMAGE_PAD : VIDEO_PAD);
+}
+
 constexpr bool is_qsa(int layer) {
     return layer % 4 == 3;
 }

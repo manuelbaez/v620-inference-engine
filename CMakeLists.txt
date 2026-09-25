@@ -72,6 +72,8 @@ set(QW_HIP_SOURCES
   src/kernels/mtp.hip
   src/kernels/logits.hip
   src/kernels/blend.hip
+  src/kernels/vision.hip
+  src/vision/vision_encoder.hip
   src/comm/comm.hip
   src/engine/weights.hip
   src/engine/buffers.hip
@@ -81,16 +83,19 @@ set(QW_HIP_SOURCES
   src/engine/prefill.hip
   src/engine/snapshot.hip
   src/engine/host_tier.hip
-  src/engine/blend.hip)
+  src/engine/blend.hip
+  src/engine/vision_job.hip)
 # host code that includes HIP headers
 set(QW_HIP_HOST_SOURCES
   src/engine/device_mem.cpp
   src/engine/pinned_pool.cpp
   src/engine/weight_convert.cpp
+  src/vision/vision_weights.cpp
   src/session/session.cpp
   src/session/generate.cpp
   src/session/prefix_cache.cpp
   src/session/block_store.cpp
+  src/session/vision_cache.cpp
   src/session/disk_tier.cpp
   src/session/sampling.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} src/capi/capi.cpp PROPERTIES LANGUAGE HIP)
@@ -123,7 +128,7 @@ foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench)
 endforeach()
 qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)
 
-foreach(t test_comm test_batch_decode test_speculative test_host_tier test_snapshot_capture test_block_store test_moe test_gemv)
+foreach(t test_comm test_batch_decode test_speculative test_host_tier test_snapshot_capture test_block_store test_vision_encoder test_moe test_gemv)
   qw_gpu_program(${t} tests/gpu/${t}.hip)
 endforeach()
 add_test(NAME comm COMMAND test_comm)

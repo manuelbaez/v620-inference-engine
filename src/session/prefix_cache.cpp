@@ -78,6 +78,7 @@ void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
         const size_t n = prompt.size(), chunks = size_t((int64_t(n) - from + e_.prefill_chunk() - 1) / e_.prefill_chunk());
         store_->reserve((n - size_t(from)) / BlockStore::BLOCK + 2 * (caps.size() + chunks), caps.size() + chunks);
     }
+    const auto embeds = vision_embeds(from);
     size_t next = 0;
     e_.prefill(
         slot, rest, nullptr,
@@ -89,7 +90,7 @@ void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
             const int idx = save_snapshot(slot);
             if (store_ && pos >= min_gap_) store_->save(slot, idx, hist, &snaps_[size_t(idx)].logits);
         },
-        caps);
+        caps, embeds);
     reserved_.clear();
 }
 

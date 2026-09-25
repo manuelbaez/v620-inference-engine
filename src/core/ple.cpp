@@ -110,6 +110,7 @@ std::vector<NgramIds> NgramHasher::ids_for(const std::vector<int32_t> &history,
     std::vector<int32_t> ctx(history.end() - std::min<ptrdiff_t>(history.size(), cfg::NGRAM - 1), history.end());
     int hist = int(ctx.size());
     ctx.insert(ctx.end(), tokens.begin(), tokens.end());
+    for (auto &t : ctx) t = cfg::real_token(t);  // vision tokens hash as their pad token
     std::vector<NgramIds> out;
     out.reserve(tokens.size());
     int prev_eos = -1;  // latest EOS strictly before the current position

@@ -22,6 +22,8 @@ Session::Session(Engine &e)
         store_ = std::make_unique<BlockStore>(e_, budget, dir ? dir : "", size_t((dgb ? std::atof(dgb) : 200.0) * 1e9));
     }
     if (const char *g = std::getenv("QW_SNAP_MIN_GAP")) min_gap_ = std::max<int64_t>(1, std::atoll(g));
+    const char *vgb = std::getenv("QW_VISION_CACHE_GB");
+    vision_budget_ = size_t((vgb ? std::atof(vgb) : 2.0) * 1e9);
 }
 
 void Session::drop_snapshots_after(int slot, int64_t n) {

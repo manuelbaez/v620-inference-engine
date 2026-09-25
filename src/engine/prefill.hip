@@ -289,7 +289,8 @@ void Engine::run_prefill_rank(Rank &rk) {
 
 const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &tokens, std::vector<float> *all_logits,
                                           const std::function<void(int64_t)> &after_chunk,
-                                          const std::vector<Capture> &captures) {
+                                          const std::vector<Capture> &captures,
+                                          const std::vector<EmbedSpan> &embeds) {
     QW_CHECK(!tokens.empty(), "empty prefill");
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];
@@ -314,10 +315,21 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
         pemb_.resize(size_t(T) * H);
         pple_.resize(size_t(T) * H);
         for (int t = 0; t < T; ++t) {
-            QW_CHECK(chunk[size_t(t)] >= 0 && chunk[size_t(t)] < VOCAB, "token out of range");
-            for (int j = 0; j < H; ++j)
-                pemb_[size_t(t) * H + j] = bf16_to_f32(embed_[size_t(chunk[size_t(t)]) * H + j]);
+            const int32_t tok = chunk[size_t(t)];
+            QW_CHECK(tok < VOCAB, "token out of range");
+            if (tok < 0) continue;  // a vision token: its row comes from `embeds`
+            for (int j = 0; j < H; ++j) pemb_[size_t(t) * H + j] = bf16_to_f32(embed_[size_t(tok) * H + j]);
         }
+        int64_t covered = 0;
+        const int64_t c_start = sh.len;
+        for (const EmbedSpan &sp : embeds) {
+            const int64_t a = std::max(sp.pos, c_start), b = std::min(sp.pos + sp.n, c_start + T);
+            for (int64_t p = a; p < b; ++p)
+                std::memcpy(&pemb_[size_t(p - c_start) * H], sp.rows + size_t(p - sp.pos) * H, H * 4);
+            covered += std::max<int64_t>(0, b - a);
+        }
+        QW_CHECK(covered == std::count_if(chunk.begin(), chunk.end(), [](int32_t t) { return t < 0; }),
+                 "prefill: vision tokens without embeddings (or embeddings over text tokens)");
         auto ids = hasher_.ids_for(sh.hist, chunk);
         std::vector<float> e(H);
         for (int t = 0; t < T; ++t) {

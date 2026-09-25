@@ -14,6 +14,7 @@ from .engine import Engine
 from .output_parser import OutputParser
 from .prompt import ChatPrompt
 from .scheduler import Request, Scheduler
+from . import vision
 
 
 class Server:
@@ -32,6 +33,7 @@ class Server:
         im_start = self.tok.token_to_id("<|im_start|>")
         if im_start is not None:
             self.engine.set_boundary_token(im_start)
+        self.vision = vision.VisionPreprocessor(args.model_dir) if self.engine.has_vision else None
         self.sched = Scheduler(self.engine, args.mtp)
 
     def render(self, body):
@@ -41,7 +43,19 @@ class Server:
         return self.prompt.encode(text)
 
     # --- generation
-    async def run(self, prompt_ids, body):
+    async def media(self, body, prompt_ids):
+        """Decodes and preprocesses the request's images and videos (off the event loop) and
+        expands their placeholders in prompt_ids. Returns (prompt_ids, media)."""
+        parts = self.prompt.media_parts(body)
+        if not parts:
+            return prompt_ids, []
+        if self.vision is None:
+            raise ValueError("this engine has no vision tower")
+        loop = asyncio.get_running_loop()
+        media = await loop.run_in_executor(None, lambda: [vision.media_of_part(self.vision, p) for p in parts])
+        return vision.expand(prompt_ids, media, self.tok), media
+
+    async def run(self, prompt_ids, body, media=None):
         """Async generator of (kind, payload) events of one request: 'start'
         (cached prompt tokens), 'token' (id, logprob, top), 'eos', then 'end'
         (finish reason) or 'error'."""
@@ -51,7 +65,7 @@ class Server:
         def emit(kind, payload):
             loop.call_soon_threadsafe(q.put_nowait, (kind, payload))
 
-        req = Request(prompt_ids, body, emit, self.eos_ids)
+        req = Request(prompt_ids, body, emit, self.eos_ids, media)
         self.sched.submit(req)
         try:
             while True:
@@ -107,6 +121,10 @@ class Server:
         except jinja2.exceptions.TemplateError as e:
             return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
         prompt_ids = self.encode(text)
+        try:
+            prompt_ids, media = await self.media(body, prompt_ids)
+        except (ValueError, OSError) as e:
+            return web.json_response({"error": {"message": f"media: {e}", "type": "invalid_request_error"}}, status=400)
         parser = OutputParser(self.tok, thinking, tools, parse_tools=bool(tools))
         stops = self._stop_strings(body)
         rid = "chatcmpl-" + uuid.uuid4().hex
@@ -147,7 +165,7 @@ class Server:
         timings = None  # llama.cpp-style per-request timings (llama-swap's activity log reads them)
         reasoning_tokens = 0
         try:
-            async for kind, payload in self.run(prompt_ids, body):
+            async for kind, payload in self.run(prompt_ids, body, media):
                 if kind == "error":
                     raise RuntimeError(payload)
                 if kind == "start":

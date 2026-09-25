@@ -8,8 +8,9 @@ from .engine import Sampling
 
 
 class Request:
-    def __init__(self, prompt_ids, body, emit, eos_ids):
+    def __init__(self, prompt_ids, body, emit, eos_ids, media=None):
         self.prompt = prompt_ids
+        self.media = media or []  # vision.Media items of the prompt
         self.emit = emit
         self.cancelled = threading.Event()
         mt = body.get("max_completion_tokens") or body.get("max_tokens")
@@ -134,7 +135,7 @@ class Scheduler:
                 r.limit = min(r.max_new, room) if r.max_new else room
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
                 r.t_admit = time.time()
-                cached = self.e.set_prompt(slot, r.prompt)
+                cached = self.e.set_prompt(slot, r.prompt, r.media)
                 r.cached = cached
                 self.cache_stats = self.e.cache_stats()
                 r.emit("start", cached)

@@ -26,10 +26,41 @@ class ChatPrompt:
         self.template = env.from_string(src)
         self.eos_ids = {self.tok.token_to_id(t) for t in EOS_TEXT}
 
+    @staticmethod
+    def _normalize_parts(content):
+        """OpenAI part shapes the template does not know -> its own: video_url/input_video become
+        {"type": "video", "video": url}, input_image becomes {"type": "image_url", ...}."""
+        if not isinstance(content, list):
+            return content
+        out = []
+        for part in content:
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind in ("video_url", "input_video"):
+                src = part.get(kind) or part.get("video_url") or {}
+                part = {"type": "video", "video": src.get("url") if isinstance(src, dict) else src}
+            elif kind == "input_image":
+                src = part.get("image_url") or part.get("input_image") or {}
+                part = {"type": "image_url", "image_url": src if isinstance(src, dict) else {"url": src}}
+            out.append(part)
+        return out
+
+    def media_parts(self, body):
+        """The image and video parts of the messages, in the order the template renders them."""
+        parts = []
+        for m in body.get("messages", []):
+            content = self._normalize_parts(m.get("content"))
+            if isinstance(content, list):
+                for p in content:
+                    if isinstance(p, dict) and ("image" in p or "image_url" in p or p.get("type") == "image" or
+                                                "video" in p or p.get("type") == "video"):
+                        parts.append(p)
+        return parts
+
     def render(self, body):
         messages = []
         for m in body.get("messages", []):
             m = dict(m)
+            m["content"] = self._normalize_parts(m.get("content"))
             rc = m.get("reasoning_content", m.get("reasoning"))
             if rc is not None:
                 m["reasoning_content"] = rc
