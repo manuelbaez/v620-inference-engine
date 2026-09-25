@@ -468,6 +468,16 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    serving production through llama-swap and litellm.
 8. **CacheBlend experiment.** Done: rejected on quality (see above); exact
    block-level reuse shipped instead.
+9. **Performance, next** (details and estimates in "Next steps" below):
+   - [ ] int8 dense weights (W8A16), behind a logprob quality gate
+   - [ ] collectives fused into their producer and consumer kernels
+   - [ ] fewer, bigger decode kernels (fuse each sublayer's glue)
+   - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
+   - [ ] MTP drafting inside one graph (device-side argmax and embedding)
+   - [ ] MTP off while acceptance stays low, with a catch-up pass on resume
+   - [ ] root-cause multi-request speculative batches over 8 rows
+   - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
+   - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention
 
 ## Next steps: where the time goes (profiled 2026-09-25)
 
