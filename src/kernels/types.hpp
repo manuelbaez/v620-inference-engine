@@ -23,6 +23,8 @@ constexpr int QSA_LAYERS_MAX = N_QSA + 1;  // + the MTP layer
 constexpr int D_PAD = 328;                 // HC down outputs (320 + 4 inject) padded to 16 bytes
 constexpr int LIST_W = 2052;               // QSA attention token-list width (512 groups x 4 + tail)
 
+// K/V/ck hold fp16 bits: store with __half_as_ushort (assigning a __half to a
+// uint16_t converts the value to an integer).
 struct SlotPtrs {
     uint16_t *K[QSA_LAYERS_MAX], *V[QSA_LAYERS_MAX], *ck[QSA_LAYERS_MAX];
     float *raw_k[QSA_LAYERS_MAX];

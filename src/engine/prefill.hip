@@ -185,7 +185,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         m.pend = b.out_moe;
     };
 
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int l = 0; l < debug_layers_; ++l) {
         LayerW &w = rk.L[size_t(l)];
         for (auto &m : mbs) {
             PrefillBuf &b = *m.b;

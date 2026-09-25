@@ -1,4 +1,5 @@
 // Checks the batched decode path on real weights:
+//   0. decoding a prompt token by token matches prefill (logprobs);
 //   1. several sequences decoded together == each decoded alone (greedy tokens,
 //      and max |logit difference|, expected 0: rows share no arithmetic);
 //   2. k tokens of one sequence as one multi-row step (the speculative
@@ -58,6 +59,34 @@ int main(int argc, char **argv) {
         const auto A = parse_ids(a_s), B = parse_ids(b_s);
         Engine e(opt);
         int fails = 0;
+
+        // ---- 0. decode vs prefill: the prompt token by token must give the
+        // prefill's distributions (different kernels, same math)
+        {
+            auto logprob = [](const float *l, int32_t tok) {
+                const float mx = *std::max_element(l, l + cfg::VOCAB);
+                double z = 0;
+                for (int i = 0; i < cfg::VOCAB; ++i) z += std::exp(double(l[i] - mx));
+                return double(l[tok] - mx) - std::log(z);
+            };
+            std::vector<float> all;
+            e.slot_reset(0);
+            e.prefill(0, A, &all);
+            e.slot_reset(0);
+            double sum = 0, mx = 0;
+            for (size_t t = 0; t + 1 < A.size(); ++t) {
+                const auto &d = e.decode({{0, A[t]}});
+                const double diff =
+                    std::fabs(logprob(all.data() + t * cfg::VOCAB, A[t + 1]) - logprob(d.data(), A[t + 1]));
+                sum += diff;
+                mx = std::max(mx, diff);
+            }
+            const double mean = sum / double(A.size() - 1);
+            const bool ok = mean < 0.05 && mx < 0.3;  // fp16 paths differ ~0.01-0.03; a real bug is ~1 nat
+            fails += !ok;
+            std::printf("decode vs prefill on A: mean |dlogprob| %.4f, max %.4f: %s\n", mean, mx,
+                        ok ? "ok" : "MISMATCH");
+        }
 
         // ---- 1. alone vs together
         auto alone = [&](const std::vector<int32_t> &p, std::vector<int> &toks, std::vector<std::vector<float>> &lg) {

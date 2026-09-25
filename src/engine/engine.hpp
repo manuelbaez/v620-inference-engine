@@ -76,6 +76,11 @@ public:
     const std::vector<float> &logits_rows_lse() const { return dlse_; }
     void set_logits(const std::vector<float> &l) { logits_ = l; }
 
+    // Debugging: run only the first n decoder layers (then the final mixer and
+    // lm_head) in prefill and decode. Needs QW_NOGRAPH (graphs keep the layer
+    // count they were captured with).
+    void set_debug_layers(int n) { debug_layers_ = n; }
+
     // ---- MTP speculative decoding
     bool has_mtp() const { return mtp_; }
     // Keeps the first n rows of `slot`'s run in the last decode (1 <= n <= run
@@ -140,6 +145,7 @@ private:
     std::vector<SlotHost> slots_;
 
     bool mtp_ = false;
+    int debug_layers_ = cfg::N_LAYERS;
     // current jobs (host side, read by every rank thread)
     enum class Job { Prefill, Decode, Mtp } job_ = Job::Decode;
     struct PrefillJob {

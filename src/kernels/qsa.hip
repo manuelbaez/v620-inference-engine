@@ -143,8 +143,8 @@ __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, 
     }
     norm_shared(kp, kn, buf, HEAD_DIM, red);
     rope_shared(buf, pos);
-    sp.K[qi][pos * HEAD_DIM + t] = __float2half(buf[t]);
-    sp.V[qi][pos * HEAD_DIM + t] = __float2half(vp[t]);
+    sp.K[qi][pos * HEAD_DIM + t] = __half_as_ushort(__float2half(buf[t]));
+    sp.V[qi][pos * HEAD_DIM + t] = __half_as_ushort(__float2half(vp[t]));
     __syncthreads();
     for (int h = 0; h < IDX_HEADS; ++h) {
         norm_shared(ip + h * IDX_DIM, iqn, buf, IDX_DIM, red);
@@ -174,7 +174,7 @@ __global__ __launch_bounds__(128) void qsa_compress_B_kernel(const float *ikn, c
     const float ss = block_sum<4>(mean[t] * mean[t], red);
     buf[t] = mean[t] * rsqrtf(ss / IDX_DIM + EPS) * ikn[t];
     rope_shared(buf, pos + 1 - IDX_RATIO);
-    sp.ck[qi][(pos / IDX_RATIO) * IDX_DIM + t] = __float2half(buf[t]);
+    sp.ck[qi][(pos / IDX_RATIO) * IDX_DIM + t] = __half_as_ushort(__float2half(buf[t]));
 }
 
 void qsa_compress_B(const float *ikn, const SlotPtrs *tab, int qi, Rows rows, hipStream_t s) {

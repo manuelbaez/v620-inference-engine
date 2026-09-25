@@ -117,7 +117,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
 
     gpu::embed_T(b.X, b.emb, M, s);
     const float *pend = nullptr;
-    for (int l = 0; l < N_LAYERS; ++l) {
+    for (int l = 0; l < debug_layers_; ++l) {
         if (l == PLE_LAYER) {
             if (pend) gpu::hc_combine_T(b.X, pend, b.inj_mlp, M, s);
             pend = nullptr;

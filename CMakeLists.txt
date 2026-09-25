@@ -101,6 +101,7 @@ function(qw_gpu_program name src)
 endfunction()
 
 qw_gpu_program(qw_gpu_cli tools/qw_gpu.hip)
+qw_gpu_program(qw_layer_diff tools/qw_layer_diff.hip)
 set_target_properties(qw_gpu_cli PROPERTIES OUTPUT_NAME qw_gpu)
 
 foreach(b p2p_bench gemm_bench uncached_bench)
