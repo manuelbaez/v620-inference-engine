@@ -459,12 +459,74 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 1. **Reference and spec.** Done: CPU fp32 reference (`src/ref`), validated against vLLM.
 2. **Kernels.** Done, validated end to end against the reference and vLLM.
 3. **4-GPU runtime.** Done: TP/EP, P2P collectives, graph-captured batched decode.
-4. **Prefix cache tiers.** Per-slot reuse, VRAM snapshots and a host-RAM tier
-   done; a disk tier (restart survival) next.
+4. **Prefix cache tiers.** Done: per-slot reuse, VRAM snapshots, and the
+   block store in RAM and on disk, shared by all conversations.
 5. **MTP speculative decoding.** Done, with adaptive K. Next: draft steps inside
    one graph (device-side argmax and embedding lookup).
 6. **Prefill kernels.** Done (two micro-batches, optional W4A8); chunked GDN next.
-7. **OpenAI-compatible server and tokenizer.** Done (continuous batching); a
-   llama-swap entry in home-infra pending.
+7. **OpenAI-compatible server and tokenizer.** Done (continuous batching),
+   serving production through llama-swap and litellm.
 8. **CacheBlend experiment.** Done: rejected on quality (see above); exact
    block-level reuse shipped instead.
+
+## Next steps: where the time goes (profiled 2026-09-25)
+
+Single-stream decode is 15.0 ms per step (66 tok/s plain, 90-106 with MTP at
+temperature 0). A `rocprofv3 --kernel-trace` of 300 steps (`qw_gpu --gen
+300`), per step on one rank (tracing inflates the collective waits, not the
+kernel durations):
+
+| | per step |
+|---|---|
+| dense GEMVs (`gemv_rows`, 339 launches) | 4.9 ms: ~86% of the card's bandwidth for the fp16 weights |
+| other compute (MoE pairs 1.0, HC mixers 0.9, QSA 0.4, GDN 0.3, routing 0.3 ms) | ~3.5 ms |
+| collectives: 291 (3 per HC mix: all-reduce, all-gather, reduce-scatter; 97 mixes) | push + receive kernels, 582 launches |
+| kernel launches in the graph | 1,585 |
+
+So ~8.5 ms is compute and ~6.5 ms is collective latency and launch gaps. The
+GEMVs are near the bandwidth limit, so the remaining gains are in bytes,
+launches and collectives, in this order of expected payoff:
+
+1. **int8 dense weights (W8A16).** Dense fp16 weights are 88% of the bytes
+   read per token. Per-channel int8 copies halve the GEMV time (~-2.4 ms per
+   step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
+   against the fp32 reference (`qw_gpu --logprobs`) must stay near today's
+   0.074 (fp16), and greedy output should match on the test prompts.
+2. **Fuse the collectives into their producers and consumers.** Each
+   collective is a separate push kernel and a separate receive kernel. The
+   producing GEMV or mixer can store its slice straight into the peers'
+   buffers, and the consuming kernel can wait on the flags itself, as the
+   design intended (section P2P). That removes ~580 launches per step and
+   their gaps; estimate -1.5 to -3 ms.
+3. **Fewer, bigger kernels.** The ~1,000 small kernels (HC pre/norm/mix,
+   routing, combine, swiglu, GDN conv/scan/norm) each cost a launch gap of a
+   few µs in the graph. Fusing each sublayer's glue into its neighbours
+   (e.g. routing + combine into the expert kernels, GDN conv + scan + norm in
+   one kernel) should save another ~1-2 ms.
+4. **One collective fewer per sublayer.** The next HC mix's down projection
+   is linear in the residual, so each rank could apply it to its unreduced
+   block output instead of waiting for the reduce-scatter (97 fewer
+   collectives per step), at the cost of reading the HC-down weights for the
+   full width. Needs measuring: ~-1.5 ms of latency against ~+0.3 ms of reads.
+5. **MTP drafting inside one graph.** Drafting costs ~4 ms per step (3 MTP
+   passes with a host round trip each for argmax and the next embedding).
+   Device-side argmax and embedding lookup make it one graph launch: ~-2.5 ms
+   per step, ~10% of MTP throughput.
+6. **Stop drafting when acceptance stays low.** On hard-to-predict text MTP
+   can be slower than plain decoding (63 vs 68 tok/s on the second test
+   prompt, 1.7 tokens per step), and temperature 1.0 is probably also below
+   plain. The adaptive draft count never goes below 1, because the first MTP
+   pass also keeps the MTP layer's KV current. Plan: when a request's
+   acceptance EMA stays under a threshold, switch it to plain decoding
+   (K = 0); probe again every N steps, first running one MTP pass over the
+   tokens decoded since drafting stopped to bring the MTP KV up to date (the
+   same catch-up path prefill uses, `mtp_pend`).
+7. **Multi-request speculative batches over 8 rows.** Root-cause the open
+   issue above; lifting the 8-row cap lets 3-4 concurrent requests draft 3
+   tokens each instead of 1.
+8. **GPU-side sampling.** Top-k/top-p/min-p sampling costs 0.2-0.7 ms per
+   token on the host at temperature > 0; doing it per vocab shard on the GPUs
+   (like the log-sum-exp) saves most of that.
+9. **Prefill.** ~2,000 tok/s. Profile a long prefill the same way before
+   choosing: candidates are the chunked (WY) GDN kernel, the fp32-output
+   router GEMM (rocBLAS falls back to a slow HSS kernel), and QSA attention.
