@@ -491,7 +491,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    block-level reuse shipped instead.
 9. **Performance, next** (details and estimates in "Next steps" below):
    - [ ] int8 dense weights (W8A16), behind a logprob quality gate
-   - [ ] collectives fused into their producer and consumer kernels
+   - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [ ] fewer, bigger decode kernels (fuse each sublayer's glue)
    - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
    - [ ] MTP drafting inside one graph (device-side argmax and embedding)
@@ -567,7 +567,16 @@ launches and collectives, in this order of expected payoff:
    step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
    against the fp32 reference (`qw_gpu --logprobs`) must stay near today's
    0.074 (fp16), and greedy output should match on the test prompts.
-2. **Fuse the collectives into their producers and consumers.** Each
+2. **Fuse the collectives into their producers and consumers.** Measured
+   first (`bench/graph_launch_bench`): a dependent kernel in a graph costs
+   ~3.3 µs on this card. Step one, done: a small collective is one kernel
+   (four push blocks and a waiting/reducing block) instead of two
+   (`exchange_small_kernel`, `QW_COMM_SPLIT=1` restores two): 18.8 -> 15.7 µs
+   per chained all-reduce, but decode only goes 15.0 -> 14.8 ms per step,
+   because each collective's time is mostly the cross-GPU round trip, which a
+   launch gap overlaps. Folding the push into the producer and the wait into
+   the consumer would save as little, so collectives are better attacked by
+   count (item 4) or by overlapping them with compute. Original note: Each
    collective is a separate push kernel and a separate receive kernel. The
    producing GEMV or mixer can store its slice straight into the peers'
    buffers, and the consuming kernel can wait on the flags itself, as the

@@ -44,17 +44,17 @@ struct PushArgs {
 // once (12 concurrent cross-NUMA flows) measured ~6x slower on this box.
 // The last block to finish a destination raises its flag; every block fences
 // its own stores before counting.
-__global__ __launch_bounds__(256) void push_kernel(PushArgs a) {
+__device__ void push_body(const PushArgs &a, int block) {
     const uint32_t seq = *a.base + a.k;
     const int par = int(seq & 1);
     const int row16 = int(a.row16);
     // Small payloads (latency-bound) go to all peers at once: block b serves
     // destination b. Large ones rotate as described above.
     const bool concurrent = a.concurrent != 0;
-    for (int dd = concurrent ? int(blockIdx.x) : 0; dd < (concurrent ? int(blockIdx.x) + 1 : RANKS); ++dd) {
+    for (int dd = concurrent ? block : 0; dd < (concurrent ? block + 1 : RANKS); ++dd) {
         const int d = (a.rank + dd) % RANKS;
         const int nblk = concurrent ? 1 : int(gridDim.x);
-        const int blk = concurrent ? 0 : int(blockIdx.x);
+        const int blk = concurrent ? 0 : block;
         uint4 *dst = reinterpret_cast<uint4 *>(a.recv[d] + (size_t(par) * RANKS + a.rank) * a.slot);
         const uint8_t *src = a.src + a.src_dest_offset * d;
         if (a.rows == 1) {
@@ -79,6 +79,10 @@ __global__ __launch_bounds__(256) void push_kernel(PushArgs a) {
             }
         }
     }
+}
+
+__global__ __launch_bounds__(256) void push_kernel(PushArgs a) {
+    push_body(a, int(blockIdx.x));
 }
 
 struct RecvArgs {
@@ -126,14 +130,15 @@ __global__ void wait_kernel(RecvArgs a) {
     wait_flags(a, int(seq & 1), seq);
 }
 
-__global__ __launch_bounds__(256) void recv_kernel(RecvArgs a) {
+// Reduces or concatenates the 4 slots into dst; `blk` of `nblk` blocks.
+__device__ void recv_body(const RecvArgs &a, int blk, int nblk) {
     const uint32_t seq = *a.base + a.k;
     const int par = int(seq & 1);
     const uint8_t *slots = a.recv + size_t(par) * RANKS * a.slot;
     if (a.wait) wait_flags(a, par, seq);
     __syncthreads();
-    const size_t stride = size_t(gridDim.x) * blockDim.x;
-    const size_t start = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    const size_t stride = size_t(nblk) * blockDim.x;
+    const size_t start = blk * size_t(blockDim.x) + threadIdx.x;
     if (a.op == 0) {  // sum fp32 -> fp32, same layout
         const size_t n = size_t(a.rows) * a.row_bytes / 4;
         const float *s0 = reinterpret_cast<const float *>(slots);
@@ -159,13 +164,28 @@ __global__ __launch_bounds__(256) void recv_kernel(RecvArgs a) {
     } else {  // concat, interleaved per row: dst[t][q][row_bytes]
         const int r16 = int(a.row_bytes / 16);
         uint4 *dst = static_cast<uint4 *>(a.dst);
-        for (int row = blockIdx.x; row < a.rows; row += gridDim.x)
+        for (int row = blk; row < a.rows; row += nblk)
             for (int c = threadIdx.x; c < r16 * RANKS; c += blockDim.x) {
                 const int q = c / r16, cc = c - q * r16;
                 dst[size_t(row) * r16 * RANKS + c] =
                     reinterpret_cast<const uint4 *>(slots + q * a.slot)[size_t(row) * r16 + cc];
             }
     }
+}
+
+__global__ __launch_bounds__(256) void recv_kernel(RecvArgs a) {
+    recv_body(a, int(blockIdx.x), int(gridDim.x));
+}
+
+// A small collective in one kernel (one launch instead of two): blocks 0..3
+// push to one destination each, the last block waits for the 4 slots and
+// reduces them. All 5 blocks are resident at once, so the waiting block never
+// holds up the pushes.
+__global__ __launch_bounds__(256) void exchange_small_kernel(PushArgs pa, RecvArgs ra) {
+    if (int(blockIdx.x) < RANKS)
+        push_body(pa, int(blockIdx.x));
+    else
+        recv_body(ra, 0, 1);
 }
 
 }  // namespace
@@ -250,7 +270,6 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     static const size_t concurrent_max =
         std::getenv("QW_COMM_CONCURRENT_MAX") ? size_t(std::atol(std::getenv("QW_COMM_CONCURRENT_MAX"))) : 32768;
     pa.concurrent = bytes <= concurrent_max;
-    push_kernel<<<pa.concurrent ? RANKS : std::max(blocks, 1), 256, 0, s>>>(pa);
     RecvArgs ra;
     ra.recv = recv_[size_t(r)];
     ra.flags = flags_[size_t(r)];
@@ -267,6 +286,12 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
         std::getenv("QW_COMM_RECV_BYTES") ? size_t(std::atol(std::getenv("QW_COMM_RECV_BYTES"))) : 65536;
     const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS + recv_bytes - 1) / recv_bytes)));
     ra.wait = rblocks == 1;
+    static const bool split = std::getenv("QW_COMM_SPLIT") != nullptr;  // two launches, as before
+    if (pa.concurrent && ra.wait && !split) {
+        exchange_small_kernel<<<RANKS + 1, 256, 0, s>>>(pa, ra);
+        return;
+    }
+    push_kernel<<<pa.concurrent ? RANKS : std::max(blocks, 1), 256, 0, s>>>(pa);
     if (!ra.wait) wait_kernel<<<1, 64, 0, s>>>(ra);
     recv_kernel<<<rblocks, 256, 0, s>>>(ra);
 }
