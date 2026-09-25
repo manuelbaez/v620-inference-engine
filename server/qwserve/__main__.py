@@ -18,7 +18,7 @@ def main():
     ap.add_argument("--ple-dir", default="/mnt/llms/qwen3.8-flash-next-ple/ples_int4")
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "libqw_engine.so"))
     ap.add_argument("--served-model-name", default="qw/qwen3.8-flash-next")
-    ap.add_argument("--slots", default="131072,65536,32768,32768",
+    ap.add_argument("--slots", default="262144,65536,32768,32768",
                     help="context size of each sequence slot (concurrent requests); the largest is max_model_len")
     ap.add_argument("--prefill-chunk", type=int, default=8192)
     ap.add_argument("--mtp", type=int, default=3, help="MTP draft tokens per step (0: no speculative decoding)")

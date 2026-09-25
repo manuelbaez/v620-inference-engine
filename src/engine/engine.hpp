@@ -32,7 +32,7 @@ struct EngineOptions {
     std::string ple_dir = "/mnt/llms/qwen3.8-flash-next-ple/ples_int4";
     std::array<int, RANKS> devices{0, 1, 2, 3};
     // KV capacity (tokens) of each sequence slot; multiples of 256.
-    std::vector<int> slot_tokens{131072, 65536, 32768, 32768};
+    std::vector<int> slot_tokens{262144, 65536, 32768, 32768};
     int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion
