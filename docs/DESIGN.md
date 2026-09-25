@@ -321,14 +321,55 @@ Measured on short prompts: 2.5-2.6 tokens per step, 24.4 ms verification +
 production vLLM with MTP: ~56-65). Through the server, 4 concurrent requests
 reach 180 tok/s aggregate.
 
+## Host-RAM tier of the prefix cache (2026-09-25)
+
+A slot holds one conversation; when a new, unrelated prompt takes the slot,
+the slot's longest recurrent-state snapshot (normally the end of its last
+prompt) is copied with the KV of its positions to pinned host memory
+(`Engine::export_state`: ~81 KB per token plus ~126 MB of recurrent state for
+all ranks; 0.5 GB for 4k tokens). A later prompt that extends a saved one is
+restored into a slot (`import_state`) and only the new tokens are
+prefilled. Measured: 4,000 tokens restored in 0.07-0.1 s against a 2.7 s
+prefill; the result is bit-identical to continuing in place
+(`tests/gpu/test_host_tier`). Budget `QW_HOST_CACHE_GB` (default 48, LRU),
+entries of at least 1,024 tokens. This is the LMCache role (a RAM tier
+behind the GPU prefix cache) inside the engine process; it does not survive
+restarts yet.
+
+## Adaptive draft count
+
+Each request keeps a running per-draft acceptance a (updated per verified
+draft) and drafts K in [1, 3] tokens maximizing expected tokens per step cost:
+(1 + a + ... + a^K) / (1 + beta (K - 1)), beta ~0.2 (one more verification row
+plus one more MTP pass relative to a step; `QW_SPEC_COST`). K >= 1 because the
+first MTP pass also keeps the MTP layer's KV current.
+
+## Platform stability (main-srv, 2026-09-25)
+
+The PCIe path above two of the cards (root port 80:03.1, switch port
+83:00.0) logs correctable Data Link Layer AER events in bursts while the GPUs
+are busy (87 in 3 hours; the kernel runs `pcie_aspm.policy=powersave`). Every
+intermittent failure seen here fell inside such a burst: a rank stuck forever,
+GPU memory aperture violations, and non-reproducible output differences in
+multi-sequence speculative batches; the same tests pass repeatedly between
+bursts. home-infra's tuning notes record the same class of failures for vLLM's
+P2P all-reduce and SDMA copies on this box, and the amdgpu/ASPM kernel
+parameters they recommend (aspm off, runpm=0, noretry=1, PCIe gen cap) are
+not all in place. Engine-side mitigations: copies run as compute-shader
+blits (`HSA_ENABLE_SDMA=0`, set by the engine unless overridden); a
+collective that times out makes every later wait give up at once and the
+engine fails with the waiting rank, missing peer and collective offset; a
+dispatch watchdog logs the stuck job and each rank's phase every 60 s.
+
 ## Roadmap
 
 1. **Reference and spec.** Done: CPU fp32 reference (`src/ref`), validated against vLLM.
 2. **Kernels.** Done, validated end to end against the reference and vLLM.
 3. **4-GPU runtime.** Done: TP/EP, P2P collectives, graph-captured batched decode.
-4. **Prefix cache tiers.** Per-slot reuse and snapshots done; LMCache offload tier next.
-5. **MTP (K=3) speculative decoding.** Done. Next: draft steps inside one graph
-   (device-side argmax and embedding lookup), adaptive K.
+4. **Prefix cache tiers.** Per-slot reuse, VRAM snapshots and a host-RAM tier
+   done; a disk tier (restart survival) next.
+5. **MTP speculative decoding.** Done, with adaptive K. Next: draft steps inside
+   one graph (device-side argmax and embedding lookup).
 6. **Prefill kernels.** Done (two micro-batches, optional W4A8); chunked GDN next.
 7. **OpenAI-compatible server and tokenizer.** Done (continuous batching); a
    llama-swap entry in home-infra pending.

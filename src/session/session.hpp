@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -89,9 +90,21 @@ private:
         std::vector<int32_t> stop;    // stop tokens of the current request
         std::vector<int32_t> drafts;  // MTP drafts following drafts_for
         int32_t drafts_for = -1;
+        float accept = 0.8f;  // running per-draft acceptance (adaptive draft count)
     };
+    // host-RAM tier (host_tier.cpp)
+    struct HostEntry {
+        std::vector<int32_t> tokens;  // the state is exactly after these
+        std::vector<float> logits;    // after tokens.back()
+        std::shared_ptr<Engine::HostState> state;
+        size_t bytes = 0;
+        uint64_t used = 0;
+    };
+    void offload_slot(int slot, const std::vector<int32_t> &next_prompt);
+    int best_host_entry(const std::vector<int32_t> &prompt, size_t at_least) const;
     void save_snapshot(int slot);
     void drop_snapshots_after(int slot, int64_t n);
+    int draft_count(int slot, int k_max) const;
     int32_t sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known = NAN,
                           size_t hist_len = SIZE_MAX);
     size_t reusable(int slot, const std::vector<int32_t> &prompt) const;
@@ -99,6 +112,9 @@ private:
     Engine &e_;
     std::vector<SlotInfo> slots_;
     std::vector<Snap> snaps_;
+    std::vector<HostEntry> host_;
+    size_t host_bytes_ = 0, host_budget_ = 0;
+    size_t host_min_tokens_ = 1024;
     std::vector<int> row_slot_;  // slot of each row of the last decode
     std::vector<StepOut> out_;
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)

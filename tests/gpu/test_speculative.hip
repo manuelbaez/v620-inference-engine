@@ -15,6 +15,7 @@
 #include "core/common.hpp"
 #include "core/config.hpp"
 #include "engine/engine.hpp"
+#include "session/session.hpp"
 
 using namespace qw;
 
@@ -174,6 +175,61 @@ int main(int argc, char **argv) {
             fails += !same;
             std::printf("%zu prompts together: %.1f tok/s aggregate, %s\n", prompts.size(),
                         double(prompts.size() * size_t(gen - 1)) / dt, same ? "SAME tokens" : "DIFFERENT tokens");
+        }
+        // Session::generate (the server's path): speculative (k = 3) vs plain (k = 0), all prompts at once
+        {
+            Session ses(e);
+            SamplingParams greedy;
+            greedy.temperature = 0.f;
+            auto gen_all = [&](int k) {
+                std::vector<int> slots;
+                std::vector<std::vector<int32_t>> outs(prompts.size());
+                std::vector<int32_t> pending(prompts.size());
+                for (size_t p = 0; p < prompts.size(); ++p) {
+                    const int sl = ses.acquire(prompts[p], gen);
+                    ses.set_prompt(sl, prompts[p]);
+                    pending[p] = ses.sample_prompt(sl, greedy);
+                    outs[p].push_back(pending[p]);
+                    slots.push_back(sl);
+                }
+                for (;;) {
+                    std::vector<Session::StepReq> reqs;
+                    std::vector<size_t> idx;
+                    for (size_t p = 0; p < prompts.size(); ++p)
+                        if (int(outs[p].size()) < gen) {
+                            reqs.push_back({slots[p], pending[p], gen - int(outs[p].size()), greedy});
+                            idx.push_back(p);
+                        }
+                    if (reqs.empty()) break;
+                    const auto &res = ses.generate(reqs, k);
+                    for (size_t j = 0; j < idx.size(); ++j) {
+                        auto &o = outs[idx[j]];
+                        o.insert(o.end(), res[j].tokens.begin(), res[j].tokens.end());
+                        pending[idx[j]] = res[j].tokens.back();
+                    }
+                }
+                for (int sl : slots) ses.release(sl);
+                for (auto &o : outs) o.resize(size_t(gen));
+                return outs;
+            };
+            for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+            const auto plain = gen_all(0);
+            for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+            const auto spec = gen_all(K);
+            bool same = true;
+            for (size_t p = 0; p < prompts.size(); ++p) {
+                const bool sp = plain[p] == spec[p] && plain[p] == ref[p];
+                if (!sp) {
+                    size_t kk = 0;
+                    while (kk < plain[p].size() && plain[p][kk] == spec[p][kk] && plain[p][kk] == ref[p][kk]) ++kk;
+                    std::printf("  session prompt %zu differs at %zu: ref %d plain %d spec %d\n", p, kk, ref[p][kk],
+                                plain[p][kk], spec[p][kk]);
+                }
+                same = same && sp;
+            }
+            fails += !same;
+            std::printf("session generate, %zu prompts at once: plain == spec == engine greedy: %s\n", prompts.size(),
+                        same ? "SAME" : "DIFFERENT");
         }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;

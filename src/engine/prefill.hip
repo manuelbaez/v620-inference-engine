@@ -249,6 +249,7 @@ void Engine::run_prefill_rank(Rank &rk) {
     }
     for (auto &m : mbs) {
         *m.seq_base += m.k;
+        phase_[size_t(r)] = 2;
         CK(hipStreamSynchronize(m.s));
     }
     for (auto &[m, r0] : outs)

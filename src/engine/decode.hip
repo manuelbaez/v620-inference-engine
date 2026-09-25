@@ -206,6 +206,7 @@ void Engine::run_decode_rank(Rank &rk) {
     const auto t1 = std::chrono::steady_clock::now();
     CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
     CK(hipMemcpyAsync(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
+    phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(dlse_parts_.data() + size_t(r) * gpu::MAX_ROWS * 2, b.h_lse, size_t(M) * 2 * 4);
     for (int i = 0; i < M; ++i)
@@ -237,6 +238,7 @@ void Engine::run_mtp_rank(Rank &rk) {
     launch_graph(s, g, nc, [&] { return record_batch(rk, M, 2); });
     rk.seq_base += nc;
     CK(hipMemcpyAsync(b.h_amax, b.amax, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
+    phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(damax_parts_.data() + size_t(r) * MR * 2, b.h_amax, size_t(M) * 2 * 4);
 }

@@ -10,6 +10,29 @@
 
 namespace qw {
 
+// Drafts for a request's next step: K in [1, k_max] maximizing expected
+// tokens per step cost, with draft j accepted with probability a^j (a: the
+// slot's running acceptance) and each draft beyond the first costing beta
+// (one more verification row plus one more MTP pass, ~0.2 of a step).
+// K >= 1: the first MTP pass also keeps the MTP layer's KV current.
+int Session::draft_count(int slot, int k_max) const {
+    static const float beta = std::getenv("QW_SPEC_COST") ? float(std::atof(std::getenv("QW_SPEC_COST"))) : 0.2f;
+    if (k_max <= 1) return k_max;
+    const float a = slots_[size_t(slot)].accept;
+    int best = 1;
+    float best_rate = 0.f, expect = 1.f, p = 1.f;
+    for (int K = 1; K <= k_max; ++K) {
+        p *= a;
+        expect += p;
+        const float rate = expect / (1.f + beta * float(K - 1));
+        if (rate > best_rate) {
+            best_rate = rate;
+            best = K;
+        }
+    }
+    return best;
+}
+
 void Session::set_stop_tokens(int slot, std::vector<int32_t> ids) {
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     slots_[size_t(slot)].stop = std::move(ids);
@@ -59,7 +82,9 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         }
     }
     if (!dreqs.empty()) {
-        const auto &d = e_.draft(dreqs, k_max);
+        int kd = 1;
+        for (const auto &dq : dreqs) kd = std::max(kd, draft_count(dq.slot, k_max));
+        const auto &d = e_.draft(dreqs, kd);
         for (size_t j = 0; j < which.size(); ++j) {
             SlotInfo &si = slots_[size_t(reqs[which[j]].slot)];
             si.drafts = d[j];
@@ -76,7 +101,8 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         const SlotInfo &si = slots_[size_t(rq.slot)];
         QW_CHECK(rq.budget >= 1 && room(rq.slot) >= 1, "generate: request has no room left");
         if (k_max > 0 && si.drafts_for == rq.pending)
-            n_drafts[i] = int(std::min<int64_t>({k_max, int64_t(si.drafts.size()), rq.budget - 1, room(rq.slot) - 1}));
+            n_drafts[i] = int(std::min<int64_t>(
+                {draft_count(rq.slot, k_max), int64_t(si.drafts.size()), rq.budget - 1, room(rq.slot) - 1}));
         out_[i].first_row = int(rows.size());
         rows.push_back({rq.slot, rq.pending});
         for (int j = 0; j < n_drafts[i]; ++j) rows.push_back({rq.slot, si.drafts[size_t(j)]});
@@ -107,6 +133,11 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
             if (j == n_drafts[i] || tok != si.drafts[size_t(j)]) break;
         }
         const int keep = int(o.tokens.size());  // rows kept: their inputs are committed
+        // acceptance: drafts 0..keep-2 confirmed, draft keep-1 rejected (unless all were or a stop cut it)
+        constexpr float rate = 0.1f;
+        const int confirmed = keep - 1;
+        for (int j = 0; j < confirmed; ++j) si.accept += rate * (1.f - si.accept);
+        if (!o.stopped && confirmed < n_drafts[i]) si.accept += rate * (0.f - si.accept);
         e_.accept(rq.slot, keep);
         si.hist.resize(base + size_t(keep));
         si.drafts_for = -1;
@@ -118,7 +149,9 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
     }
     g_trace.lap(3);
     if (!next.empty()) {
-        const auto &d = e_.draft(next, k_max);
+        int kd = 1;
+        for (const auto &nq : next) kd = std::max(kd, draft_count(nq.slot, k_max));
+        const auto &d = e_.draft(next, kd);
         for (size_t j = 0; j < which.size(); ++j) {
             SlotInfo &si = slots_[size_t(reqs[which[j]].slot)];
             si.drafts = d[j];

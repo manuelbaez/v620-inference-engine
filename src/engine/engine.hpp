@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -106,6 +107,16 @@ public:
     void snapshot_save(int snap, int slot);
     void snapshot_restore(int snap, int slot, int64_t n, const std::vector<int32_t> &tail);
 
+    // ---- host-RAM tier (host_tier.hip): a slot's state at n tokens, copied
+    // to pinned host memory and back. The recurrent state comes from VRAM
+    // snapshot `snap` (taken at exactly n tokens of this slot), the KV from
+    // the slot's positions [0, n).
+    struct HostState;  // per-rank pinned buffers
+    std::shared_ptr<HostState> export_state(int slot, int snap, int64_t n);
+    // Makes `slot` hold the exported state (n tokens; tail: its last tokens).
+    void import_state(const HostState &hs, int slot, const std::vector<int32_t> &tail);
+    static size_t host_state_bytes(const HostState &hs);
+
     // Single-sequence convenience API on slot 0 (tools, tests).
     void reset();
     const std::vector<float> &prefill(const std::vector<int32_t> &tokens, std::vector<float> *all_logits = nullptr,
@@ -178,6 +189,8 @@ private:
     std::vector<std::vector<int32_t>> drafts_;
     std::vector<float> logits_;
 
+    // watchdog: per-rank phase of the current job (0 idle, 1 enqueueing, 2 waiting for the GPU)
+    std::array<std::atomic<int>, RANKS> phase_{};
     std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     uint64_t gen_ = 0;

@@ -19,6 +19,12 @@
 namespace qw {
 
 Engine::Engine(const EngineOptions &opt) : opt_(opt) {
+    // Copies as compute-shader blits, not SDMA: on this box an SDMA copy's
+    // completion signal occasionally never fires (PCIe AER events), which
+    // wedges that rank forever (home-infra docs/llm-backend-amd-tuning.md,
+    // "SDMA code-object wedge"). Must be set before the HIP runtime starts;
+    // an explicit HSA_ENABLE_SDMA in the environment wins.
+    setenv("HSA_ENABLE_SDMA", "0", 0);
     check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
@@ -108,6 +114,7 @@ void Engine::rank_loop(int r) {
             if (stop_) return;
         }
         std::string err;
+        phase_[size_t(r)] = 1;
         try {
             if (job_ == Job::Prefill)
                 run_prefill_rank(rk);
@@ -118,6 +125,7 @@ void Engine::rank_loop(int r) {
         } catch (const std::exception &e) {
             err = e.what();
         }
+        phase_[size_t(r)] = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (!err.empty() && error_.empty()) error_ = err;
@@ -143,8 +151,18 @@ void Engine::dispatch() {
     }
     cv_.notify_all();
     {
+        // Watchdog: a job never takes minutes; report what is stuck (and keep waiting).
         std::unique_lock<std::mutex> lk(mu_);
-        done_cv_.wait(lk, [&] { return done_ == RANKS; });
+        int waited = 0;
+        while (!done_cv_.wait_for(lk, std::chrono::seconds(60), [&] { return done_ == RANKS; })) {
+            waited += 60;
+            const char *kind = job_ == Job::Prefill ? "prefill" : job_ == Job::Mtp ? "mtp" : "decode";
+            log("watchdog: %s job (M=%d, prefill T=%d) running for %d s; rank phases %d %d %d %d "
+                "(1 enqueueing, 2 waiting for GPU, 0 done); comm errors: %s / %s",
+                kind, djob_.M, pjob_.T, waited, phase_[0].load(), phase_[1].load(), phase_[2].load(),
+                phase_[3].load(), Comm::describe_error(comm_->error()).c_str(),
+                Comm::describe_error(comm2_->error()).c_str());
+        }
     }
     if (!error_.empty()) fail(error_);
     if (comm_->error()) fail("collective timed out: " + Comm::describe_error(comm_->error()));

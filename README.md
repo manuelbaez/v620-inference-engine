@@ -20,9 +20,9 @@ reusable across turns without re-prefilling.
 |---|---|
 | 1. Spec + CPU fp32 reference (`src/ref`) | done; matches vLLM (greedy identical at 57 and 4,266 tokens) |
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
-| 3. 4-GPU runtime (TP4 dense + EP4 experts) | **decode 58 tok/s** single stream, **165 tok/s** at 4 concurrent (HIP graphs per batch size), **prefill ~1,900-2,000 tok/s** (vLLM: ~56 / ~1,060) |
-| 4. Prefix cache | per-slot in-place continuation + recurrent-state snapshots; LMCache offload tier next |
-| 5. MTP speculative decoding | done: exact (greedy output identical), 2.5-2.6 tokens/step, **86 tok/s** single stream in the engine; on by default in the server (`--mtp 3`) |
+| 3. 4-GPU runtime (TP4 dense + EP4 experts) | **decode 67 tok/s** single stream, **178 tok/s** at 4 concurrent (HIP graphs per batch size), **prefill ~1,900-2,000 tok/s** (vLLM: ~56 / ~1,060) |
+| 4. Prefix cache | per-slot reuse, VRAM snapshots, host-RAM tier (evicted conversations restored in ~0.1 s instead of re-prefilled) |
+| 5. MTP speculative decoding | done: exact, adaptive draft count, 2.5-2.8 tokens/step, **~95-105 tok/s** single stream; on by default in the server (`--mtp 3`) |
 | 6. Prefill kernels | batched prefill done; overlap and int8 next |
 | 7. OpenAI server, tokenizer, llama-swap entry | server works (matches vLLM's template, tokenization and parsers); llama-swap entry pending |
 | 8. CacheBlend-style reuse (experimental) | |
@@ -80,7 +80,8 @@ tools/                 qw_gpu / qw_ref command-line runners, vLLM ground-truth h
 bench/                 P2P, GEMM and uncached-memory microbenchmarks
 tests/unit, tests/gpu  host unit tests; GPU tests (collectives, batched decode, speculative decoding)
 server/                OpenAI server (qwserve package), its tests, ctl.sh
-scripts/               deploy to the GPU box
+docker/                container image for llama-swap (built on the serving box by scripts/build-image.sh)
+scripts/               deploy to the GPU dev box, build the image
 ```
 
 ## Build and run

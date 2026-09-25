@@ -11,7 +11,10 @@
 namespace qw {
 
 Session::Session(Engine &e)
-    : e_(e), slots_(size_t(e.num_slots())), snaps_(Engine::SNAPSHOTS), rng_(std::random_device{}()) {}
+    : e_(e), slots_(size_t(e.num_slots())), snaps_(Engine::SNAPSHOTS), rng_(std::random_device{}()) {
+    const char *gb = std::getenv("QW_HOST_CACHE_GB");
+    host_budget_ = size_t((gb ? std::atof(gb) : 48.0) * 1e9);
+}
 
 void Session::drop_snapshots_after(int slot, int64_t n) {
     for (auto &s : snaps_)
@@ -90,9 +93,33 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     QW_CHECK(!prompt.empty(), "empty prompt");
     QW_CHECK(int64_t(prompt.size()) <= e_.slot_capacity(slot), "prompt longer than the slot's KV capacity");
     slots_[size_t(slot)].drafts_for = -1;
+    slots_[size_t(slot)].accept = 0.8f;
     auto &hist = slots_[size_t(slot)].hist;
     size_t common = 0;
     while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) ++common;
+
+    // host tier: a saved conversation that covers more of the prompt than this slot can
+    // (offload the slot's own conversation first: saving may evict entries)
+    const size_t slot_reuse = reusable(slot, prompt);
+    if (best_host_entry(prompt, slot_reuse) >= 0) offload_slot(slot, prompt);
+    const int hb = best_host_entry(prompt, slot_reuse);
+    if (hb >= 0) {
+        HostEntry &h = host_[size_t(hb)];
+        h.used = ++clock_;
+        e_.import_state(*h.state, slot, h.tokens);
+        drop_snapshots_after(slot, 0);
+        hist = h.tokens;
+        common = hist.size();
+        if (common == prompt.size()) e_.set_logits(h.logits);
+        log("host tier: restored %zu tokens into slot %d", hist.size(), slot);
+        if (common == prompt.size()) {
+            slots_[size_t(slot)].prompt_end = int64_t(hist.size());
+            single_ = false;
+            return int64_t(common);
+        }
+    } else if (!(common == hist.size() && common > 0)) {
+        offload_slot(slot, prompt);  // the slot's conversation is about to be replaced
+    }
 
     int64_t reused = 0;
     if (common == hist.size() && common > 0) {
