@@ -221,7 +221,11 @@ across chunk boundaries is the previous 2 tokens.
 ## MTP (one extra layer; phase 5)
 
 `e = fc_embedding @ gemma_norm(embed(t+1), pre_fc_norm_embedding)`; the backbone's
-pre-final-mixer multi-stream `X` is normed with `pre_fc_norm_hidden` (grouped),
-each stream passes through `fc_hidden`, and `e` is added to every stream. Then a
+pre-final-mixer multi-stream `X` is normed with `pre_fc_norm_hidden` (one RMS
+norm over all 10240 values, not per stream), each stream passes through the
+shared `fc_hidden`, and `e` is added to every stream. The routed experts are
+bf16 with a fused `gate_up_proj` [512][1280][2560] (gate rows first).
+Later draft steps use the MTP's own combined (pre-final-mixer) hidden in place
+of the backbone's. Then a
 QSA decoder layer (with bf16 routed experts, fused `gate_up_proj`) runs, and the
 MTP's own final mixer feeds the shared `lm_head`.

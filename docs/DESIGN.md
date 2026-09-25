@@ -261,15 +261,75 @@ Next for prefill: overlap the collectives (now the largest share) with
 compute by splitting each chunk into two micro-batches on two streams; W4A8
 expert GEMMs on `v_dot4_i32_i8`; a chunked (WY) GDN kernel.
 
+## Batched decode and slots (2026-09-25)
+
+The engine holds several sequences ("slots", default 131072 / 65536 / 32768 /
+32768 tokens of KV), each with its own recurrent state (GDN state and conv
+ring, PLE conv ring), QSA K/V, compressed keys and MTP input store. A decode
+step is a batch of up to 16 rows; a row is (slot, position, token), rows of a
+slot are consecutive (a "run"), and the kernels find per-sequence state
+through a device table of slot pointers. Each row count has its own captured
+graph, so a step costs one launch per rank.
+
+- Rows share no arithmetic: logits of a sequence decoded alone and in a batch
+  are bit-identical (`tests/gpu/test_batch_decode`), and so are k rows of one
+  run vs k single steps (the speculative verification shape).
+- Routed experts for small batches use GEMV-shaped kernels, one wave per
+  (token, expert) pair and output row (`moe_experts_P`); the tiled prefill
+  GEMM padded every expert to 32 tokens and cost 8.5 ms of a 17 ms step.
+- Each row's log-sum-exp is computed per vocab shard on the GPUs and combined
+  on the host, so sampling with logprobs needs no pass over 248k logits on
+  the CPU (that pass cost ~10 ms per token in the server).
+
+| rows per step | ms / step | aggregate tok/s |
+|---|---|---|
+| 1 | 17.3 | 57.9 |
+| 2 (2 slots) | 19.3 | 103.5 |
+| 4 (4 slots) | 24.2 | 165.0 |
+| 8 (4 slots x 2 rows) | 34.0 | 235.3 |
+
+## MTP speculative decoding (2026-09-25)
+
+The checkpoint's MTP head is one more QSA decoder layer. Its input for
+position p is fc_hidden(gnorm(X_p)) per stream + fc_embedding(gnorm(emb of
+token p+1)), where X_p is the backbone's pre-final-mixer 4-stream hidden; its
+own final mixer feeds the shared lm_head, and its combined hidden feeds the
+next draft step. The engine keeps it exact and simple:
+
+- The MTP layer has its own KV (QSA layer index 12 in every slot). Prefill
+  runs it over every chunk, shifted by one row: row t pairs X_t with token
+  t+1, and the chunk's last hidden waits in the slot's MTP input store until
+  the next token is known. The fc projections are row-parallel (each rank
+  multiplies its 640 columns, a reduce-scatter sums them).
+- Its bf16 routed experts are quantized at load to the same int4 g128
+  layout as the backbone's (only draft quality depends on them).
+- A step feeds each request's pending token plus K = 3 drafts as one run.
+  The GDN scan also writes the state after every row; `accept(slot, n)`
+  copies back the state after row n-1 (KV, compressed keys and the conv rings
+  are position-indexed, and the rings are large enough that rejected rows
+  never overwrite a row still needed).
+- Verification samples row j from the full model and continues only while
+  the sample equals draft j, so every emitted token is an exact sample from
+  the model given the true prefix (at any temperature); greedy output is
+  identical to plain decoding (`tests/gpu/test_speculative`).
+- Drafting: one MTP pass over the step's kept tokens, then K-1 single-row
+  passes chained through the MTP output hidden; argmax per vocab shard on
+  the GPUs.
+
+Measured on short prompts: 2.5-2.6 tokens per step, 24.4 ms verification +
+0.2 ms accept + 4.7 ms drafting, **86-87 tok/s** single stream (58 plain;
+production vLLM with MTP: ~56-65). Through the server, 4 concurrent requests
+reach 180 tok/s aggregate.
+
 ## Roadmap
 
-1. **Reference and spec.** CPU fp32 reference (`src/ref`), validated against
-   vLLM's prompt logprobs. *In progress.*
-2. **Single-GPU kernels.** Each kernel is checked against the reference, layer
-   by layer.
-3. **4-GPU runtime.** TP/EP, collectives, graph-captured decode; beat 65 tok/s.
-4. **Prefix cache tiers.**
-5. **MTP (K=3) speculative decoding.**
-6. **Prefill kernels.**
-7. **OpenAI-compatible server and tokenizer**, and a llama-swap entry in home-infra.
+1. **Reference and spec.** Done: CPU fp32 reference (`src/ref`), validated against vLLM.
+2. **Kernels.** Done, validated end to end against the reference and vLLM.
+3. **4-GPU runtime.** Done: TP/EP, P2P collectives, graph-captured batched decode.
+4. **Prefix cache tiers.** Per-slot reuse and snapshots done; LMCache offload tier next.
+5. **MTP (K=3) speculative decoding.** Done. Next: draft steps inside one graph
+   (device-side argmax and embedding lookup), adaptive K.
+6. **Prefill kernels.** Done (two micro-batches, optional W4A8); chunked GDN next.
+7. **OpenAI-compatible server and tokenizer.** Done (continuous batching); a
+   llama-swap entry in home-infra pending.
 8. **CacheBlend experiment.**
