@@ -1,6 +1,7 @@
-// gemv_rows for every batch row count (1..16) and the model's shapes against a
-// CPU reference, including the grouped (rows-per-group) form of the HC down
-// projection and output rows with a stride.
+// gemv_rows and gemv_rows_i8 (int8 weights, per-row scales) for every batch
+// row count (1..16) and the model's shapes against a CPU reference, including
+// the grouped (rows-per-group) form of the HC down projection and output rows
+// with a stride.
 #include <hip/hip_runtime.h>
 
 #include <cmath>
@@ -10,6 +11,7 @@
 #include <vector>
 
 #include "core/common.hpp"
+#include "engine/weight_convert.hpp"
 #include "kernels/gemv.hpp"
 
 using namespace qw;
@@ -73,6 +75,43 @@ int main() {
                                 overwritten);
             }
             std::printf("N=%4d K=%4d rpg=%3d: M=1..16 %s\n", sh.N, sh.K, sh.rpg, fails ? "(see above)" : "ok");
+            {  // int8 weights: against the same product with the dequantized weights
+                std::vector<int8_t> q;
+                std::vector<float> sc;
+                quantize_rows_i8(W, sh.N, sh.K, q, sc, gpu::I8_GROUP);
+                int8_t *dq;
+                float *ds;
+                CK(hipMalloc(&dq, q.size()));
+                CK(hipMalloc(&ds, sc.size() * 4));
+                CK(hipMemcpy(dq, q.data(), q.size(), hipMemcpyHostToDevice));
+                CK(hipMemcpy(ds, sc.data(), sc.size() * 4, hipMemcpyHostToDevice));
+                double worst = 0, qerr = 0;
+                for (int M = 1; M <= 16; ++M) {
+                    gpu::gemv_rows_i8(dq, ds, dx, sh.xs, dy, sh.ys, sh.N, sh.K, M, sh.rpg, false, nullptr);
+                    CK(hipDeviceSynchronize());
+                    std::vector<float> y(ybytes / 4);
+                    CK(hipMemcpy(y.data(), dy, ybytes, hipMemcpyDeviceToHost));
+                    for (int m = 0; m < M; ++m)
+                        for (int n = 0; n < sh.N; ++n) {
+                            const size_t xoff = size_t(m) * sh.xs + (sh.rpg ? size_t(n / sh.rpg) * sh.K : 0);
+                            double ref = 0, exact = 0;
+                            for (int k = 0; k < sh.K; ++k) {
+                                const double xv = f16_to_f32(x[xoff + size_t(k)]);
+                                ref += double(q[size_t(n) * sh.K + size_t(k)]) *
+                                       sc[size_t(n) * (sh.K / gpu::I8_GROUP) + size_t(k / gpu::I8_GROUP)] * xv;
+                                exact += double(f16_to_f32(W[size_t(n) * sh.K + size_t(k)])) * xv;
+                            }
+                            worst = std::max(worst, std::fabs(ref - y[size_t(m) * sh.ys + size_t(n)]));
+                            qerr = std::max(qerr, std::fabs(exact - ref));
+                        }
+                }
+                const bool ok = worst < 1e-2;
+                fails += !ok;
+                std::printf("  int8: max err vs dequantized %.2e %s (quantization itself: %.2e)\n", worst,
+                            ok ? "ok" : "FAIL", qerr);
+                CK(hipFree(dq));
+                CK(hipFree(ds));
+            }
             CK(hipFree(dW));
             CK(hipFree(dx));
             CK(hipFree(dy));

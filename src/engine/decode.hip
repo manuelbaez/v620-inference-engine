@@ -50,37 +50,45 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
     auto mix = [&](const HcW &w, const float *pend, const float *pend_inj, float *inj_out) {
         gpu::hc_pre_B(b.X, pend, pend_inj, w.w1, b.y, b.hc_send, M, s);
         // rows of `down` are grouped by stream: row n reads stream n / 324 of y
-        gpu::gemv_rows(w.down, b.y, HC * SH, b.hc_send + HC, HC_SEND, HC * HC_DOWN, SH, M, HC_DOWN, false, s);
+        if (w.down8.w)
+            gpu::gemv_rows_i8(w.down8.w, w.down8.s, b.y, HC * SH, b.hc_send + HC, HC_SEND, HC * HC_DOWN, SH, M, HC_DOWN,
+                              false, s);
+        else
+            gpu::gemv_rows(w.down, b.y, HC * SH, b.hc_send + HC, HC_SEND, HC * HC_DOWN, SH, M, HC_DOWN, false, s);
         allreduce(b.hc_send, b.hc_red, HC_SEND);
         gpu::hc_up_mix_B(b.hc_red, w.up, b.y, b.bin_local, inj_out, M, s);
         allgather(b.bin_local, b.bin, SH * 2);
     };
-    auto gemv = [&](const uint16_t *W, int N, int K, const uint16_t *x, float *y, bool acc = false) {
-        gpu::gemv_rows(W, x, K, y, N, N, K, M, 0, acc, s);
+    // fp16 weights, or their int8 copy when loaded (QW_INT8_DENSE=1)
+    auto gemv = [&](const uint16_t *W, const Q8 &W8, int N, int K, const uint16_t *x, float *y, bool acc = false) {
+        if (W8.w)
+            gpu::gemv_rows_i8(W8.w, W8.s, x, K, y, N, N, K, M, 0, acc, s);
+        else
+            gpu::gemv_rows(W, x, K, y, N, N, K, M, 0, acc, s);
     };
     // One decoder layer (after the PLE step, if any) on b.X; returns the
     // pending MoE output, combined into X by the next mix.
     auto layer = [&](LayerW &w, bool qsa, int idx, const float *pend, float *save) -> const float * {
         mix(w.attn_hc, pend, b.inj_mlp, b.inj_attn);
         if (qsa) {
-            gemv(w.qsa_proj, QSA_PROJ_L, H, b.bin, b.proj);
+            gemv(w.qsa_proj, w.qsa_proj8, QSA_PROJ_L, H, b.bin, b.proj);
             gpu::qsa_prep_B(b.proj, w.qn, w.kn, w.iqn, rk.dtab, idx, rows, b.q16, b.gate, b.iq, s);
             gpu::qsa_compress_B(w.ikn, rk.dtab, idx, rows, s);
             gpu::qsa_attend_B(b.q16, b.gate, b.iq, rk.dtab, idx, rows, b.scores, b.score_ld, b.lists, b.counts,
                               b.att_partial, b.act16, s);
-            gemv(w.qsa_o, H, QH_L * HEAD_DIM, b.act16, b.partial);
+            gemv(w.qsa_o, w.qsa_o8, H, QH_L * HEAD_DIM, b.act16, b.partial);
         } else {
-            gemv(w.gdn_proj, GDN_PROJ_L, H, b.bin, b.proj);
+            gemv(w.gdn_proj, w.gdn_proj8, GDN_PROJ_L, H, b.bin, b.proj);
             gpu::gdn_conv_B(b.proj, w.gdn_conv, w.gdn_A, w.gdn_dt, rk.dtab, idx, rows, b.qkv, b.gb, s);
             gpu::gdn_ring_B(b.proj, rk.dtab, idx, rows, s);
             gpu::gdn_scan_B(b.qkv, b.gb, rk.dtab, idx, b.run_start, b.run_len, b.run_slot, M, b.o_raw, save, s);
             gpu::gdn_norm_B(b.o_raw, b.proj, w.gdn_norm, M, b.act16, s);
-            gemv(w.gdn_out, H, GDN_VL * GDN_DIM, b.act16, b.partial);
+            gemv(w.gdn_out, w.gdn_out8, H, GDN_VL * GDN_DIM, b.act16, b.partial);
         }
         reduce_scatter(b.partial, b.out_attn);
 
         mix(w.mlp_hc, b.out_attn, b.inj_attn, b.inj_mlp);
-        gemv(w.router, N_EXPERTS, H, b.bin, b.router);
+        gemv(w.router, Q8{}, N_EXPERTS, H, b.bin, b.router);
         gpu::moe_route_B(b.router, M, r * EXP_L, b.ecounts, b.offsets, b.tok_w, b.tok_slot, b.pair_tok, s);
         if (M <= moe_pair_max)
             gpu::moe_experts_P(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.offsets, b.pair_tok, b.bin, M, b.moe_h, b.yp,
@@ -88,9 +96,9 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         else
             gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.ecounts, b.offsets, b.pair_tok, b.bin, M,
                                b.tiles, b.moe_h, b.yp, s);
-        gemv(w.sh_gu, 2 * SFFN_L + 1, H, b.bin, b.shp);
+        gemv(w.sh_gu, w.sh_gu8, 2 * SFFN_L + 1, H, b.bin, b.shp);
         gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, M, b.sh_h, s);
-        gemv(w.sh_down, H, SFFN_L, b.sh_h, b.sh_out);
+        gemv(w.sh_down, w.sh_down8, H, SFFN_L, b.sh_h, b.sh_out);
         gpu::moe_combine_B(b.yp, b.tok_slot, b.tok_w, b.sh_out, M, b.partial, s);
         reduce_scatter(b.partial, b.out_moe);
         return b.out_moe;
@@ -101,14 +109,20 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         gpu::mtp_ssq(b.m_hid, b.emb, M, b.m_send, s);
         comm_->allreduce(r, b.m_send, b.m_red, 4, ++k, s, M);
         gpu::mtp_norm(b.m_hid, b.emb, b.m_red, rk.mtp_nh, rk.mtp_ne, M, b.m_xn, s);
-        for (int st = 0; st < 5; ++st)
-            gpu::gemv_rows(st < HC ? rk.mtp_fc_h : rk.mtp_fc_e, b.m_xn + size_t(st) * M * SH, SH,
-                           b.m_part + size_t(st) * M * H, H, H, SH, M, 0, false, s);
+        for (int st = 0; st < 5; ++st) {
+            const Q8 &f8 = st < HC ? rk.mtp_fc_h8 : rk.mtp_fc_e8;
+            if (f8.w)
+                gpu::gemv_rows_i8(f8.w, f8.s, b.m_xn + size_t(st) * M * SH, SH, b.m_part + size_t(st) * M * H, H, H,
+                                  SH, M, 0, false, s);
+            else
+                gpu::gemv_rows(st < HC ? rk.mtp_fc_h : rk.mtp_fc_e, b.m_xn + size_t(st) * M * SH, SH,
+                               b.m_part + size_t(st) * M * H, H, H, SH, M, 0, false, s);
+        }
         comm_->reduce_scatter(r, b.m_part, b.m_out, SH, ++k, s, 5 * M);
         gpu::mtp_add(b.m_out, M, b.X, s);
         const float *pend = layer(rk.mtp, true, N_QSA, nullptr, nullptr);
         mix(rk.mtp_final, pend, b.inj_mlp, nullptr);
-        gemv(rk.lm_head, VOCAB_L, H, b.bin, b.logits);
+        gemv(rk.lm_head, rk.lm_head8, VOCAB_L, H, b.bin, b.logits);
         gpu::row_argmax(b.logits, VOCAB_L, M, b.amax, s);
         return k;
     }
@@ -119,7 +133,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         if (l == PLE_LAYER) {
             if (pend) gpu::hc_combine_T(b.X, pend, b.inj_mlp, M, s);
             pend = nullptr;
-            gemv(rk.ple_kv, PLE_KV, H, b.ple_e, b.kv);
+            gemv(rk.ple_kv, rk.ple_kv8, PLE_KV, H, b.ple_e, b.kv);
             gpu::ple_stats_B(b.kv, b.X, rk.ple_nk, rk.ple_nq, M, b.ple_send, s);
             allreduce(b.ple_send, b.ple_red, 16);
             gpu::ple_apply_B(b.kv, b.ple_red, rk.ple_nc, rk.ple_conv, rk.dtab, rows, b.ncbuf, b.X, s);
@@ -133,7 +147,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         gpu::save_last_rows(b.X, rk.dtab, b.run_start, b.run_len, b.run_slot, M, s);
         gpu::save_rows_hist(b.X, rk.dtab, rows, s);
     }
-    gemv(rk.lm_head, VOCAB_L, H, b.bin, b.logits);
+    gemv(rk.lm_head, rk.lm_head8, VOCAB_L, H, b.bin, b.logits);
     gpu::row_lse(b.logits, VOCAB_L, M, b.lse, s);
     return k;
 }

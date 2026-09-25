@@ -89,4 +89,22 @@ void quantize_int4_g128(const uint16_t *src, size_t n_groups, int32_t *ct, uint1
     }
 }
 
+void quantize_rows_i8(const std::vector<uint16_t> &fp16, int64_t N, int64_t K, std::vector<int8_t> &q,
+                      std::vector<float> &scale, int64_t group) {
+    QW_CHECK(int64_t(fp16.size()) == N * K && K % group == 0, "quantize_rows_i8: size");
+    const int64_t G = K / group;
+    q.resize(fp16.size());
+    scale.resize(size_t(N * G));
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t g = 0; g < G; ++g) {
+            const uint16_t *w = fp16.data() + n * K + g * group;
+            float amax = 0.f;
+            for (int64_t k = 0; k < group; ++k) amax = std::max(amax, std::fabs(f16_to_f32(w[k])));
+            const float s = amax > 0.f ? amax / 127.f : 1.f;
+            scale[size_t(n * G + g)] = s;
+            for (int64_t k = 0; k < group; ++k)
+                q[size_t(n * K + g * group + k)] = int8_t(std::lrint(std::clamp(f16_to_f32(w[k]) / s, -127.f, 127.f)));
+        }
+}
+
 }  // namespace qw

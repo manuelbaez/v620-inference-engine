@@ -25,6 +25,11 @@ std::vector<float> f32_of(const TensorView &t);
 std::vector<float> shard_w1(const TensorView &t, int r);
 std::vector<float> plus_one(std::vector<float> v);
 
+// Symmetric int8 of an fp16 [N][K] matrix in groups of `group` along K:
+// q[n][k] = round(w / s[n][k / group]), s = max |w| over the group / 127.
+void quantize_rows_i8(const std::vector<uint16_t> &fp16, int64_t N, int64_t K, std::vector<int8_t> &q,
+                      std::vector<float> &scale, int64_t group);
+
 // Repacks compressed-tensors int4 words (element 8c+i at bits 4i) into the
 // kernels' layout (even elements in the low half-word, odd in the high one).
 void pack_int4_words(const int32_t *ct, uint32_t *out, size_t n_words);

@@ -27,11 +27,19 @@ constexpr size_t SLOT_RING = size_t(N_GDN) * GDN_RING * GDN_QKV_L;
 constexpr size_t SLOT_PLE = size_t(PLE_RING) * HC * SH;
 
 // ---------------------------------------------------------------- weights
+// An int8 copy of a dense matrix for the decode GEMVs (QW_INT8_DENSE=1):
+// W[n][k] = w[n][k] * s[n]. Null when off; prefill keeps the fp16 original.
+struct Q8 {
+    int8_t *w = nullptr;
+    float *s = nullptr;
+};
+
 struct HcW {
     float *w1;            // [HC][SH] 1 + hc_norm
     uint16_t *down;       // [HC][324][SH]      decode layout (per-stream groups)
     uint16_t *down_flat;  // [328][HC*SH]       prefill layout (one GEMM over all streams)
     uint16_t *up;         // [SH][HC][320]
+    Q8 down8;
 };
 
 // Prefill scratch for one rank, sized for opt.prefill_chunk tokens.
@@ -72,6 +80,7 @@ struct LayerW {
     uint16_t *egs, *eus, *eds;  // fp16 scales
     uint16_t *sh_gu;            // [321][H]: gate 160 | up 160 | shared_expert_gate
     uint16_t *sh_down;          // [H][160]
+    Q8 qsa_proj8, qsa_o8, gdn_proj8, gdn_out8, sh_gu8, sh_down8;
 };
 
 struct Rank {
@@ -87,6 +96,7 @@ struct Rank {
     std::vector<LayerW> L;
     HcW final_hc{};
     uint16_t *lm_head = nullptr;  // [VOCAB_L][H]
+    Q8 lm_head8, ple_kv8, mtp_fc_h8, mtp_fc_e8;
     // MTP head (QSA layer index N_QSA in the slots' KV)
     LayerW mtp{};
     HcW mtp_final{};
