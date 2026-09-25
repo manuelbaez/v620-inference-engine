@@ -2,6 +2,7 @@
 // prefix cache tells images apart), and their embeddings for a prefill, from
 // an LRU cache of vision-tower outputs or encoded on the cards on demand.
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 #include "core/common.hpp"
@@ -76,7 +77,12 @@ std::vector<Engine::EmbedSpan> Session::vision_embeds(int64_t from) {
     }
     if (!todo.empty()) {
         QW_CHECK(e_.has_vision(), "the prompt has images or videos but the engine has no vision tower");
+        const auto t0 = std::chrono::steady_clock::now();
         e_.encode_vision(todo);
+        size_t tokens = 0;
+        for (const auto &s : todo) tokens += size_t(s.h) * s.w / 4;
+        log("vision: %zu slices, %zu tokens encoded in %.3f s", todo.size(), tokens,
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     for (const Need &nd : need) {
         auto &e = vision_cache_.at(nd.key);

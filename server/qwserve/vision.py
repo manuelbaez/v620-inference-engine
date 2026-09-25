@@ -111,9 +111,9 @@ class VisionPreprocessor:
         size = img.get("size", {})
         self.img_min = size.get("shortest_edge", 56 * 56)
         self.img_max = size.get("longest_edge", 28 * 28 * 1280)
-        cap = os.environ.get("QW_VISION_MAX_PIXELS")
-        if cap:  # the default budget (16.7 MP, ~16k tokens) is far more than an agent's screenshots need
-            self.img_max = min(self.img_max, int(cap))
+        # The model's own budget (16.7 MP, ~16k tokens) costs ~20 s of vision tower for a 4K image;
+        # by default images are scaled to at most ~1920x1088 (2,040 tokens, ~1.3 s on one card).
+        self.img_max = min(self.img_max, int(os.environ.get("QW_VISION_MAX_PIXELS", 1920 * 1088)))
         self.img_mean, self.img_std = img.get("image_mean", [0.5] * 3), img.get("image_std", [0.5] * 3)
         vsize = vid.get("size", {})
         self.vid_min = vsize.get("shortest_edge", 128 * 32 * 32)
@@ -200,9 +200,9 @@ def media_of_part(pre, part):
 
 def expand(ids, media, tok):
     """Replaces each item's placeholder token in `ids` by its vision tokens and sets each Media's
-    spans. An image becomes t*h*w/4 pads. A video becomes, per temporal patch,
-    '<t seconds><|vision_start|>' + pads + '<|vision_end|>' (Qwen3VLProcessor), replacing the
-    template's own start/pad/end."""
+    spans. An image becomes t*h*w/4 pads. A video's pad becomes, per temporal patch,
+    '<t seconds><|vision_start|>' + pads + '<|vision_end|>', inside the template's own
+    start/end tokens (Qwen3VLProcessor.replace_video_token)."""
     image_pad, video_pad = tok.token_to_id("<|image_pad|>"), tok.token_to_id("<|video_pad|>")
     vstart, vend = tok.token_to_id("<|vision_start|>"), tok.token_to_id("<|vision_end|>")
     out, it, i = [], iter(media), 0
@@ -219,10 +219,6 @@ def expand(ids, media, tok):
             m.spans = [(len(out), m.tokens)]
             out.extend([image_pad] * m.tokens)
             continue
-        if not (out and out[-1] == vstart and i < len(ids) and ids[i] == vend):
-            raise ValueError("a video placeholder must be <|vision_start|><|video_pad|><|vision_end|>")
-        out.pop()
-        i += 1
         per = m.grid[1] * m.grid[2] // (MERGE * MERGE)
         for stamp in m.timestamps:
             out.extend(tok.encode(f"<{stamp:.1f} seconds>", add_special_tokens=False).ids)

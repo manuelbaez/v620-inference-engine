@@ -113,20 +113,33 @@ int qw_has_vision(qw_handle *h) {
     return h->engine->has_vision() ? 1 : 0;
 }
 
+static std::vector<qw::Session::Media> media_of(const qw_media *media, int n_media) {
+    std::vector<qw::Session::Media> ms;
+    for (int i = 0; i < n_media; ++i) {
+        const qw_media &m = media[i];
+        ms.push_back({m.hash, m.video != 0, m.t, m.h, m.w, m.patches, std::vector<int64_t>(m.starts, m.starts + m.t)});
+    }
+    return ms;
+}
+
 int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media,
                             int n_media) {
     return guarded(
         h,
         [&] {
-            std::vector<qw::Session::Media> ms;
-            for (int i = 0; i < n_media; ++i) {
-                const qw_media &m = media[i];
-                ms.push_back({m.hash, m.video != 0, m.t, m.h, m.w, m.patches,
-                              std::vector<int64_t>(m.starts, m.starts + m.t)});
-            }
-            return h->session->set_prompt(slot, std::vector<int32_t>(tokens, tokens + n), ms);
+            return h->session->set_prompt(slot, std::vector<int32_t>(tokens, tokens + n), media_of(media, n_media));
         },
         int64_t(-1));
+}
+
+int qw_acquire_media(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new, const qw_media *media,
+                     int n_media) {
+    return guarded(
+        h,
+        [&] {
+            return h->session->acquire(std::vector<int32_t>(tokens, tokens + n), max_new, media_of(media, n_media));
+        },
+        -1);
 }
 
 int32_t qw_sample_prompt(qw_handle *h, int slot, const qw_sampling *p, float *lp) {

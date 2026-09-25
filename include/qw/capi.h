@@ -65,6 +65,9 @@ typedef struct qw_media {
     const float *patches;   /* fp32 [t*h*w][1536], merge-window order */
     const int64_t *starts;  /* first token of each slice (h*w/4 tokens each), t entries */
 } qw_media;
+/* qw_acquire for a prompt with media (so the slot choice sees the media's identity). */
+int qw_acquire_media(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new, const qw_media *media,
+                     int n_media);
 /* 1 if the engine has the vision tower (images and videos accepted). */
 int qw_has_vision(qw_handle *h);
 /* qw_set_prompt with media; the vision tower runs on the cards for the media

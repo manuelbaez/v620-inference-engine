@@ -86,6 +86,13 @@ void Engine::warmup() {
     std::vector<int32_t> toks(size_t(opt_.prefill_chunk) + 300, 0);
     for (size_t i = 0; i < toks.size(); ++i) toks[i] = int32_t(i % 1000 + 100);
     prefill(0, toks);
+    if (vision_) {  // the vision tower's GEMM shapes, on every card
+        std::vector<float> px(size_t(32) * 32 * 1536, 0.1f);
+        std::vector<std::vector<float>> outs(RANKS, std::vector<float>(size_t(32) * 32 / 4 * H));
+        std::vector<VisionSlice> slices;
+        for (int r = 0; r < RANKS; ++r) slices.push_back({px.data(), 32, 32, outs[size_t(r)].data()});
+        encode_vision(slices);
+    }
     std::vector<Row> rows;
     for (int m = 1; m <= gpu::MAX_ROWS; ++m) {  // capture every batch size's graph
         rows.clear();

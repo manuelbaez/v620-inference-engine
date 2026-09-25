@@ -23,6 +23,10 @@ void vit_embed(float *x, const uint16_t *y, const float *bias, const float *tabl
 // Rotates q and k of qkv fp16 [N][3][heads][72] in place by each patch's (h, w) position:
 // NeoX halves of 36, angles h*inv[i] for i < 18 and w*inv[i - 18] above.
 void vit_rope2d(uint16_t *qkv, const int32_t *pos_hw, int N, int heads, hipStream_t s);
+// Full (non-causal) attention of one slice, fused (flash-style online softmax):
+// out fp16 [L][heads*72] = softmax(q k^T / sqrt(72)) v per head, from qkv fp16
+// [L][3][heads][72].
+void vit_attention(const uint16_t *qkv, int L, int heads, uint16_t *out, hipStream_t s);
 // Row softmax in place over fp16 [rows][n], rows of stride ld, fp32 math.
 void vit_softmax(uint16_t *s_rows, int rows, int n, int ld, hipStream_t s);
 // out fp32 [N][D] = y fp16 [N][D] + bias

@@ -125,7 +125,7 @@ class Scheduler:
             n = len(r.prompt)
             need = r.max_new if r.max_new else self.DEFAULT_RESERVE
             need = max(1, min(need, self.e.max_tokens - n))
-            slot = self.e.acquire(r.prompt, need)
+            slot = self.e.acquire(r.prompt, need, r.media)
             if slot < 0:
                 return  # FIFO: wait for a slot to free up
             self.waiting.pop(0)

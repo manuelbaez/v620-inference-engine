@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -34,8 +35,9 @@ static std::vector<T> read_raw(const std::string &path) {
 
 int main(int argc, char **argv) {
     try {
-        QW_CHECK(argc >= 3, "usage: test_vision_encoder DIR case...");
+        QW_CHECK(argc >= 3, "usage: test_vision_encoder DIR case... | --bench H W");
         const std::string dir = argv[1];
+        const bool bench = dir == "--bench";
         SafeTensors st;
         st.add_index("/mnt/llms/qwen3.8-flash-next-awq");
         const auto hw = load_vision_weights(st);
@@ -54,6 +56,19 @@ int main(int argc, char **argv) {
         }
         std::printf("vision tower: %.2f GB per card, %d cards\n", double(enc[0]->weight_bytes()) / 1e9, devices);
         int fails = 0;
+        if (bench) {  // timing only: random patches of an H x W grid on card 0
+            const int h = std::atoi(argv[2]), w = std::atoi(argv[3]);
+            std::vector<float> px(size_t(h) * w * 1536), out(size_t(h) * w / 4 * 2560);
+            for (size_t i = 0; i < px.size(); ++i) px[i] = float(int(i * 2654435761u % 2001) - 1000) / 1000.f;
+            CK(hipSetDevice(0));
+            for (int rep = 0; rep < 3; ++rep) {
+                const auto t0 = std::chrono::steady_clock::now();
+                enc[0]->encode(px.data(), h, w, out.data());
+                std::printf("%dx%d patches: %.1f ms\n", h, w,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+            return 0;
+        }
         for (int c = 2; c < argc; ++c) {
             const std::string name = argv[c];
             const auto grid = read_raw<int64_t>(dir + "/" + name + ".grid.i64");

@@ -4,7 +4,7 @@
 FROM rocm/dev-ubuntu-24.04:7.2.3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      cmake build-essential rocblas-dev hip-dev python3 python3-venv \
+      cmake build-essential rocblas-dev hip-dev python3 python3-venv ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 ENV ROCM_PATH=/opt/rocm
@@ -24,7 +24,7 @@ RUN cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     && find build -type d -name CMakeFiles -prune -exec rm -rf {} +
 
 RUN python3 -m venv /opt/qw/venv \
-    && /opt/qw/venv/bin/pip install --no-cache-dir tokenizers jinja2 aiohttp
+    && /opt/qw/venv/bin/pip install --no-cache-dir tokenizers jinja2 aiohttp numpy pillow
 COPY server server
 
 # Copies as compute-shader blits (the engine also defaults to this): SDMA

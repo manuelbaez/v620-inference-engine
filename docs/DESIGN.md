@@ -499,6 +499,50 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
    - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention
+   - [ ] vision attention kernel at ~20% of peak: tile/occupancy work
+   - [ ] vision: HF 3D M-RoPE positions experiment (vs the vLLM fork's plain indices)
+
+## Vision: images and video (2026-09-25)
+
+The checkpoint carries a Qwen3-VL vision tower (`model.visual.*`, 0.41 B
+parameters): 16x16 patches over 2 frames, a learned 48x48 position table
+interpolated to each image's grid, 27 pre-norm blocks (width 1152, 16 heads of
+72, 2D rotary positions, GELU-tanh MLP 4304), then a 2x2 patch merger to the
+language model's width (2560). Every card holds its own fp16 copy (0.9 GB) and
+encodes whole slices: an image, or one temporal slice of a video (attention
+never spans slices), so up to four slices encode at once with no traffic
+between cards (`Engine::encode_vision`; tensor-parallel splitting would spend
+more time in all-reduces than in compute).
+
+- `src/vision/vision_encoder.hip`: fp32 residual stream (activations reach
+  ~1e4), fp16 rocBLAS GEMMs, and a fused flash-style attention kernel (one
+  thread per query, keys and transposed values through LDS as half2 pairs,
+  online softmax over groups of 16 keys). Matches HF's `Qwen4ExpVisionModel`
+  in fp32 to 2-6e-3 relative error (`tests/gpu/test_vision_encoder` against
+  `tools/vision_ref.py` dumps).
+- Encode time on one card: 720p 0.33 s, 1080p 1.37 s (attention is 80% of
+  it, at ~20% of the packed-dot peak: the next thing to improve); four 1080p
+  images 1.66 s. Images are scaled to at most ~1920x1088 by default
+  (`QW_VISION_MAX_PIXELS`; the model allows 16.7 MP).
+- Inputs: the server mirrors the Qwen3-VL processor (PIL backend) exactly for
+  images (pixels within 1.2e-7, identical token ids) and video (ffmpeg decode,
+  2 fps sampling, timestamps between temporal slices; frames within 8e-3
+  because HF resizes video frames with torchvision)
+  (`server/tests/test_vision_preprocess.py`).
+- Language model: vision tokens are negative ids inside the engine, derived
+  from each item's content hash and position within it; prefill takes their
+  embeddings, the n-gram table and the sampler's penalties see the pad token.
+  The prefix cache therefore tells images apart with no special casing, and
+  the vision tower only runs for vision tokens that are prefilled, with an LRU
+  cache of its outputs (`QW_VISION_CACHE_GB`, default 2). A resent screenshot
+  costs nothing once its prefix is cached.
+- Positions: the vLLM fork gives vision tokens plain token indices (what
+  production vLLM served); HF transformers gives them 3D M-RoPE positions.
+  The engine follows the vLLM fork; the HF scheme is an open experiment.
+
+Measured through the server: OCR of rendered text, shapes/colors/layout, and
+a question about one line of a 1080p code screenshot all answered correctly;
+two different images at the same prompt position never share cached state.
 
 ## Next steps: where the time goes (profiled 2026-09-25)
 

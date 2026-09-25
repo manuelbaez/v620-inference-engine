@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
@@ -119,7 +120,11 @@ void VisionEncoder::encode(const float *patches, int h, int w, float *out) {
         gpu::gemm(blas_, b.qkv, 3 * D, D, xn_, D, L, qkv_, 3 * D, true);
         gpu::vit_bias(qkv_, b.qkv_b, L, 3 * D, s_);
         gpu::vit_rope2d(qkv_, pos_, L, cfg_.heads, s_);
-        attention(L);
+        static const bool gemm_attn = std::getenv("QW_VIT_GEMM_ATTN") != nullptr;
+        if (gemm_attn)
+            attention(L);
+        else
+            gpu::vit_attention(qkv_, L, cfg_.heads, att_, s_);
         gpu::gemm(blas_, b.proj, D, D, att_, D, L, xn_, D, true);
         gpu::vit_residual_add(x_, xn_, D, b.proj_b, L, D, s_);
         gpu::vit_layernorm(x_, b.n2w, b.n2b, L, D, xn_, s_);

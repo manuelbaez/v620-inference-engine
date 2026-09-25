@@ -58,6 +58,9 @@ public:
         std::vector<int64_t> starts;  // first token of each slice (h*w/4 tokens each)
     };
     int64_t set_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media);
+    int acquire(const std::vector<int32_t> &prompt, int64_t max_new, const std::vector<Media> &media) {
+        return acquire(media.empty() ? prompt : media_keys(prompt, media), max_new);
+    }
     // Samples the first token after set_prompt (before any other prefill).
     int32_t sample_prompt(int slot, const SamplingParams &p, float *logprob = nullptr);
 

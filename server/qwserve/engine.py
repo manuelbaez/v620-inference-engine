@@ -63,6 +63,8 @@ class Engine:
             "qw_set_prompt_media": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
                                                       ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_has_vision": (ctypes.c_int, [P]),
+            "qw_acquire_media": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64,
+                                                 ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_sample_prompt": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
             "qw_decode": (ctypes.c_int, [P, ctypes.c_int, I32P, I32P]),
             "qw_sample_row": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
@@ -96,9 +98,28 @@ class Engine:
             raise self._err()
         return r
 
-    def acquire(self, tokens, max_new):
+    @staticmethod
+    def _media_array(media):
+        """ctypes array of the media, and the numpy buffers it points into (keep them alive)."""
+        import numpy as np
+        keep, items = [], []
+        for m in media:
+            patches = np.ascontiguousarray(m.patches, dtype=np.float32)
+            starts = np.asarray([s for s, _ in m.spans], dtype=np.int64)
+            keep += [patches, starts]
+            t, h, w = m.grid
+            items.append(MediaStruct(int.from_bytes(m.hash, "little"), int(m.kind == "video"), t, h, w,
+                                     patches.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+                                     starts.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))))
+        return (MediaStruct * len(items))(*items), keep
+
+    def acquire(self, tokens, max_new, media=None):
         arr = (ctypes.c_int32 * len(tokens))(*tokens)
-        r = self.lib.qw_acquire(self.h, arr, len(tokens), max_new)
+        if media:
+            arr_m, keep = self._media_array(media)
+            r = self.lib.qw_acquire_media(self.h, arr, len(tokens), max_new, arr_m, len(media))
+        else:
+            r = self.lib.qw_acquire(self.h, arr, len(tokens), max_new)
         if r < 0 and self.lib.qw_error(self.h):
             raise self._err()
         return r  # -1: no free slot fits right now
@@ -111,18 +132,8 @@ class Engine:
         arr = (ctypes.c_int32 * len(tokens))(*tokens)
         if not media:
             return self._check(self.lib.qw_set_prompt(self.h, slot, arr, len(tokens)))
-        import numpy as np
-        keep, items = [], []
-        for m in media:
-            patches = np.ascontiguousarray(m.patches, dtype=np.float32)
-            starts = np.asarray([s for s, _ in m.spans], dtype=np.int64)
-            keep += [patches, starts]
-            t, h, w = m.grid
-            items.append(MediaStruct(int.from_bytes(m.hash, "little"), int(m.kind == "video"), t, h, w,
-                                     patches.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
-                                     starts.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))))
-        arr_m = (MediaStruct * len(items))(*items)
-        return self._check(self.lib.qw_set_prompt_media(self.h, slot, arr, len(tokens), arr_m, len(items)))
+        arr_m, keep = self._media_array(media)
+        return self._check(self.lib.qw_set_prompt_media(self.h, slot, arr, len(tokens), arr_m, len(media)))
 
     def sample_prompt(self, slot, s):
         lp = ctypes.c_float()

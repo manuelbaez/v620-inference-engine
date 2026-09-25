@@ -99,6 +99,106 @@ __global__ __launch_bounds__(64) void rope2d_kernel(uint16_t *qkv, const int32_t
         }
 }
 
+// One thread per query row, ATT_Q rows per block, one head per blockIdx.y. Keys
+// and values stream through LDS in tiles of ATT_TILE: keys as half2 pairs along
+// the head dim (scores: 36 dot2 per key), values transposed as half2 pairs of
+// consecutive keys (the output update is 36 dot2 per key too). All lanes of a
+// wave read the same LDS words (broadcast), 16 bytes at a time. Online softmax
+// per group of ATT_GROUP keys, fp32 accumulation.
+constexpr int ATT_HD = 72, ATT_TILE = 64, ATT_GROUP = 16, ATT_Q = 128;
+constexpr int KW = ATT_HD / 8;          // uint4 per key row (8 halves each)
+constexpr int VW = ATT_TILE / 2 / 4;    // uint4 per value column (4 key pairs each)
+__global__ __launch_bounds__(ATT_Q) void attention_kernel(const uint16_t *qkv, int L, int heads, uint16_t *out) {
+    __shared__ uint4 k_s[ATT_TILE][KW];  // [key][8 dims]
+    __shared__ uint4 vt_s[ATT_HD][VW];   // [dim][4 key pairs]
+    const int h = blockIdx.y, q = blockIdx.x * ATT_Q + threadIdx.x;
+    const size_t ld = size_t(3) * heads * ATT_HD;
+    const float scale = rsqrtf(float(ATT_HD));
+    uint32_t qv[ATT_HD / 2];  // pre-scaled query, half2 pairs
+    if (q < L) {
+        const uint32_t *qp = reinterpret_cast<const uint32_t *>(qkv + size_t(q) * ld + size_t(h) * ATT_HD);
+#pragma unroll
+        for (int i = 0; i < ATT_HD / 2; ++i) {
+            const float2 f = __half22float2(__builtin_bit_cast(__half2, qp[i]));
+            qv[i] = __builtin_bit_cast(uint32_t, __floats2half2_rn(f.x * scale, f.y * scale));
+        }
+    }
+    float o[ATT_HD];
+#pragma unroll
+    for (int d = 0; d < ATT_HD; ++d) o[d] = 0.f;
+    float m = -INFINITY, l = 0.f;
+    const __half *kbase = reinterpret_cast<const __half *>(qkv) + size_t(heads + h) * ATT_HD;
+    const __half *vbase = reinterpret_cast<const __half *>(qkv) + size_t(2 * heads + h) * ATT_HD;
+    uint32_t *vt_w = reinterpret_cast<uint32_t *>(vt_s);
+    for (int k0 = 0; k0 < L; k0 += ATT_TILE) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < ATT_TILE * KW; i += ATT_Q) {  // keys: rows of 8 halves
+            const int kr = i / KW, c = i % KW, key = k0 + kr;
+            k_s[kr][c] = key < L ? reinterpret_cast<const uint4 *>(kbase + size_t(key) * ld)[c] : make_uint4(0, 0, 0, 0);
+        }
+        for (int i = threadIdx.x; i < ATT_HD * ATT_TILE / 2; i += ATT_Q) {  // values: pairs of keys per dim
+            const int d = i % ATT_HD, kp = i / ATT_HD, key = k0 + 2 * kp;
+            const __half a = key < L ? vbase[size_t(key) * ld + d] : __float2half(0.f);
+            const __half b = key + 1 < L ? vbase[size_t(key + 1) * ld + d] : __float2half(0.f);
+            vt_w[d * VW * 4 + kp] = __builtin_bit_cast(uint32_t, __halves2half2(a, b));
+        }
+        __syncthreads();
+        if (q >= L) continue;
+        const int n_keys = min(ATT_TILE, L - k0);
+        for (int g = 0; g < n_keys; g += ATT_GROUP) {
+            float sc[ATT_GROUP];
+            float gmax = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < ATT_GROUP; ++j) {
+                float acc = 0.f;
+#pragma unroll
+                for (int c = 0; c < KW; ++c) {
+                    const uint4 kv = k_s[g + j][c];
+                    acc = dot2(qv[4 * c], kv.x, acc);
+                    acc = dot2(qv[4 * c + 1], kv.y, acc);
+                    acc = dot2(qv[4 * c + 2], kv.z, acc);
+                    acc = dot2(qv[4 * c + 3], kv.w, acc);
+                }
+                sc[j] = g + j < n_keys ? acc : -INFINITY;
+                gmax = fmaxf(gmax, sc[j]);
+            }
+            const float m_new = fmaxf(m, gmax);
+            const float alpha = __expf(m - m_new);
+            uint32_t pp[ATT_GROUP / 2];  // probabilities as half2 pairs of consecutive keys
+            float psum = 0.f;
+#pragma unroll
+            for (int j = 0; j < ATT_GROUP; j += 2) {
+                const float p0 = __expf(sc[j] - m_new), p1 = __expf(sc[j + 1] - m_new);
+                psum += p0 + p1;
+                pp[j / 2] = __builtin_bit_cast(uint32_t, __floats2half2_rn(p0, p1));
+            }
+            l = l * alpha + psum;
+            const int gp = g / 8;  // first uint4 of this group's key pairs
+#pragma unroll
+            for (int d = 0; d < ATT_HD; ++d) {
+                const uint4 v0 = vt_s[d][gp], v1 = vt_s[d][gp + 1];
+                float acc = o[d] * alpha;
+                acc = dot2(pp[0], v0.x, acc);
+                acc = dot2(pp[1], v0.y, acc);
+                acc = dot2(pp[2], v0.z, acc);
+                acc = dot2(pp[3], v0.w, acc);
+                acc = dot2(pp[4], v1.x, acc);
+                acc = dot2(pp[5], v1.y, acc);
+                acc = dot2(pp[6], v1.z, acc);
+                acc = dot2(pp[7], v1.w, acc);
+                o[d] = acc;
+            }
+            m = m_new;
+        }
+    }
+    if (q >= L) return;
+    const float inv = 1.f / l;
+    uint32_t *op = reinterpret_cast<uint32_t *>(out + size_t(q) * heads * ATT_HD + size_t(h) * ATT_HD);
+#pragma unroll
+    for (int i = 0; i < ATT_HD / 2; ++i)
+        op[i] = __builtin_bit_cast(uint32_t, __floats2half2_rn(o[2 * i] * inv, o[2 * i + 1] * inv));
+}
+
 __global__ __launch_bounds__(256) void softmax_kernel(uint16_t *s, int n, int ld) {
     __shared__ float red[8];
     uint16_t *row = s + size_t(blockIdx.x) * ld;
@@ -141,6 +241,10 @@ void vit_embed(float *x, const uint16_t *y, const float *bias, const float *tabl
 void vit_rope2d(uint16_t *qkv, const int32_t *pos_hw, int N, int heads, hipStream_t s) {
     rope2d_kernel<<<N, 64, 0, s>>>(qkv, pos_hw, heads);
 }
+void vit_attention(const uint16_t *qkv, int L, int heads, uint16_t *out, hipStream_t s) {
+    attention_kernel<<<dim3(unsigned((L + ATT_Q - 1) / ATT_Q), unsigned(heads)), ATT_Q, 0, s>>>(qkv, L, heads, out);
+}
+
 void vit_softmax(uint16_t *s_rows, int rows, int n, int ld, hipStream_t s) {
     softmax_kernel<<<rows, 256, 0, s>>>(s_rows, n, ld);
 }

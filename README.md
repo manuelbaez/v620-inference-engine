@@ -22,10 +22,10 @@ reusable across turns without re-prefilling.
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
 | 3. 4-GPU runtime (TP4 dense + EP4 experts) | **decode 67 tok/s** single stream, **178 tok/s** at 4 concurrent (HIP graphs per batch size), **prefill ~1,900-2,000 tok/s** (vLLM: ~56 / ~1,060) |
 | 4. Prefix cache | per-slot reuse, VRAM snapshots, and a block store shared by all conversations in host RAM (128 GB) and on disk (survives restarts): any stored prefix up to a chat message boundary is restored in 0.02-0.5 s instead of re-prefilled (a shared 12k system prompt: 6.1 s -> 0.34 s) |
-| 5. MTP speculative decoding | done: exact, adaptive draft count, 2.5-2.8 tokens/step, **~95-105 tok/s** single stream; on by default in the server (`--mtp 3`) |
+| 5. MTP speculative decoding | done: exact, adaptive draft count (off while drafting does not pay), 2.5-2.8 tokens/step, **~95-105 tok/s** single stream; on by default in the server (`--mtp 3`) |
 | 6. Prefill kernels | batched prefill done; overlap and int8 next |
-| 7. OpenAI server, tokenizer, llama-swap entry | server works (matches vLLM's template, tokenization and parsers); llama-swap entry pending |
-| 8. CacheBlend-style reuse (experimental) | |
+| 7. OpenAI server, tokenizer, llama-swap entry | done: serving production through llama-swap and litellm; images and video (vision tower on every card, 720p in 0.33 s) |
+| 8. CacheBlend-style reuse (experimental) | built and measured, rejected on quality (docs/DESIGN.md) |
 
 The n-gram (PLE) table never goes to the GPUs. It stays mmapped in host RAM as
 the int4 sidecar, and the host gathers 16 rows per token.
