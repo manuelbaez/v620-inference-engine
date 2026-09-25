@@ -141,6 +141,7 @@ class Server:
             await resp.write(b"data: " + json.dumps(chunk({"role": "assistant", "content": ""})).encode() + b"\n\n")
 
         emitted_content = 0  # for stop-string truncation in streaming
+        timings = None  # llama.cpp-style per-request timings (llama-swap's activity log reads them)
         reasoning_tokens = 0
         try:
             async for kind, payload in self.run(prompt_ids, body):
@@ -148,6 +149,9 @@ class Server:
                     raise RuntimeError(payload)
                 if kind == "start":
                     cached = payload
+                    continue
+                if kind == "timings":
+                    timings = payload
                     continue
                 if kind == "eos":
                     usage["completion_tokens"] += 1
@@ -196,10 +200,15 @@ class Server:
         usage["prompt_tokens_details"] = {"cached_tokens": int(cached)}
         usage["completion_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
         if stream:
-            await resp.write(b"data: " + json.dumps(chunk({}, fin=finish)).encode() + b"\n\n")
+            last = chunk({}, fin=finish)
+            if timings:
+                last["timings"] = timings
+            await resp.write(b"data: " + json.dumps(last).encode() + b"\n\n")
             if include_usage:
                 u = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": self.model_name,
                      "choices": [], "usage": usage}
+                if timings:
+                    u["timings"] = timings
                 await resp.write(b"data: " + json.dumps(u).encode() + b"\n\n")
             await resp.write(b"data: [DONE]\n\n")
             return resp
@@ -211,7 +220,7 @@ class Server:
             "id": rid, "object": "chat.completion", "created": created, "model": self.model_name,
             "choices": [{"index": 0, "message": msg, "logprobs": {"content": logprobs} if body.get("logprobs") else None,
                          "finish_reason": finish}],
-            "usage": usage})
+            "usage": usage, **({"timings": timings} if timings else {})})
 
     async def completions(self, request):
         body = await request.json()
@@ -228,7 +237,7 @@ class Server:
         det = Detok(self.tok)
         text = ""
         usage = {"prompt_tokens": len(prompt_ids), "completion_tokens": 0}
-        finish, cached = "stop", 0
+        finish, cached, timings = "stop", 0, None
         stops = self._stop_strings(body)
         resp = None
         if stream:
@@ -239,6 +248,9 @@ class Server:
                 return web.json_response({"error": {"message": payload}}, status=500)
             if kind == "start":
                 cached = payload
+                continue
+            if kind == "timings":
+                timings = payload
                 continue
             if kind == "eos":
                 usage["completion_tokens"] += 1
@@ -265,9 +277,11 @@ class Server:
         usage["prompt_tokens_details"] = {"cached_tokens": int(cached)}
         if stream:
             c = {"id": rid, "object": "text_completion", "created": created, "model": self.model_name,
-                 "choices": [{"index": 0, "text": "", "finish_reason": finish}], "usage": usage}
+                 "choices": [{"index": 0, "text": "", "finish_reason": finish}], "usage": usage,
+                 **({"timings": timings} if timings else {})}
             await resp.write(b"data: " + json.dumps(c).encode() + b"\n\n")
             await resp.write(b"data: [DONE]\n\n")
             return resp
         return web.json_response({"id": rid, "object": "text_completion", "created": created, "model": self.model_name,
-                                  "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage})
+                                  "choices": [{"index": 0, "text": text, "finish_reason": finish}], "usage": usage,
+                                  **({"timings": timings} if timings else {})})

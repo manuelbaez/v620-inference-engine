@@ -32,6 +32,27 @@ class Request:
         self.limit = 0      # max new tokens in the slot it got
         self.generated = 0
         self.next = None    # sampled token not yet fed to the engine
+        self.cached = 0     # prompt tokens reused from the prefix cache
+        self.t_admit = self.t_first = None  # prefill start, first token (time.time())
+
+    def timings(self):
+        """llama.cpp-style per-request timings (llama-swap's activity log reads these)."""
+        now = time.time()
+        prompt_n = len(self.prompt) - self.cached
+        prompt_ms = (self.t_first - self.t_admit) * 1e3
+        predicted_ms = (now - self.t_first) * 1e3
+        decoded = max(self.generated - 1, 0)  # the first token comes from the prompt's logits
+        return {
+            "cache_n": self.cached,
+            "prompt_n": prompt_n,
+            "prompt_ms": round(prompt_ms, 3),
+            "prompt_per_token_ms": round(prompt_ms / prompt_n, 3) if prompt_n else 0.0,
+            "prompt_per_second": round(prompt_n / prompt_ms * 1e3, 2) if prompt_n and prompt_ms > 0 else 0.0,
+            "predicted_n": self.generated,
+            "predicted_ms": round(predicted_ms, 3),
+            "predicted_per_token_ms": round(predicted_ms / decoded, 3) if decoded else 0.0,
+            "predicted_per_second": round(decoded / predicted_ms * 1e3, 2) if decoded and predicted_ms > 0 else 0.0,
+        }
 
 
 class Scheduler:
@@ -71,6 +92,8 @@ class Scheduler:
             self.cv.notify()
 
     def _finish(self, r, reason):
+        if r.t_first is not None:
+            r.emit("timings", r.timings())
         r.emit("end", reason)
         if r.slot >= 0:
             self.e.release(r.slot)
@@ -109,10 +132,13 @@ class Scheduler:
                 room = self.e.capacity[slot] - n
                 r.limit = min(r.max_new, room) if r.max_new else room
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
+                r.t_admit = time.time()
                 cached = self.e.set_prompt(slot, r.prompt)
+                r.cached = cached
                 r.emit("start", cached)
                 top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
                 tid, lp = self.e.sample_prompt(slot, r.sampling)
+                r.t_first = time.time()
             except Exception as ex:  # noqa: BLE001
                 r.emit("error", str(ex))
                 self._finish(r, "abort")
