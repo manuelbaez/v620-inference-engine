@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 #include "engine/engine.hpp"
@@ -68,6 +69,13 @@ public:
     // state before such tokens. -1: no message boundaries.
     void set_boundary_token(int32_t id) { boundary_ = id; }
     BlockStore::Stats cache_stats() const { return store_ ? store_->stats() : BlockStore::Stats{}; }
+    // Prompt-level counters: prompt tokens, tokens reused exactly, and tokens
+    // after the reuse point in chunks already seen in an earlier prompt at any
+    // position (what non-prefix reuse could have saved).
+    struct ReuseCounters {
+        uint64_t prompt_tokens = 0, reused_tokens = 0, blend_candidate_tokens = 0;
+    };
+    ReuseCounters reuse_counters() const { return counters_; }
     struct StepReq {
         int slot;
         int32_t pending;  // sampled, not decoded yet
@@ -117,6 +125,7 @@ private:
     std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from);
     void prefill_rest(int slot, const std::vector<int32_t> &prompt);
     int save_snapshot(int slot);  // returns the VRAM snapshot index
+    void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     void drop_snapshots_after(int slot, int64_t n);
     int draft_count(int slot, int k_max) const;
     int32_t sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known = NAN,
@@ -129,6 +138,8 @@ private:
     std::vector<int> reserved_;       // VRAM snapshots the running prefill captures into
     std::unique_ptr<BlockStore> store_;
     int32_t boundary_ = -1;
+    ReuseCounters counters_;
+    std::unordered_map<uint64_t, uint64_t> seen_chunks_;  // chunk hash -> last prompt that had it
     int64_t min_gap_ = 1024;          // tokens between snapshots (and the least a saved prefix holds)
     std::vector<int> row_slot_;       // slot of each row of the last decode
     std::vector<StepOut> out_;

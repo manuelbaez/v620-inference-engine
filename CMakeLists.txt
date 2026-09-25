@@ -39,6 +39,9 @@ enable_testing()
 add_executable(test_ngram tests/unit/test_ngram.cpp)
 target_link_libraries(test_ngram PRIVATE qw_core)
 add_test(NAME ngram COMMAND test_ngram)
+add_executable(test_chunker tests/unit/test_chunker.cpp src/session/chunker.cpp)
+target_include_directories(test_chunker PRIVATE src)
+add_test(NAME chunker COMMAND test_chunker)
 
 if(NOT QW_GPU)
   return()
@@ -86,6 +89,7 @@ set(QW_HIP_HOST_SOURCES
   src/session/generate.cpp
   src/session/prefix_cache.cpp
   src/session/block_store.cpp
+  src/session/chunker.cpp
   src/session/disk_tier.cpp
   src/session/sampling.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} src/capi/capi.cpp PROPERTIES LANGUAGE HIP)

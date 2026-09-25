@@ -39,6 +39,9 @@ int qw_set_boundary_token(qw_handle *h, int32_t id);
 typedef struct qw_cache_stats {
     uint64_t hits, tokens_restored, snapshots_saved;
     uint64_t ram_bytes, disk_bytes, blocks, snapshots;
+    /* prompt tokens, tokens reused exactly, and tokens after the reuse point in
+     * chunks seen before at any position (what non-prefix reuse could save) */
+    uint64_t prompt_tokens, reused_tokens, blend_candidate_tokens;
 } qw_cache_stats;
 int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out);
 

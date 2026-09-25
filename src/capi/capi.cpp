@@ -146,7 +146,9 @@ int qw_set_boundary_token(qw_handle *h, int32_t id) {
 
 int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out) {
     const qw::BlockStore::Stats s = h->session->cache_stats();
-    *out = {s.hits, s.tokens_restored, s.snapshots_saved, s.ram_bytes, s.disk_bytes, s.blocks, s.snapshots};
+    const qw::Session::ReuseCounters c = h->session->reuse_counters();
+    *out = {s.hits,      s.tokens_restored, s.snapshots_saved, s.ram_bytes,        s.disk_bytes,
+            s.blocks,    s.snapshots,       c.prompt_tokens,   c.reused_tokens,    c.blend_candidate_tokens};
     return 0;
 }
 

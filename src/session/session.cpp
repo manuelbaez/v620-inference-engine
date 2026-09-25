@@ -110,6 +110,7 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     if (restore_from_store(slot, prompt, reusable(slot, prompt), common) && common == prompt.size()) {
         slots_[size_t(slot)].prompt_end = int64_t(common);
         single_ = false;
+        count_reuse(prompt, int64_t(common));
         return int64_t(common);
     }
 
@@ -174,6 +175,7 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     if (prompt.size() > hist.size()) prefill_rest(slot, prompt);
     slots_[size_t(slot)].prompt_end = int64_t(hist.size());
     single_ = false;
+    count_reuse(prompt, reused);
     return reused;
 }
 

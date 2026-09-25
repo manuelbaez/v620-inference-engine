@@ -29,7 +29,8 @@ class StepReq(ctypes.Structure):
 
 class CacheStats(ctypes.Structure):
     _fields_ = [(name, ctypes.c_uint64) for name in (
-        "hits", "tokens_restored", "snapshots_saved", "ram_bytes", "disk_bytes", "blocks", "snapshots")]
+        "hits", "tokens_restored", "snapshots_saved", "ram_bytes", "disk_bytes", "blocks", "snapshots",
+        "prompt_tokens", "reused_tokens", "blend_candidate_tokens")]
 
 
 class Engine:

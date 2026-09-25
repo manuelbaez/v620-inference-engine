@@ -4,6 +4,7 @@
 #include <algorithm>
 
 #include "core/common.hpp"
+#include "session/chunker.hpp"
 #include "session/session.hpp"
 
 namespace qw {
@@ -90,6 +91,25 @@ void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
         },
         caps);
     reserved_.clear();
+}
+
+void Session::count_reuse(const std::vector<int32_t> &prompt, int64_t reused) {
+    const uint64_t id = ++clock_;
+    counters_.prompt_tokens += prompt.size();
+    counters_.reused_tokens += uint64_t(reused);
+    for (const Chunk &c : chunk_prompt(prompt, boundary_)) {
+        auto it = seen_chunks_.find(c.hash);
+        if (it != seen_chunks_.end() && it->second != id && c.start >= reused) counters_.blend_candidate_tokens += c.len;
+        seen_chunks_[c.hash] = id;
+    }
+    if (seen_chunks_.size() > (1u << 20)) {  // keep the more recently seen half
+        std::vector<uint64_t> ids;
+        for (const auto &kv : seen_chunks_) ids.push_back(kv.second);
+        std::nth_element(ids.begin(), ids.begin() + ptrdiff_t(ids.size() / 2), ids.end());
+        const uint64_t cut = ids[ids.size() / 2];
+        for (auto it = seen_chunks_.begin(); it != seen_chunks_.end();)
+            it = it->second < cut ? seen_chunks_.erase(it) : std::next(it);
+    }
 }
 
 void Session::persist() {
