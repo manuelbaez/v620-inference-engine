@@ -490,7 +490,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 8. **CacheBlend experiment.** Done: rejected on quality (see above); exact
    block-level reuse shipped instead.
 9. **Performance, next** (details and estimates in "Next steps" below):
-   - [ ] int8 dense weights (W8A16), behind a logprob quality gate
+   - [~] int8 dense weights: built (+16% decode), fails the quality gate; opt-in `QW_INT8_DENSE=1`
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [ ] fewer, bigger decode kernels (fuse each sublayer's glue)
    - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
@@ -562,7 +562,14 @@ So ~8.5 ms is compute and ~6.5 ms is collective latency and launch gaps. The
 GEMVs are near the bandwidth limit, so the remaining gains are in bytes,
 launches and collectives, in this order of expected payoff:
 
-1. **int8 dense weights (W8A16).** Dense fp16 weights are 88% of the bytes
+1. **int8 dense weights (W8A16).** Built and measured (`QW_INT8_DENSE=1`,
+   `gemv_rows_i8`, one fp32 scale per 32 weights along K): single-stream
+   decode 14.9 -> 12.8 ms per step (67 -> 78 tok/s), but against the fp32
+   reference over 500 tokens (teacher-forced decode) mean |dlogprob| goes
+   0.094 -> 0.127 and top-1 agreement 95.4% -> 92.6% (per-row scales were
+   worse: 0.161 against fp16). Every weight group contributes (bisected with
+   `QW_INT8_SKIP`), so it stays opt-in: a speed/accuracy choice. Original
+   note: Dense fp16 weights are 88% of the bytes
    read per token. Per-channel int8 copies halve the GEMV time (~-2.4 ms per
    step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
    against the fp32 reference (`qw_gpu --logprobs`) must stay near today's
