@@ -33,10 +33,35 @@ void Session::offload_slot(int slot, const std::vector<int32_t> &next_prompt) {
     h.tokens = s.tokens;
     h.logits = s.logits;
     h.state = e_.export_state(slot, best, int64_t(s.tokens.size()));
+    if (disk_) disk_->store(h.tokens, h.logits, h.state);  // written in the background
+    log("host tier: saved %zu tokens of slot %d", h.tokens.size(), slot);
+    add_host_entry(std::move(h));
+}
+
+void Session::persist() {
+    if (!disk_) return;
+    for (int slot = 0; slot < num_slots(); ++slot) {
+        int best = -1;
+        for (int i = 0; i < int(snaps_.size()); ++i) {
+            const Snap &s = snaps_[size_t(i)];
+            if (s.valid && s.slot == slot && (best < 0 || s.tokens.size() > snaps_[size_t(best)].tokens.size()))
+                best = i;
+        }
+        if (best < 0) continue;
+        const Snap &s = snaps_[size_t(best)];
+        if (s.tokens.size() < host_min_tokens_ || disk_->has(s.tokens)) continue;
+        disk_->store(s.tokens, s.logits, e_.export_state(slot, best, int64_t(s.tokens.size())));
+    }
+    disk_->flush();
+    log("disk tier: persisted the slots' conversations");
+}
+
+// Adds an entry to the RAM tier, evicting least recently used ones to fit.
+void Session::add_host_entry(HostEntry h) {
     h.bytes = Engine::host_state_bytes(*h.state) + h.logits.size() * 4;
     h.used = ++clock_;
     if (h.bytes > host_budget_) return;
-    while (host_bytes_ + h.bytes > host_budget_ && !host_.empty()) {  // evict least recently used
+    while (host_bytes_ + h.bytes > host_budget_ && !host_.empty()) {
         auto lru = std::min_element(host_.begin(), host_.end(),
                                     [](const HostEntry &a, const HostEntry &b) { return a.used < b.used; });
         host_bytes_ -= lru->bytes;
@@ -44,8 +69,18 @@ void Session::offload_slot(int slot, const std::vector<int32_t> &next_prompt) {
     }
     host_bytes_ += h.bytes;
     host_.push_back(std::move(h));
-    log("host tier: saved %zu tokens of slot %d (%zu entries, %.1f GB)", s.tokens.size(), slot, host_.size(),
-        double(host_bytes_) / 1e9);
+}
+
+// Brings the disk tier's longest prefix of `prompt` into the RAM tier if it
+// beats `at_least` tokens. Returns whether it did.
+bool Session::promote_from_disk(const std::vector<int32_t> &prompt, size_t at_least) {
+    if (!disk_) return false;
+    const size_t len = disk_->best(prompt, at_least);
+    if (len == 0) return false;
+    HostEntry h;
+    if (!disk_->load(prompt, len, h.tokens, h.logits, h.state)) return false;
+    add_host_entry(std::move(h));
+    return true;
 }
 
 // The entry holding the longest prefix of `prompt`, if longer than at_least.

@@ -129,6 +129,16 @@ int32_t qw_sample_row(qw_handle *h, int row, const qw_sampling *p, float *lp) {
     return guarded(h, [&] { return h->session->sample_row(row, params(p), lp); }, int32_t(-1));
 }
 
+int qw_persist(qw_handle *h) {
+    return guarded(
+        h,
+        [&] {
+            h->session->persist();
+            return 0;
+        },
+        -1);
+}
+
 int qw_has_mtp(qw_handle *h) {
     return h->engine->has_mtp() ? 1 : 0;
 }

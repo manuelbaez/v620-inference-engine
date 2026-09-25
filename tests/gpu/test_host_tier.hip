@@ -1,12 +1,15 @@
 // Host-RAM tier of the prefix cache: with 2 slots, a third conversation
 // evicts the first to host memory; coming back to the first (plus a new
 // message) must reuse all of its tokens and give the same next-token
-// distribution as a fresh prefill of the whole prompt.
+// distribution as a fresh prefill of the whole prompt. Then a new session with
+// an empty RAM tier (a restarted server) must get the conversation back from
+// the disk tier.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "core/common.hpp"
@@ -43,6 +46,9 @@ int main() {
         opt.slot_tokens = {8192, 8192};
         opt.warmup = false;
         Engine e(opt);
+        const std::string disk_dir = "/tmp/qw_disk_tier_test";
+        std::system(("rm -rf " + disk_dir).c_str());
+        setenv("QW_DISK_CACHE_DIR", disk_dir.c_str(), 1);
         Session s(e);
         const auto A = text(4000, 1), B = text(3000, 2), C = text(3000, 3);
         auto A2 = A;
@@ -90,6 +96,30 @@ int main() {
         fails += !(same_top && d_tier < 1e-3);
         std::printf("A2 vs fresh prefill: top token %s, |dlogprob| %.4f (in-place split: %.4f; tier vs split: %.5f)\n",
                     same_top ? "same" : "DIFFERENT", d, d_split, d_tier);
+        // restart: a fresh session (empty RAM tier) indexes the disk tier
+        s.flush_disk();
+        for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+        {
+            Session s2(e);
+            auto A3 = A;
+            const auto tail3 = text(30, 5);
+            A3.insert(A3.end(), tail3.begin(), tail3.end());
+            const int slot = s2.acquire(A3, 16);
+            const double t0 = now();
+            const int64_t reused = s2.set_prompt(slot, A3);
+            const double dt = now() - t0;
+            const std::vector<float> got = e.logits();
+            e.slot_reset(0);
+            e.prefill(0, A);
+            const std::vector<float> split3 = e.prefill(0, tail3);
+            const int32_t top3 = int32_t(std::max_element(split3.begin(), split3.end()) - split3.begin());
+            const double d3 = std::fabs(logprob(split3, top3) - logprob(got, top3));
+            const bool ok = reused == int64_t(A.size()) && d3 < 1e-3;
+            fails += !ok;
+            std::printf(
+                "after restart: A3 reused %lld of %zu tokens from disk in %.3f s, |dlogprob| vs in-place %.5f %s\n",
+                (long long)reused, A3.size(), dt, d3, ok ? "" : "FAIL");
+        }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;
     } catch (const std::exception &ex) {

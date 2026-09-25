@@ -21,7 +21,7 @@ reusable across turns without re-prefilling.
 | 1. Spec + CPU fp32 reference (`src/ref`) | done; matches vLLM (greedy identical at 57 and 4,266 tokens) |
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
 | 3. 4-GPU runtime (TP4 dense + EP4 experts) | **decode 67 tok/s** single stream, **178 tok/s** at 4 concurrent (HIP graphs per batch size), **prefill ~1,900-2,000 tok/s** (vLLM: ~56 / ~1,060) |
-| 4. Prefix cache | per-slot reuse, VRAM snapshots, host-RAM tier (evicted conversations restored in ~0.1 s instead of re-prefilled) |
+| 4. Prefix cache | per-slot reuse, VRAM snapshots, host-RAM tier (128 GB) and disk tier (survives restarts): evicted conversations restored in 0.1-0.5 s instead of re-prefilled |
 | 5. MTP speculative decoding | done: exact, adaptive draft count, 2.5-2.8 tokens/step, **~95-105 tok/s** single stream; on by default in the server (`--mtp 3`) |
 | 6. Prefill kernels | batched prefill done; overlap and int8 next |
 | 7. OpenAI server, tokenizer, llama-swap entry | server works (matches vLLM's template, tokenization and parsers); llama-swap entry pending |

@@ -331,10 +331,23 @@ all ranks; 0.5 GB for 4k tokens). A later prompt that extends a saved one is
 restored into a slot (`import_state`) and only the new tokens are
 prefilled. Measured: 4,000 tokens restored in 0.07-0.1 s against a 2.7 s
 prefill; the result is bit-identical to continuing in place
-(`tests/gpu/test_host_tier`). Budget `QW_HOST_CACHE_GB` (default 48, LRU),
-entries of at least 1,024 tokens. This is the LMCache role (a RAM tier
-behind the GPU prefix cache) inside the engine process; it does not survive
-restarts yet.
+(`tests/gpu/test_host_tier`). Budget `QW_HOST_CACHE_GB` (default 128, LRU),
+entries of at least 1,024 tokens.
+
+Disk tier (`src/session/disk_tier.cpp`, `QW_DISK_CACHE_DIR`,
+`QW_DISK_CACHE_GB`, default 200): every entry saved to RAM is also written to
+a file by a background thread (header with a state-layout id, tokens, last
+logits, each rank's state; written to a temporary name and renamed). The
+directory is indexed at startup, and a prompt that extends a stored
+conversation loads it into the RAM tier and restores it. Measured on the dev
+box's ZFS: 0.46 GB written in 0.1 s, loaded and restored in 0.46 s after a
+simulated restart, bit-identical to continuing in place. On shutdown (SIGTERM)
+the server stops its scheduler and saves every slot's newest snapshot too
+(`qw_persist`; 0.7 s for 4 slots of ~3.4k tokens), so no conversation is
+lost across restarts. Measured through the server: follow-up turns after a
+restart come back with the whole previous prompt cached, 0.37 s vs ~2 s.
+Together this is the
+LMCache role (RAM and disk tiers behind the GPU prefix cache), in-process.
 
 ## Adaptive draft count
 

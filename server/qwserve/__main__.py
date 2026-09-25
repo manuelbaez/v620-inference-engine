@@ -22,7 +22,16 @@ def main():
                     help="context size of each sequence slot (concurrent requests); the largest is max_model_len")
     ap.add_argument("--prefill-chunk", type=int, default=8192)
     ap.add_argument("--mtp", type=int, default=3, help="MTP draft tokens per step (0: no speculative decoding)")
+    ap.add_argument("--host-cache-gb", type=float, default=128,
+                    help="pinned host RAM for conversations evicted from their slot (0: off)")
+    ap.add_argument("--disk-cache-dir", default=os.path.expanduser("~/.cache/qw/prefix-cache"),
+                    help="disk tier of the prefix cache, survives restarts ('' : off)")
+    ap.add_argument("--disk-cache-gb", type=float, default=200)
     args = ap.parse_args()
+    # the engine's session reads these when it starts
+    os.environ["QW_HOST_CACHE_GB"] = str(args.host_cache_gb)
+    os.environ["QW_DISK_CACHE_DIR"] = args.disk_cache_dir
+    os.environ["QW_DISK_CACHE_GB"] = str(args.disk_cache_gb)
     srv = Server(args)
     app = web.Application(client_max_size=256 * 1024 * 1024)
     app.router.add_get("/health", srv.health)
@@ -30,6 +39,7 @@ def main():
     app.router.add_post("/tokenize", srv.tokenize)
     app.router.add_post("/v1/chat/completions", srv.chat)
     app.router.add_post("/v1/completions", srv.completions)
+    app.on_shutdown.append(srv.on_shutdown)
     web.run_app(app, host=args.host, port=args.port, access_log=None)
 
 

@@ -49,7 +49,18 @@ class Scheduler:
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
         self.active = []
-        threading.Thread(target=self._loop, daemon=True, name="qw-scheduler").start()
+        self.stopping = False
+        self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
+        self.thread.start()
+
+    def shutdown(self, timeout=30):
+        """Stops after the current step; in-flight requests end with an error."""
+        with self.cv:
+            self.stopping = True
+            self.cv.notify_all()
+        self.thread.join(timeout)
+        for r in self.waiting + self.active + self.queue:
+            r.emit("error", "server shutting down")
 
     def submit(self, req):
         n = len(req.prompt)
@@ -134,8 +145,10 @@ class Scheduler:
     def _loop(self):
         while True:
             with self.cv:
-                while not self.queue and not self.waiting and not self.active:
+                while not self.queue and not self.waiting and not self.active and not self.stopping:
                     self.cv.wait()
+                if self.stopping:
+                    return
                 self.waiting += self.queue  # the queue is shared; waiting is this thread's
                 self.queue = []
             try:

@@ -47,6 +47,7 @@ class Engine:
             "qw_sample_row": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
             "qw_top_logprobs": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int, I32P, FP]),
             "qw_has_mtp": (ctypes.c_int, [P]),
+            "qw_persist": (ctypes.c_int, [P]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
                                            I32P, I32P]),
@@ -118,3 +119,7 @@ class Engine:
         self._check(self.lib.qw_generate(self.h, n, arr, k, toks, lps, counts, firsts, stopped))
         return [(list(toks[i * w:i * w + counts[i]]), list(lps[i * w:i * w + counts[i]]), firsts[i], bool(stopped[i]))
                 for i in range(n)]
+
+    def persist(self):
+        """Saves the slots' conversations to the disk prefix cache."""
+        self._check(self.lib.qw_persist(self.h))

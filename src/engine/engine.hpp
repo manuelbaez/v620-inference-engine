@@ -116,6 +116,15 @@ public:
     // Makes `slot` hold the exported state (n tokens; tail: its last tokens).
     void import_state(const HostState &hs, int slot, const std::vector<int32_t> &tail);
     static size_t host_state_bytes(const HostState &hs);
+    // Raw access for persistence (the disk tier): an empty state for n tokens
+    // in this engine's layout, its size, and each rank's buffer.
+    std::shared_ptr<HostState> alloc_host_state(int64_t n);
+    static int64_t host_state_tokens(const HostState &hs);
+    static size_t host_state_rank_bytes(const HostState &hs);
+    static uint8_t *host_state_buffer(const HostState &hs, int rank);
+    // Identifies the state layout (shapes, ring sizes, MTP layer): a saved
+    // state is only loadable by an engine with the same id.
+    uint64_t state_layout_id() const;
 
     // Single-sequence convenience API on slot 0 (tools, tests).
     void reset();

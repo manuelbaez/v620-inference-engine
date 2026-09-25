@@ -31,4 +31,6 @@ COPY server server
 # completions can go missing on this box (docs/DESIGN.md, platform notes).
 ENV HSA_ENABLE_SDMA=0
 ENV PYTHONPATH=/opt/qw/server
-ENTRYPOINT ["/opt/qw/venv/bin/python", "-m", "qwserve", "--lib", "/opt/qw/build/libqw_engine.so"]
+# prefix-cache disk tier: mount a persistent volume here
+VOLUME /cache
+ENTRYPOINT ["/opt/qw/venv/bin/python", "-m", "qwserve", "--lib", "/opt/qw/build/libqw_engine.so", "--disk-cache-dir", "/cache/prefix"]

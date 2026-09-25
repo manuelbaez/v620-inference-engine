@@ -59,6 +59,14 @@ class Server:
         finally:
             req.cancelled.set()  # no-op when finished; frees the slot on client disconnect
 
+    async def on_shutdown(self, _app):
+        """Stop the scheduler, then save the slots' conversations to the disk tier."""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self.sched.shutdown)
+        t0 = time.time()
+        await loop.run_in_executor(None, self.engine.persist)
+        print(f"persisted the prefix cache in {time.time() - t0:.1f}s", flush=True)
+
     # --- handlers
     async def health(self, _):
         st = dict(self.sched.stats)

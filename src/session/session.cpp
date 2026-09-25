@@ -13,7 +13,12 @@ namespace qw {
 Session::Session(Engine &e)
     : e_(e), slots_(size_t(e.num_slots())), snaps_(Engine::SNAPSHOTS), rng_(std::random_device{}()) {
     const char *gb = std::getenv("QW_HOST_CACHE_GB");
-    host_budget_ = size_t((gb ? std::atof(gb) : 48.0) * 1e9);
+    host_budget_ = size_t((gb ? std::atof(gb) : 128.0) * 1e9);
+    // disk tier: QW_DISK_CACHE_DIR (off when unset), QW_DISK_CACHE_GB (default 200)
+    if (const char *dir = std::getenv("QW_DISK_CACHE_DIR"); dir && *dir && host_budget_ > 0) {
+        const char *dgb = std::getenv("QW_DISK_CACHE_GB");
+        disk_ = std::make_unique<DiskTier>(e_, dir, size_t((dgb ? std::atof(dgb) : 200.0) * 1e9));
+    }
 }
 
 void Session::drop_snapshots_after(int slot, int64_t n) {
@@ -101,6 +106,14 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     // host tier: a saved conversation that covers more of the prompt than this slot can
     // (offload the slot's own conversation first: saving may evict entries)
     const size_t slot_reuse = reusable(slot, prompt);
+    {  // the disk tier's best, if it beats both the slot and the RAM tier, moves to RAM
+        const int rb = best_host_entry(prompt, slot_reuse);
+        const size_t ram_best = rb >= 0 ? host_[size_t(rb)].tokens.size() : slot_reuse;
+        if (disk_ && disk_->best(prompt, ram_best) > 0) {
+            offload_slot(slot, prompt);
+            promote_from_disk(prompt, ram_best);
+        }
+    }
     if (best_host_entry(prompt, slot_reuse) >= 0) offload_slot(slot, prompt);
     const int hb = best_host_entry(prompt, slot_reuse);
     if (hb >= 0) {

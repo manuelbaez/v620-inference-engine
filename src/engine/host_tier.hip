@@ -47,19 +47,45 @@ size_t Engine::host_state_bytes(const HostState &hs) {
     return hs.bytes_per_rank * hs.buf.size();
 }
 
-std::shared_ptr<Engine::HostState> Engine::export_state(int slot, int snap, int64_t n) {
-    QW_CHECK(slot >= 0 && slot < num_slots() && snap >= 0 && snap < SNAPSHOTS, "export_state: bad slot / snapshot");
-    QW_CHECK(n > 0 && n <= slots_[size_t(slot)].len, "export_state: the slot does not hold n tokens");
+std::shared_ptr<Engine::HostState> Engine::alloc_host_state(int64_t n) {
     auto hs = std::make_shared<HostState>();
     hs->n = n;
     hs->layers = N_QSA + int(mtp_);
     const Layout lay(n);
     hs->bytes_per_rank = size_t(hs->layers) * lay.per_layer + lay.state;
     for (auto &rkp : ranks_) {
-        Rank &rk = *rkp;
-        CK(hipSetDevice(rk.dev));
+        CK(hipSetDevice(rkp->dev));
         hs->buf.push_back(pinned<uint8_t>(hs->bytes_per_rank));
-        uint8_t *p = hs->buf.back();
+    }
+    return hs;
+}
+
+int64_t Engine::host_state_tokens(const HostState &hs) { return hs.n; }
+size_t Engine::host_state_rank_bytes(const HostState &hs) { return hs.bytes_per_rank; }
+uint8_t *Engine::host_state_buffer(const HostState &hs, int rank) { return hs.buf[size_t(rank)]; }
+
+uint64_t Engine::state_layout_id() const {
+    // FNV-1a over everything that shapes the per-token and per-sequence state
+    const uint64_t fields[] = {3,  uint64_t(N_QSA + int(mtp_)), HEAD_DIM, IDX_DIM, IDX_RATIO, SLOT_S, SLOT_RING,
+                               SLOT_PLE, XW, uint64_t(RANKS), uint64_t(VOCAB)};
+    uint64_t h = 1469598103934665603ull;
+    for (uint64_t f : fields)
+        for (int b = 0; b < 8; ++b) {
+            h ^= (f >> (8 * b)) & 0xff;
+            h *= 1099511628211ull;
+        }
+    return h;
+}
+
+std::shared_ptr<Engine::HostState> Engine::export_state(int slot, int snap, int64_t n) {
+    QW_CHECK(slot >= 0 && slot < num_slots() && snap >= 0 && snap < SNAPSHOTS, "export_state: bad slot / snapshot");
+    QW_CHECK(n > 0 && n <= slots_[size_t(slot)].len, "export_state: the slot does not hold n tokens");
+    auto hs = alloc_host_state(n);
+    const Layout lay(n);
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        Rank &rk = *ranks_[r];
+        CK(hipSetDevice(rk.dev));
+        uint8_t *p = hs->buf[r];
         const auto &sl = rk.slots[size_t(slot)];
         for (int i = 0; i < hs->layers; ++i) {
             CK(hipMemcpyAsync(p, sl.K[size_t(i)], lay.k, hipMemcpyDeviceToHost, rk.s));

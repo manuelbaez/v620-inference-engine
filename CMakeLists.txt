@@ -83,13 +83,15 @@ set(QW_HIP_HOST_SOURCES
   src/session/session.cpp
   src/session/generate.cpp
   src/session/host_tier.cpp
+  src/session/disk_tier.cpp
   src/session/sampling.cpp
   src/capi/capi.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} PROPERTIES LANGUAGE HIP)
 
 set_source_files_properties(src/engine/device_mem.cpp PROPERTIES LANGUAGE HIP)
 add_library(qw_gpu STATIC ${QW_HIP_SOURCES} src/engine/device_mem.cpp src/engine/weight_convert.cpp src/session/session.cpp
-                          src/session/generate.cpp src/session/host_tier.cpp src/session/sampling.cpp)
+                          src/session/generate.cpp src/session/host_tier.cpp src/session/disk_tier.cpp
+                          src/session/sampling.cpp)
 target_include_directories(qw_gpu PUBLIC src include)
 target_compile_options(qw_gpu PRIVATE -Wall)
 if(QW_DEVICE_CHECKS)

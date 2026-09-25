@@ -27,6 +27,9 @@ typedef struct qw_sampling {
  * "slots": [131072, 65536, 32768, 32768], "prefill_chunk": 8192}. */
 qw_handle *qw_open(const char *options_json, char *err, int errlen);
 void qw_close(qw_handle *h);
+/* Saves the slots' conversations to the disk prefix cache (if configured) and
+ * waits for the writes; call before exiting, with no request in flight. */
+int qw_persist(qw_handle *h);
 const char *qw_error(qw_handle *h);
 
 int qw_num_slots(qw_handle *h);

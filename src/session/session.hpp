@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "engine/engine.hpp"
+#include "session/disk_tier.hpp"
 #include "session/sampling.hpp"
 
 namespace qw {
@@ -50,6 +51,13 @@ public:
     // ---- generation with MTP speculative decoding
     // Tokens that end a request in `slot` (EOS, stop ids): verification stops there.
     void set_stop_tokens(int slot, std::vector<int32_t> ids);
+    // Saves every slot's newest snapshot to the disk tier and waits for the
+    // writes (call at shutdown, with no request running).
+    void persist();
+    // Blocks until the disk tier's queued writes are on disk (no-op without it).
+    void flush_disk() {
+        if (disk_) disk_->flush();
+    }
     struct StepReq {
         int slot;
         int32_t pending;  // sampled, not decoded yet
@@ -101,6 +109,8 @@ private:
         uint64_t used = 0;
     };
     void offload_slot(int slot, const std::vector<int32_t> &next_prompt);
+    void add_host_entry(HostEntry h);
+    bool promote_from_disk(const std::vector<int32_t> &prompt, size_t at_least);
     int best_host_entry(const std::vector<int32_t> &prompt, size_t at_least) const;
     void save_snapshot(int slot);
     void drop_snapshots_after(int slot, int64_t n);
@@ -115,7 +125,8 @@ private:
     std::vector<HostEntry> host_;
     size_t host_bytes_ = 0, host_budget_ = 0;
     size_t host_min_tokens_ = 1024;
-    std::vector<int> row_slot_;  // slot of each row of the last decode
+    std::unique_ptr<DiskTier> disk_;  // declared after the tiers it feeds from: destroyed first
+    std::vector<int> row_slot_;       // slot of each row of the last decode
     std::vector<StepOut> out_;
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)
     uint64_t clock_ = 0;
