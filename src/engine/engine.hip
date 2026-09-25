@@ -28,8 +28,11 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
-    // QW_PLE_PIN=1: lock the n-gram table in RAM instead of leaving it in page cache
-    ple_->pin_in_background(std::getenv("QW_PLE_PIN") != nullptr);
+    // The n-gram table is reserved in RAM up front (mlock); QW_PLE_PIN=0 leaves it in page cache.
+    {
+        const char *pin = std::getenv("QW_PLE_PIN");
+        ple_->pin_in_background(!(pin && std::string(pin) == "0"));
+    }
     const size_t slot = std::max<size_t>(64 * 1024, size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096);
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
     comm2_ = std::make_unique<Comm>(opt_.devices, slot);
