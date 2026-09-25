@@ -17,8 +17,9 @@ float log_sum_exp(const float *raw) {
     return mx + float(std::log(z));
 }
 
-int32_t sample_token(const float *raw, const SamplingParams &p, const std::vector<int32_t> &hist, int64_t prompt_end,
-                     std::mt19937_64 &rng, float *logprob, float lse_known) {
+int32_t sample_token(const float *raw, const SamplingParams &p, const std::vector<int32_t> &hist, size_t hist_len,
+                     int64_t prompt_end, std::mt19937_64 &rng, float *logprob, float lse_known) {
+    const size_t n_hist = std::min(hist_len, hist.size());
     const int V = cfg::VOCAB;
     // the log-sum-exp is only needed for the reported logprob
     const float lse = !logprob ? 0.f : std::isnan(lse_known) ? log_sum_exp(raw) : lse_known;
@@ -32,10 +33,10 @@ int32_t sample_token(const float *raw, const SamplingParams &p, const std::vecto
     std::vector<float> l(raw, raw + V);
     if (penalties) {
         std::unordered_map<int32_t, int> counts;
-        for (size_t i = size_t(prompt_end); i < hist.size(); ++i) ++counts[hist[i]];
+        for (size_t i = size_t(prompt_end); i < n_hist; ++i) ++counts[hist[i]];
         if (p.repetition_penalty != 1.f) {
             std::vector<bool> seen(size_t(V), false);
-            for (int32_t t : hist) seen[size_t(t)] = true;
+            for (size_t i = 0; i < n_hist; ++i) seen[size_t(hist[i])] = true;
             for (int i = 0; i < V; ++i)
                 if (seen[size_t(i)])
                     l[size_t(i)] =
@@ -75,7 +76,7 @@ int32_t sample_token(const float *raw, const SamplingParams &p, const std::vecto
         while (k < keep && prob[k] >= thr) ++k;
         keep = std::max<size_t>(k, 1);
     }
-    std::mt19937_64 seeded(p.seed + hist.size());
+    std::mt19937_64 seeded(p.seed + n_hist);
     std::mt19937_64 &g = p.seed ? seeded : rng;
     double tot = 0;
     for (size_t i = 0; i < keep; ++i) tot += prob[i];

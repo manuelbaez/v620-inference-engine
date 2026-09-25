@@ -79,12 +79,13 @@ set(QW_HIP_SOURCES
 set(QW_HIP_HOST_SOURCES
   src/engine/weight_convert.cpp
   src/session/session.cpp
+  src/session/generate.cpp
   src/session/sampling.cpp
   src/capi/capi.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} PROPERTIES LANGUAGE HIP)
 
 add_library(qw_gpu STATIC ${QW_HIP_SOURCES} src/engine/weight_convert.cpp src/session/session.cpp
-                          src/session/sampling.cpp)
+                          src/session/generate.cpp src/session/sampling.cpp)
 target_include_directories(qw_gpu PUBLIC src include)
 target_compile_options(qw_gpu PRIVATE -Wall)
 target_link_libraries(qw_gpu PUBLIC qw_core roc::rocblas hip::host)

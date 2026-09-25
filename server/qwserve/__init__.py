@@ -13,7 +13,8 @@ production vLLM's `--reasoning-parser qwen3 --tool-call-parser qwen3_coder`:
     trimmed, values coerced to the tool's JSON schema type.
 
 Requests run concurrently, one per engine slot (continuous batching: every
-active request advances one token per batched step; others queue). Prompt
+active request advances each batched step, by 1 + accepted MTP draft tokens;
+others queue). Prompt
 state is reused: a request goes to the slot holding the longest prefix of its
 prompt and only prefills the rest (usage.prompt_tokens_details.cached_tokens).
 """

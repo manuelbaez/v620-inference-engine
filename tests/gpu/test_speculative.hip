@@ -40,6 +40,11 @@ struct Seq {
     int steps = 0, accepted = 0;
 };
 
+struct Timing {
+    double decode = 0, accept = 0, draft = 0;
+};
+static Timing g_time;
+
 // Speculative greedy decoding of every sequence (one slot each) until each
 // has `gen` tokens.
 static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
@@ -60,7 +65,9 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
             n_rows[i] = 1 + k;
         }
         if (rows.empty()) break;
+        double t = now();
         const auto &lg = e.decode(rows);
+        g_time.decode += now() - t;
         reqs.clear();
         std::vector<size_t> which;
         for (size_t i = 0; i < seqs.size(); ++i) {
@@ -77,14 +84,18 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
             }
             q.steps += 1;
             q.accepted += keep - 1;
+            t = now();
             e.accept(q.slot, keep);
+            g_time.accept += now() - t;
             if (int(q.out.size()) < gen) {
                 reqs.push_back({q.slot, next});
                 which.push_back(i);
             }
         }
         if (reqs.empty()) continue;
+        t = now();
         auto dd = e.draft(reqs, K);
+        g_time.draft += now() - t;
         for (size_t j = 0; j < which.size(); ++j) seqs[which[j]].drafts = dd[j];
     }
     for (auto &q : seqs) q.out.resize(size_t(gen));
@@ -124,8 +135,12 @@ int main(int argc, char **argv) {
             e.slot_reset(0);
             std::vector<Seq> one{{0, {argmax(e.prefill(0, prompts[p]).data())}}};
             const double t1 = now();
+            g_time = {};
             run_spec(e, one, gen, K);
             const double t_spec = now() - t1;
+            std::printf("  per step: verify %.2f ms, accept %.2f ms, draft %.2f ms\n",
+                        1e3 * g_time.decode / one[0].steps, 1e3 * g_time.accept / one[0].steps,
+                        1e3 * g_time.draft / one[0].steps);
             const bool same = one[0].out == out;
             fails += !same;
             std::printf("prompt %zu: plain %.1f tok/s, spec %.1f tok/s, %.2f tokens/step (%d steps), %s\n", p,

@@ -49,6 +49,28 @@ int qw_decode(qw_handle *h, int n, const int32_t *slots, const int32_t *tokens);
 /* Samples from row `row` of the last qw_decode. */
 int32_t qw_sample_row(qw_handle *h, int row, const qw_sampling *p, float *lp);
 
+/* ---- generation with MTP speculative decoding */
+typedef struct qw_step_req {
+    int32_t slot;
+    int32_t pending; /* sampled token, not decoded yet */
+    int32_t budget;  /* tokens the request may still emit (>= 1) */
+    int32_t reserved;
+    qw_sampling sampling;
+} qw_step_req;
+
+/* 1 if the MTP head is loaded (qw_generate drafts tokens), else 0. */
+int qw_has_mtp(qw_handle *h);
+/* Tokens that end the request in `slot` (EOS, stop_token_ids). */
+int qw_set_stop_tokens(qw_handle *h, int slot, const int32_t *ids, int n);
+/* One step of n requests (distinct slots): decodes each pending token plus up
+ * to k drafts and emits 1..k+1 tokens per request (at most its budget).
+ * Outputs per request i: counts[i] tokens in tokens[i*(k+1) ..] with their
+ * logprobs, first_rows[i] (the row of tokens[i*(k+1)] for qw_top_logprobs; the
+ * j-th token is row first_rows[i] + j) and stopped[i] (1: the last token is a
+ * stop token). k = 0: plain decoding. */
+int qw_generate(qw_handle *h, int n, const qw_step_req *reqs, int k, int32_t *tokens, float *logprobs, int32_t *counts,
+                int32_t *first_rows, int32_t *stopped);
+
 /* Top-k (id, logprob) of the raw distribution after the prompt (row < 0) or
  * of a decode row. Returns k. */
 int qw_top_logprobs(qw_handle *h, int row, int k, int32_t *ids, float *lps);

@@ -22,7 +22,7 @@ reusable across turns without re-prefilling.
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
 | 3. 4-GPU runtime (TP4 dense + EP4 experts) | **decode 58 tok/s** single stream, **165 tok/s** at 4 concurrent (HIP graphs per batch size), **prefill ~1,900-2,000 tok/s** (vLLM: ~56 / ~1,060) |
 | 4. Prefix cache | per-slot in-place continuation + recurrent-state snapshots; LMCache offload tier next |
-| 5. MTP speculative decoding | engine done: greedy output identical, 2.5-2.6 tokens/step, 70-74 tok/s single stream; server integration next |
+| 5. MTP speculative decoding | done: exact (greedy output identical), 2.5-2.6 tokens/step, **86 tok/s** single stream in the engine; on by default in the server (`--mtp 3`) |
 | 6. Prefill kernels | batched prefill done; overlap and int8 next |
 | 7. OpenAI server, tokenizer, llama-swap entry | server works (matches vLLM's template, tokenization and parsers); llama-swap entry pending |
 | 8. CacheBlend-style reuse (experimental) | |
@@ -58,7 +58,7 @@ Measured through HTTP (2026-09-24/25):
 | 5.4k-token prompt | TTFT 2.97 s (1,816 tok/s), decode 58 tok/s |
 | 36k-token prompt | TTFT 16.5 s (2,201 tok/s), decode 53 tok/s |
 | follow-up turn on the same conversation | fully cached, TTFT 0.10-0.18 s |
-| 4 concurrent requests | 158 tok/s aggregate (57 tok/s single) |
+| 4 concurrent requests | 180 tok/s aggregate with MTP (158 without) |
 
 ## Inputs
 

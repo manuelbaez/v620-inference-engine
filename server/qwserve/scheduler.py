@@ -40,8 +40,9 @@ class Scheduler:
 
     DEFAULT_RESERVE = 2048  # room reserved when the request sets no max_tokens
 
-    def __init__(self, engine):
+    def __init__(self, engine, mtp_drafts=3):
         self.e = engine
+        self.k = mtp_drafts if engine.has_mtp else 0
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
@@ -94,6 +95,7 @@ class Scheduler:
             try:
                 room = self.e.capacity[slot] - n
                 r.limit = min(r.max_new, room) if r.max_new else room
+                self.e.set_stop_tokens(slot, sorted(r.end_ids))
                 cached = self.e.set_prompt(slot, r.prompt)
                 r.emit("start", cached)
                 top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
@@ -113,12 +115,13 @@ class Scheduler:
             return
         batch = self.active[:16]
         self.active = self.active[16:] + batch  # round-robin past 16 requests (at most num_slots anyway)
-        self.e.decode([r.slot for r in batch], [r.next for r in batch])
-        for i, r in enumerate(batch):
-            top = self.e.top_logprobs(i, r.want_top) if r.want_top else None
-            tid, lp = self.e.sample_row(i, r.sampling)
-            if not self._took(r, tid, lp, top):
-                self.active.remove(r)
+        res = self.e.generate([(r.slot, r.next, r.limit - r.generated, r.sampling) for r in batch], self.k)
+        for r, (toks, lps, first, _) in zip(batch, res):
+            for j, (tid, lp) in enumerate(zip(toks, lps)):
+                top = self.e.top_logprobs(first + j, r.want_top) if r.want_top else None
+                if not self._took(r, tid, lp, top):  # the engine stopped at the same token
+                    self.active.remove(r)
+                    break
 
     def _loop(self):
         while True:

@@ -17,6 +17,16 @@ class Sampling(ctypes.Structure):
     ]
 
 
+class StepReq(ctypes.Structure):
+    _fields_ = [
+        ("slot", ctypes.c_int32),
+        ("pending", ctypes.c_int32),
+        ("budget", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
+        ("sampling", Sampling),
+    ]
+
+
 class Engine:
     """ctypes wrapper of the slot C API. Not thread-safe: only the scheduler
     thread calls it."""
@@ -36,6 +46,10 @@ class Engine:
             "qw_decode": (ctypes.c_int, [P, ctypes.c_int, I32P, I32P]),
             "qw_sample_row": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
             "qw_top_logprobs": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int, I32P, FP]),
+            "qw_has_mtp": (ctypes.c_int, [P]),
+            "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
+            "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
+                                           I32P, I32P]),
         }
         for name, (res, args) in sig.items():
             f = getattr(lib, name)
@@ -47,6 +61,7 @@ class Engine:
         self.lib = lib
         self.capacity = [lib.qw_slot_capacity(self.h, i) for i in range(lib.qw_num_slots(self.h))]
         self.max_tokens = max(self.capacity)
+        self.has_mtp = bool(lib.qw_has_mtp(self.h))
 
     def _err(self):
         return RuntimeError(self.lib.qw_error(self.h).decode(errors="replace"))
@@ -88,3 +103,18 @@ class Engine:
         lps = (ctypes.c_float * k)()
         n = self._check(self.lib.qw_top_logprobs(self.h, row, k, ids, lps))
         return list(zip(ids[:n], lps[:n]))
+
+    def set_stop_tokens(self, slot, ids):
+        ids = list(ids)
+        self._check(self.lib.qw_set_stop_tokens(self.h, slot, (ctypes.c_int32 * max(1, len(ids)))(*ids), len(ids)))
+
+    def generate(self, reqs, k):
+        """reqs: (slot, pending, budget, Sampling). Returns per request
+        (tokens, logprobs, first_row, stopped); token j came from row first_row + j."""
+        n, w = len(reqs), k + 1
+        arr = (StepReq * n)(*[StepReq(s, p, b, 0, smp) for s, p, b, smp in reqs])
+        toks, lps = (ctypes.c_int32 * (n * w))(), (ctypes.c_float * (n * w))()
+        counts, firsts, stopped = (ctypes.c_int32 * n)(), (ctypes.c_int32 * n)(), (ctypes.c_int32 * n)()
+        self._check(self.lib.qw_generate(self.h, n, arr, k, toks, lps, counts, firsts, stopped))
+        return [(list(toks[i * w:i * w + counts[i]]), list(lps[i * w:i * w + counts[i]]), firsts[i], bool(stopped[i]))
+                for i in range(n)]

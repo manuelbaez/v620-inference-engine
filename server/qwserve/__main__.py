@@ -21,6 +21,7 @@ def main():
     ap.add_argument("--slots", default="131072,65536,32768,32768",
                     help="context size of each sequence slot (concurrent requests); the largest is max_model_len")
     ap.add_argument("--prefill-chunk", type=int, default=8192)
+    ap.add_argument("--mtp", type=int, default=3, help="MTP draft tokens per step (0: no speculative decoding)")
     args = ap.parse_args()
     srv = Server(args)
     app = web.Application(client_max_size=256 * 1024 * 1024)

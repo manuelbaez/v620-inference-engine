@@ -27,8 +27,9 @@ class Server:
                 "slots": [int(x) for x in args.slots.split(",")]}
         t0 = time.time()
         self.engine = Engine(args.lib, opts)
-        print(f"engine ready in {time.time() - t0:.1f}s, slots {self.engine.capacity}", flush=True)
-        self.sched = Scheduler(self.engine)
+        print(f"engine ready in {time.time() - t0:.1f}s, slots {self.engine.capacity}, "
+              f"MTP drafts {args.mtp if self.engine.has_mtp else 0}", flush=True)
+        self.sched = Scheduler(self.engine, args.mtp)
 
     def render(self, body):
         return self.prompt.render(body)

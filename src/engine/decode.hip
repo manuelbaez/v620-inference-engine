@@ -26,6 +26,8 @@
 
 namespace qw {
 
+static_assert(Engine::MAX_BATCH_ROWS == gpu::MAX_ROWS, "batch row limit");
+
 // Enqueues one batched step of M rows on rank rk (graph-capturable: rows,
 // positions and slots are read from device memory). Returns the number of
 // collectives, whose sequence offsets are 1..n.

@@ -22,13 +22,14 @@ struct SamplingParams {
 // log(sum(exp(raw))) over the vocabulary
 float log_sum_exp(const float *raw);
 
-// Samples a token from raw logits [VOCAB]. hist: the sequence so far (prompt
-// then generated tokens from prompt_end on) for the penalties; a nonzero seed
-// makes the draw a function of (seed, position). logprob (optional) receives
-// the token's log-probability under the raw distribution; lse_known is the
-// row's log-sum-exp if already known (NaN: computed here).
-int32_t sample_token(const float *raw, const SamplingParams &p, const std::vector<int32_t> &hist, int64_t prompt_end,
-                     std::mt19937_64 &rng, float *logprob, float lse_known = NAN);
+// Samples a token from raw logits [VOCAB]. The sequence so far is
+// hist[0, hist_len) (prompt, then generated tokens from prompt_end on), for
+// the penalties; a nonzero seed makes the draw a function of (seed, position).
+// logprob (optional) receives the token's log-probability under the raw
+// distribution; lse_known is the row's log-sum-exp if already known (NaN:
+// computed here).
+int32_t sample_token(const float *raw, const SamplingParams &p, const std::vector<int32_t> &hist, size_t hist_len,
+                     int64_t prompt_end, std::mt19937_64 &rng, float *logprob, float lse_known = NAN);
 
 // The k most likely tokens and their log-probabilities.
 void top_logprobs(const float *raw, int k, std::vector<int32_t> &ids, std::vector<float> &lps, float lse_known = NAN);

@@ -80,12 +80,16 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
 }
 
 void Session::release(int slot) {
-    slots_[size_t(slot)].busy = false;
+    SlotInfo &si = slots_[size_t(slot)];
+    si.busy = false;
+    si.stop.clear();
+    si.drafts_for = -1;
 }
 
 int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     QW_CHECK(!prompt.empty(), "empty prompt");
     QW_CHECK(int64_t(prompt.size()) <= e_.slot_capacity(slot), "prompt longer than the slot's KV capacity");
+    slots_[size_t(slot)].drafts_for = -1;
     auto &hist = slots_[size_t(slot)].hist;
     size_t common = 0;
     while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) ++common;
@@ -178,11 +182,12 @@ int32_t Session::sample_prompt(int slot, const SamplingParams &p, float *logprob
 
 int32_t Session::sample_row(int row, const SamplingParams &p, float *logprob) {
     QW_CHECK(row >= 0 && row < int(row_slot_.size()), "sample_row: bad row");
-    // Rows are sampled after their slot's tokens were appended, so the slot's
-    // history is one ahead of this row when later rows of the same run exist;
-    // penalties only need approximate history, which this is.
-    return sample_logits(e_.logits_rows().data() + size_t(row) * cfg::VOCAB, row_slot_[size_t(row)], p, logprob,
-                         e_.logits_rows_lse()[size_t(row)]);
+    // the slot's history already holds the rows after this one of its run
+    const int slot = row_slot_[size_t(row)];
+    size_t later = 0;
+    for (size_t j = size_t(row) + 1; j < row_slot_.size() && row_slot_[j] == slot; ++j) ++later;
+    return sample_logits(e_.logits_rows().data() + size_t(row) * cfg::VOCAB, slot, p, logprob,
+                         e_.logits_rows_lse()[size_t(row)], slots_[size_t(slot)].hist.size() - later);
 }
 
 int32_t Session::sample(const SamplingParams &p, float *logprob) {
@@ -190,9 +195,10 @@ int32_t Session::sample(const SamplingParams &p, float *logprob) {
     return sample_prompt(0, p, logprob);
 }
 
-int32_t Session::sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known) {
+int32_t Session::sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known,
+                               size_t hist_len) {
     const SlotInfo &si = slots_[size_t(slot)];
-    return sample_token(raw, p, si.hist, si.prompt_end, rng_, logprob, lse_known);
+    return sample_token(raw, p, si.hist, hist_len, si.prompt_end, rng_, logprob, lse_known);
 }
 
 void Session::top_logprobs_row(int row, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const {

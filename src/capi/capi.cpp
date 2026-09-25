@@ -1,5 +1,6 @@
 #include "qw/capi.h"
 
+#include <algorithm>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -126,6 +127,44 @@ int qw_decode(qw_handle *h, int n, const int32_t *slots, const int32_t *tokens) 
 
 int32_t qw_sample_row(qw_handle *h, int row, const qw_sampling *p, float *lp) {
     return guarded(h, [&] { return h->session->sample_row(row, params(p), lp); }, int32_t(-1));
+}
+
+int qw_has_mtp(qw_handle *h) {
+    return h->engine->has_mtp() ? 1 : 0;
+}
+
+int qw_set_stop_tokens(qw_handle *h, int slot, const int32_t *ids, int n) {
+    return guarded(
+        h,
+        [&] {
+            h->session->set_stop_tokens(slot, std::vector<int32_t>(ids, ids + n));
+            return 0;
+        },
+        -1);
+}
+
+int qw_generate(qw_handle *h, int n, const qw_step_req *reqs, int k, int32_t *tokens, float *logprobs, int32_t *counts,
+                int32_t *first_rows, int32_t *stopped) {
+    return guarded(
+        h,
+        [&] {
+            std::vector<qw::Session::StepReq> rq;
+            for (int i = 0; i < n; ++i)
+                rq.push_back({reqs[i].slot, reqs[i].pending, reqs[i].budget, params(&reqs[i].sampling)});
+            const auto &out = h->session->generate(rq, k);
+            const size_t w = size_t(std::max(k, 0)) + 1;
+            for (int i = 0; i < n; ++i) {
+                const auto &o = out[size_t(i)];
+                QW_CHECK(o.tokens.size() <= w, "generate: more tokens than k + 1");
+                std::copy(o.tokens.begin(), o.tokens.end(), tokens + size_t(i) * w);
+                std::copy(o.logprobs.begin(), o.logprobs.end(), logprobs + size_t(i) * w);
+                counts[i] = int32_t(o.tokens.size());
+                first_rows[i] = o.first_row;
+                stopped[i] = o.stopped ? 1 : 0;
+            }
+            return 0;
+        },
+        -1);
 }
 
 int qw_top_logprobs(qw_handle *h, int row, int k, int32_t *ids, float *lps) {

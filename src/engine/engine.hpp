@@ -42,6 +42,7 @@ class Engine {
 public:
     static constexpr int MAX_SLOTS = 8;
     static constexpr int SNAPSHOTS = 8;
+    static constexpr int MAX_BATCH_ROWS = 16;  // rows of one decode / draft step
 
     explicit Engine(const EngineOptions &opt);
     ~Engine();
