@@ -1,5 +1,7 @@
 #include "core/ple.hpp"
 
+#include <chrono>
+
 #include "core/common.hpp"
 #include "core/json.hpp"
 
@@ -169,6 +171,30 @@ void PleTable::gather(const NgramIds &ids, float *out) const {
 void PleTable::prefetch() const {
     for (auto &s : shards_)
         for (auto &f : s->files()) f->prefetch();
+}
+
+void PleTable::pin_in_background() {
+    pin_thread_ = std::thread([this] {
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t bytes = 0;
+        bool pinned = true;
+        for (const auto &st : shards_)
+            for (const auto &f : st->files()) {
+                if (stop_pin_) return;
+                if (!pinned || !f->lock()) {
+                    pinned = false;
+                    f->touch();
+                }
+                bytes += f->size();
+            }
+        log("PLE table: %.1f GB %s in RAM in %.0f s", double(bytes) / 1e9, pinned ? "pinned" : "read (mlock refused)",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    });
+}
+
+PleTable::~PleTable() {
+    stop_pin_ = true;
+    if (pin_thread_.joinable()) pin_thread_.join();
 }
 
 }  // namespace qw

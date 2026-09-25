@@ -28,6 +28,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
+    ple_->pin_in_background();
     const size_t slot = std::max<size_t>(64 * 1024, size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096);
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
     comm2_ = std::make_unique<Comm>(opt_.devices, slot);

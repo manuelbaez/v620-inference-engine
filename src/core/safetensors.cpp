@@ -94,6 +94,16 @@ MappedFile::~MappedFile() {
     if (data_) ::munmap(data_, size_);
 }
 
+bool MappedFile::lock() const {
+    return ::mlock(data_, size_) == 0;
+}
+
+void MappedFile::touch() const {
+    volatile uint8_t sink = 0;
+    for (size_t i = 0; i < size_; i += 4096) sink = sink + data_[i];
+    (void)sink;
+}
+
 void MappedFile::prefetch() const {
     ::madvise(data_, size_, MADV_WILLNEED);
 }

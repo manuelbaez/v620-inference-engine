@@ -4,9 +4,11 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/config.hpp"
@@ -49,12 +51,19 @@ public:
     void gather(const NgramIds &ids, float *out) const;
     // Asks the kernel to page the table in.
     void prefetch() const;
+    // Pins the table in RAM from a background thread, shard by shard (falls
+    // back to reading it once if mlock is refused). Decoding gathers random
+    // rows per token: an uncached table costs a disk read per row.
+    void pin_in_background();
+    ~PleTable();
 
 private:
     int64_t rows_ = 0, rows_per_shard_ = 0;
     std::vector<std::unique_ptr<SafeTensors>> shards_;
     std::vector<const uint8_t *> q_;       // [rows_per_shard, 80]
     std::vector<const uint16_t *> scale_;  // [rows_per_shard, 10] fp16
+    std::thread pin_thread_;
+    std::atomic<bool> stop_pin_{false};
 };
 
 }  // namespace qw

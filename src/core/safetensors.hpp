@@ -35,6 +35,10 @@ public:
     MappedFile(const MappedFile &) = delete;
     MappedFile &operator=(const MappedFile &) = delete;
 
+    // Pins the mapping in RAM (reads it in); false if the kernel refuses.
+    bool lock() const;
+    // Reads every page once (warms the page cache without pinning).
+    void touch() const;
     const uint8_t *data() const { return data_; }
     size_t size() const { return size_; }
     const std::string &path() const { return path_; }
@@ -56,13 +60,13 @@ public:
     // plus any extra files given.
     void add_index(const std::string &dir, const std::vector<std::string> &extra = {});
 
+    const std::vector<std::unique_ptr<MappedFile>> &files() const { return files_; }
     bool has(const std::string &name) const { return tensors_.count(name) != 0; }
     const TensorView &get(const std::string &name) const;
     // get() plus a dtype and shape check.
     const TensorView &get(const std::string &name, DType dt, std::vector<int64_t> shape) const;
 
     const std::unordered_map<std::string, TensorView> &all() const { return tensors_; }
-    const std::vector<std::unique_ptr<MappedFile>> &files() const { return files_; }
 
 private:
     std::vector<std::unique_ptr<MappedFile>> files_;
