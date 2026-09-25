@@ -142,43 +142,39 @@ void gdn_norm_T(const float *o_raw, const uint16_t *P, const float *norm_w, int 
 }
 
 // ---- batched decode rows
-__global__ __launch_bounds__(256) void gdn_conv_B_kernel(const float *proj_all, const float *conv_w, const float *A_log,
-                                                         const float *dt_bias, const SlotPtrs *tab, int gi, Rows rows,
-                                                         float *qkv, float *gb) {
-    __shared__ float vals[GDN_QKV_L];
-    const int r = blockIdx.x;
+// One block of GDN_DIM threads per (row, 128-channel group): the causal conv
+// over the ring and the batch's earlier rows, silu, then the L2 norm of the q
+// and k groups (the first 2 * GDN_KL). Group 0 also computes decay / beta.
+__global__ __launch_bounds__(GDN_DIM) void gdn_conv_B_kernel(const float *proj_all, const float *conv_w,
+                                                             const float *A_log, const float *dt_bias,
+                                                             const SlotPtrs *tab, int gi, Rows rows, float *qkv,
+                                                             float *gb) {
+    __shared__ float red[GDN_DIM / WAVE];
+    const int r = blockIdx.x, grp = blockIdx.y, j = threadIdx.x;
+    const int ch = grp * GDN_DIM + j;
     const int64_t pos = rows.pos[r], first_pos = rows.pos[rows.run_first[r]];
     const float *ring = tab[rows.slot[r]].ring + size_t(gi) * GDN_RING * GDN_QKV_L;
-    for (int ch = threadIdx.x; ch < GDN_QKV_L; ch += blockDim.x) {
-        float acc = 0.f;
+    float acc = 0.f;
 #pragma unroll
-        for (int k = 0; k < GDN_CONV; ++k) {
-            const int64_t q = pos - (GDN_CONV - 1 - k);
-            float x;
-            if (q >= first_pos)
-                x = proj_all[size_t(r - (pos - q)) * GDN_PROJ_L + ch];
-            else if (q >= 0)
-                x = ring[int(q % GDN_RING) * GDN_QKV_L + ch];
-            else
-                x = 0.f;
-            acc += conv_w[ch * GDN_CONV + k] * x;
-        }
-        vals[ch] = silu(acc);
+    for (int k = 0; k < GDN_CONV; ++k) {
+        const int64_t q = pos - (GDN_CONV - 1 - k);
+        float x;
+        if (q >= first_pos)
+            x = proj_all[size_t(r - (pos - q)) * GDN_PROJ_L + ch];
+        else if (q >= 0)
+            x = ring[int(q % GDN_RING) * GDN_QKV_L + ch];
+        else
+            x = 0.f;
+        acc += conv_w[ch * GDN_CONV + k] * x;
     }
-    __syncthreads();
-    const int w = threadIdx.x / WAVE, lane = threadIdx.x % WAVE;
-    {
-        float ss = 0.f;
-        for (int i = lane; i < GDN_DIM; i += WAVE) ss += vals[w * GDN_DIM + i] * vals[w * GDN_DIM + i];
-        ss = wave_sum(ss);
-        const float rn = rsqrtf(ss + EPS) * (w < GDN_KL ? rsqrtf(float(GDN_DIM)) : 1.f);
-        for (int i = lane; i < GDN_DIM; i += WAVE) vals[w * GDN_DIM + i] *= rn;
+    float v = silu(acc);
+    if (grp < 2 * GDN_KL) {
+        const float ss = block_sum<GDN_DIM / WAVE>(v * v, red);
+        v *= rsqrtf(ss + EPS) * (grp < GDN_KL ? rsqrtf(float(GDN_DIM)) : 1.f);
     }
-    __syncthreads();
-    float *o = qkv + size_t(r) * GDN_QKV_L;
-    for (int ch = threadIdx.x; ch < GDN_QKV_L; ch += blockDim.x) o[ch] = vals[ch];
-    if (threadIdx.x < GDN_VL) {
-        const int h = threadIdx.x;
+    qkv[size_t(r) * GDN_QKV_L + ch] = v;
+    if (grp == 0 && j < GDN_VL) {
+        const int h = j;
         const float *row = proj_all + size_t(r) * GDN_PROJ_L;
         const float b = row[GDN_QKV_L + GDN_VL * GDN_DIM + h];
         const float a = row[GDN_QKV_L + GDN_VL * GDN_DIM + GDN_VL + h] + dt_bias[h];
@@ -190,7 +186,7 @@ __global__ __launch_bounds__(256) void gdn_conv_B_kernel(const float *proj_all, 
 
 void gdn_conv_B(const float *proj, const float *conv_w, const float *A_log, const float *dt_bias, const SlotPtrs *tab,
                 int gi, Rows rows, float *qkv, float *gb, hipStream_t s) {
-    gdn_conv_B_kernel<<<rows.M, 256, 0, s>>>(proj, conv_w, A_log, dt_bias, tab, gi, rows, qkv, gb);
+    gdn_conv_B_kernel<<<dim3(rows.M, GDN_QKV_L / GDN_DIM), GDN_DIM, 0, s>>>(proj, conv_w, A_log, dt_bias, tab, gi, rows, qkv, gb);
 }
 
 __global__ void gdn_ring_B_kernel(const float *proj, const SlotPtrs *tab, int gi, Rows rows) {

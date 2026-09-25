@@ -197,22 +197,27 @@ void swiglu_T(const float *v, int ldv, int n, int T, uint16_t *h, hipStream_t s)
 }
 
 // ---- batched decode rows
-__global__ void moe_combine_B_kernel(const __half *yp, const int32_t *tok_slot, const float *tok_w, const float *shared,
-                                     float *out) {
-    const int r = blockIdx.x;
-    for (int n = threadIdx.x; n < H; n += blockDim.x) {
-        float acc = shared[size_t(r) * H + n];
-        for (int k = 0; k < TOP_K; ++k) {
-            const int slot = tok_slot[r * TOP_K + k];
-            if (slot >= 0) acc += tok_w[r * TOP_K + k] * __half2float(yp[size_t(slot) * H + n]);
-        }
-        out[size_t(r) * H + n] = acc;
+// grid (M, H / 256): one thread per output column.
+__global__ __launch_bounds__(256) void moe_combine_B_kernel(const __half *yp, const int32_t *tok_slot,
+                                                            const float *tok_w, const float *shared, float *out) {
+    const int r = blockIdx.x, n = blockIdx.y * blockDim.x + threadIdx.x;
+    int slot[TOP_K];
+    float wt[TOP_K];
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k) {
+        slot[k] = tok_slot[r * TOP_K + k];
+        wt[k] = tok_w[r * TOP_K + k];
     }
+    float acc = shared[size_t(r) * H + n];
+#pragma unroll
+    for (int k = 0; k < TOP_K; ++k)
+        if (slot[k] >= 0) acc += wt[k] * __half2float(yp[size_t(slot[k]) * H + n]);
+    out[size_t(r) * H + n] = acc;
 }
 
 void moe_combine_B(const uint16_t *yp, const int32_t *tok_slot, const float *tok_w, const float *shared, int M,
                    float *out, hipStream_t s) {
-    moe_combine_B_kernel<<<M, 256, 0, s>>>(reinterpret_cast<const __half *>(yp), tok_slot, tok_w, shared, out);
+    moe_combine_B_kernel<<<dim3(M, H / 256), 256, 0, s>>>(reinterpret_cast<const __half *>(yp), tok_slot, tok_w, shared, out);
 }
 
 }  // namespace qw::gpu
