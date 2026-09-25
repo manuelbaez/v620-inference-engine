@@ -40,6 +40,31 @@ void Engine::accept(int slot, int n) {
     sh.run_len = n;
 }
 
+void Engine::mtp_catch_up(int slot, int64_t p0, const std::vector<int32_t> &next) {
+    if (!mtp_ || next.empty()) return;
+    const SlotHost &sh = slots_[size_t(slot)];
+    const int64_t n = int64_t(next.size());
+    QW_CHECK(p0 >= 0 && p0 + n <= sh.len && sh.len - p0 <= MTP_HISTORY, "mtp_catch_up: positions out of range");
+    for (int64_t c0 = 0; c0 < n; c0 += gpu::MAX_ROWS) {
+        const int m = int(std::min<int64_t>(gpu::MAX_ROWS, n - c0));
+        std::vector<Row> rows;
+        std::vector<int64_t> pos;
+        djob_.src.clear();
+        djob_.src_hist.clear();
+        for (int i = 0; i < m; ++i) {
+            rows.push_back({slot, next[size_t(c0 + i)]});
+            pos.push_back(p0 + c0 + i);
+            djob_.src.push_back(-1 - slot);
+            djob_.src_hist.push_back(p0 + c0 + i);
+        }
+        stage_rows(rows, pos);
+        job_ = Job::Mtp;
+        dispatch();
+    }
+    djob_.src_hist.clear();
+    for (auto &s : slots_) s.run_first = -1;  // the batch hidden now holds MTP rows
+}
+
 const std::vector<std::vector<int32_t>> &Engine::draft(const std::vector<DraftReq> &reqs, int k) {
     drafts_.assign(reqs.size(), {});
     if (!mtp_ || k <= 0 || reqs.empty()) return drafts_;

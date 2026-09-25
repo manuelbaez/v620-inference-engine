@@ -347,6 +347,27 @@ Measured on short prompts: 2.5-2.6 tokens per step, 24.4 ms verification +
 production vLLM with MTP: ~56-65). Through the server, 4 concurrent requests
 reach 180 tok/s aggregate.
 
+### MTP off while drafting does not pay (2026-09-25)
+
+The step cost model is measured on this box: 15.0 ms plain, 18.8 / 22.6 /
+26.4 ms with 1 / 2 / 3 drafts, i.e. 1.25 of a plain step for the first draft
+and 0.25 per further one (`QW_SPEC_BASE`, `QW_SPEC_COST`). A request whose
+running acceptance makes every K worth under one token per plain step decodes
+plainly: no drafts and no MTP pass. The MTP layer's KV then falls behind, so
+decode keeps every row's MTP input (the pre-final-mixer hidden) in a per-slot
+ring of 256 positions (`mtp_hist`, 2.6 MB per slot per rank). After a plain
+stretch (32 steps, doubling while drafting keeps not paying, at most 176) the
+skipped MTP rows are run from the ring (`Engine::mtp_catch_up`, up to 16 rows
+per pass) and drafting is retried from a neutral acceptance. A new turn in
+the same slot catches up the same way before its prefill.
+
+Through `Session::generate` (256 tokens, greedy, output identical):
+
+| | plain | spec before | spec now |
+|---|---|---|---|
+| prompt 0 (predictable) | 67.8 tok/s | 100.9 | 100.7 |
+| prompt 1 (hard to predict) | 67.5 tok/s | 63.1 | **74.5** |
+
 ## Block store: the shared host tier of the prefix cache (2026-09-25)
 
 The first host tier kept whole conversations: a saved entry was reused only
@@ -474,7 +495,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] fewer, bigger decode kernels (fuse each sublayer's glue)
    - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
    - [ ] MTP drafting inside one graph (device-side argmax and embedding)
-   - [ ] MTP off while acceptance stays low, with a catch-up pass on resume
+   - [x] MTP off while acceptance stays low, with a catch-up pass on resume
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
    - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention

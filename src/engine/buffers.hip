@@ -87,6 +87,7 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
         sl.ring = zeros<float>(SLOT_RING);
         sl.ple = zeros<float>(SLOT_PLE);
         sl.pend = zeros<float>(XW);
+        if (mtp) sl.hist = zeros<float>(size_t(gpu::MTP_HIST) * XW);
         for (int i = 0; i < N_QSA + int(mtp); ++i) {
             sl.K.push_back(zeros<uint16_t>(cap * HEAD_DIM));
             sl.V.push_back(zeros<uint16_t>(cap * HEAD_DIM));
@@ -105,6 +106,7 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
         t.ring = sl.ring;
         t.ple = sl.ple;
         t.mtp_pend = sl.pend;
+        t.mtp_hist = sl.hist;
         rk.slots.push_back(sl);
     }
     rk.dtab = upload(tab);

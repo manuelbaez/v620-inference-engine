@@ -239,6 +239,32 @@ int main(int argc, char **argv) {
             fails += !same;
             std::printf("session generate, %zu prompts at once: plain == spec == engine greedy: %s\n", prompts.size(),
                         same ? "SAME" : "DIFFERENT");
+            // one prompt at a time through Session::generate (adaptive drafts, MTP off when it does not pay)
+            for (size_t p = 0; p < prompts.size(); ++p) {
+                auto one = [&](int k, double &tps) {
+                    for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+                    Session s1(e);
+                    const int sl = s1.acquire(prompts[p], gen);
+                    s1.set_prompt(sl, prompts[p]);
+                    int32_t pend = s1.sample_prompt(sl, greedy);
+                    std::vector<int32_t> o{pend};
+                    const auto t0 = std::chrono::steady_clock::now();
+                    while (int(o.size()) < gen) {
+                        const auto &res = s1.generate({{sl, pend, gen - int(o.size()), greedy}}, k);
+                        o.insert(o.end(), res[0].tokens.begin(), res[0].tokens.end());
+                        pend = o.back();
+                    }
+                    tps = double(o.size() - 1) /
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                    o.resize(size_t(gen));
+                    return o;
+                };
+                double tp = 0, ts = 0;
+                const auto a = one(0, tp), b = one(K, ts);
+                fails += a != b;
+                std::printf("session, prompt %zu alone: plain %.1f tok/s, adaptive spec %.1f tok/s, %s\n", p, tp, ts,
+                            a == b ? "SAME tokens" : "DIFFERENT");
+            }
         }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;

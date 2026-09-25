@@ -129,7 +129,10 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         pend = layer(rk.L[size_t(l)], qsa, qsa ? qsa_index(l) : gdn_index(l), pend, save);
     }
     mix(rk.final_hc, pend, b.inj_mlp, nullptr);  // also completes X: the MTP input
-    if (mtp_) gpu::save_last_rows(b.X, rk.dtab, b.run_start, b.run_len, b.run_slot, M, s);
+    if (mtp_) {
+        gpu::save_last_rows(b.X, rk.dtab, b.run_start, b.run_len, b.run_slot, M, s);
+        gpu::save_rows_hist(b.X, rk.dtab, rows, s);
+    }
     gemv(rk.lm_head, VOCAB_L, H, b.bin, b.logits);
     gpu::row_lse(b.logits, VOCAB_L, M, b.lse, s);
     return k;
@@ -225,7 +228,10 @@ void Engine::run_mtp_rank(Rank &rk) {
     for (int i = 0; i < M; ++i) {
         std::memcpy(b.h_emb + size_t(i) * SH, demb_.data() + size_t(i) * H + r * SH, SH * 4);
         const int src = djob_.src[size_t(i)];
-        b.h_src[i] = src >= 0 ? b.X + size_t(src) * XW : rk.slots[size_t(-1 - src)].pend;
+        const int64_t hp = djob_.src_hist.empty() ? -1 : djob_.src_hist[size_t(i)];
+        b.h_src[i] = src >= 0   ? b.X + size_t(src) * XW
+                     : hp >= 0  ? rk.slots[size_t(-1 - src)].hist + size_t(hp % gpu::MTP_HIST) * XW
+                                : rk.slots[size_t(-1 - src)].pend;
     }
     CK(hipMemcpyAsync(b.row_slot, b.h_i32, 5 * MR * 4, hipMemcpyHostToDevice, s));
     CK(hipMemcpyAsync(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));

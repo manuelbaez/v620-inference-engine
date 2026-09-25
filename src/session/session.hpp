@@ -117,6 +117,9 @@ private:
         std::vector<int32_t> drafts;  // MTP drafts following drafts_for
         int32_t drafts_for = -1;
         float accept = 0.8f;  // running per-draft acceptance (adaptive draft count)
+        // plain decoding while drafting does not pay (MTP off): steps left, the
+        // next plain stretch's length, and decoded tokens whose MTP rows are missing
+        int plain_left = 0, plain_len = 32, mtp_lag = 0;
     };
     // prefix cache (prefix_cache.cpp)
     bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
@@ -128,6 +131,7 @@ private:
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     void drop_snapshots_after(int slot, int64_t n);
     int draft_count(int slot, int k_max) const;
+    bool plain_step(int slot, int k_max);  // MTP off for this step?
     int32_t sample_logits(const float *raw, int slot, const SamplingParams &p, float *logprob, float lse_known = NAN,
                           size_t hist_len = SIZE_MAX);
     size_t reusable(int slot, const std::vector<int32_t> &prompt) const;

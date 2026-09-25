@@ -10,27 +10,73 @@
 
 namespace qw {
 
-// Drafts for a request's next step: K in [1, k_max] maximizing expected
-// tokens per step cost, with draft j accepted with probability a^j (a: the
-// slot's running acceptance) and each draft beyond the first costing beta
-// (one more verification row plus one more MTP pass, ~0.2 of a step).
-// K >= 1: the first MTP pass also keeps the MTP layer's KV current.
-int Session::draft_count(int slot, int k_max) const {
-    static const float beta = std::getenv("QW_SPEC_COST") ? float(std::atof(std::getenv("QW_SPEC_COST"))) : 0.2f;
-    if (k_max <= 1) return k_max;
-    const float a = slots_[size_t(slot)].accept;
-    int best = 1;
-    float best_rate = 0.f, expect = 1.f, p = 1.f;
+namespace {
+// Step cost with K drafts relative to a plain step: base (one more
+// verification row and the MTP pass) + beta per further draft. Measured on
+// this box: 15.0 ms plain, 18.8 / 22.6 / 26.4 ms with 1 / 2 / 3 drafts.
+float env_or(const char *name, float def) {
+    const char *v = std::getenv(name);
+    return v ? float(std::atof(v)) : def;
+}
+const float SPEC_BASE = env_or("QW_SPEC_BASE", 1.25f), SPEC_BETA = env_or("QW_SPEC_COST", 0.25f);
+
+// Expected tokens per step cost with the best K in [1, k_max]; sets *best_k.
+float best_rate(float a, int k_max, int *best_k) {
+    float best = 0.f, expect = 1.f, p = 1.f;
+    *best_k = 1;
     for (int K = 1; K <= k_max; ++K) {
         p *= a;
         expect += p;
-        const float rate = expect / (1.f + beta * float(K - 1));
-        if (rate > best_rate) {
-            best_rate = rate;
-            best = K;
+        const float rate = expect / (SPEC_BASE + SPEC_BETA * float(K - 1));
+        if (rate > best) {
+            best = rate;
+            *best_k = K;
         }
     }
     return best;
+}
+}  // namespace
+
+// Drafts for a request's next step: K in [1, k_max] maximizing expected
+// tokens per step cost, with draft j accepted with probability a^j (a: the
+// slot's running acceptance).
+int Session::draft_count(int slot, int k_max) const {
+    if (k_max <= 1) return k_max;
+    int K = 1;
+    best_rate(slots_[size_t(slot)].accept, k_max, &K);
+    return K;
+}
+
+// Plain decoding (no drafts, no MTP pass) while drafting costs more than it
+// saves: expected tokens per step cost under 1 with any K. The MTP layer then
+// falls behind; after a stretch of plain steps (doubling while drafting keeps
+// not paying, up to Engine::MTP_HISTORY) its missing rows are caught up and
+// drafting is tried again from a neutral acceptance.
+bool Session::plain_step(int slot, int k_max) {
+    SlotInfo &si = slots_[size_t(slot)];
+    if (k_max <= 0) return false;
+    if (si.plain_left > 0 && si.mtp_lag + 1 < Engine::MTP_HISTORY) {
+        --si.plain_left;
+        return true;
+    }
+    if (si.mtp_lag > 0) {  // resume: the MTP rows of the tokens decoded plainly, but the newest
+        const int64_t len = int64_t(si.hist.size());
+        const int64_t p0 = len - si.mtp_lag;
+        std::vector<int32_t> next(si.hist.begin() + ptrdiff_t(p0 + 1), si.hist.end());
+        e_.mtp_catch_up(slot, p0, next);
+        si.mtp_lag = 0;
+        si.plain_left = 0;
+        si.accept = 0.5f;
+        return false;
+    }
+    int K = 1;
+    if (best_rate(si.accept, k_max, &K) >= 1.f) {
+        if (si.accept > 0.5f) si.plain_len = 32;  // drafting pays again: short stretches next time
+        return false;
+    }
+    si.plain_left = si.plain_len - 1;
+    si.plain_len = std::min(si.plain_len * 2, Engine::MTP_HISTORY - 16);
+    return true;
 }
 
 void Session::set_stop_tokens(int slot, std::vector<int32_t> ids) {
@@ -75,12 +121,15 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
     // free positions of a slot; drafting k tokens needs k + 2
     auto room = [&](int slot) { return e_.slot_capacity(slot) - e_.slot_len(slot); };
 
+    // requests decoding plainly this step (drafting does not pay for them now)
+    std::vector<char> plain(reqs.size(), 0);
+    for (size_t i = 0; i < reqs.size(); ++i) plain[i] = plain_step(reqs[i].slot, k_max);
     // first drafts of requests that have none for their pending token
     std::vector<Engine::DraftReq> dreqs;
     std::vector<size_t> which;
     for (size_t i = 0; i < reqs.size(); ++i) {
         const SlotInfo &si = slots_[size_t(reqs[i].slot)];
-        if (k_max > 0 && si.drafts_for != reqs[i].pending && room(reqs[i].slot) > k_max + 1) {
+        if (k_max > 0 && !plain[i] && si.drafts_for != reqs[i].pending && room(reqs[i].slot) > k_max + 1) {
             dreqs.push_back({reqs[i].slot, {reqs[i].pending}});
             which.push_back(i);
         }
@@ -104,7 +153,7 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         const StepReq &rq = reqs[i];
         const SlotInfo &si = slots_[size_t(rq.slot)];
         QW_CHECK(rq.budget >= 1 && room(rq.slot) >= 1, "generate: request has no room left");
-        if (k_max > 0 && si.drafts_for == rq.pending)
+        if (k_max > 0 && !plain[i] && si.drafts_for == rq.pending)
             n_drafts[i] = int(std::min<int64_t>(
                 {draft_count(rq.slot, k_max), int64_t(si.drafts.size()), rq.budget - 1, room(rq.slot) - 1}));
         out_[i].first_row = int(rows.size());
@@ -149,6 +198,10 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         e_.accept(rq.slot, keep);
         si.hist.resize(base + size_t(keep));
         si.drafts_for = -1;
+        if (plain[i]) {  // no MTP pass: this token's MTP row is missing
+            ++si.mtp_lag;
+            continue;
+        }
         // row r's next token is o.tokens[r]: the MTP rows of the kept tokens
         if (!o.stopped && keep < rq.budget && k_max > 0 && room(rq.slot) > k_max + 1) {
             next.push_back({rq.slot, o.tokens});

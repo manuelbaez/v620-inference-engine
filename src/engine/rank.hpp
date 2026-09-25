@@ -98,6 +98,7 @@ struct Rank {
     struct Slot {
         float *S = nullptr, *ring = nullptr, *ple = nullptr;  // GDN state, GDN conv ring, PLE conv ring
         float *pend = nullptr;                                // [XW] MTP input store
+        float *hist = nullptr;                                // [MTP_HIST][XW] decoded rows' MTP inputs
         std::vector<uint16_t *> K, V, ck;
         std::vector<float *> raw_k;
     };

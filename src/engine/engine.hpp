@@ -110,6 +110,12 @@ public:
         std::vector<int32_t> next;
     };
     const std::vector<std::vector<int32_t>> &draft(const std::vector<DraftReq> &reqs, int k);
+    // Brings the MTP layer's KV up to date after decode steps that drafted
+    // nothing: runs its rows for positions [p0, p0 + next.size()) of `slot`,
+    // next[i] being the token after position p0 + i, from the hidden states
+    // decode kept (at most MTP_HISTORY positions back).
+    void mtp_catch_up(int slot, int64_t p0, const std::vector<int32_t> &next);
+    static constexpr int MTP_HISTORY = 192;  // < gpu::MTP_HIST minus a verification batch
 
     // Recurrent-state snapshots (GDN state and conv tails, PLE conv tail) in a
     // VRAM pool. KV is position-indexed and needs no copy: restoring a slot to
@@ -226,8 +232,10 @@ private:
         std::vector<int> reset_slots;
         bool save = false;  // keep per-row GDN states (for accept())
         // MTP job: per row, the hidden source: >= 0 a row of the batch hidden, < 0 the MTP
-        // input store of slot -1 - src
+        // input store of slot -1 - src, or with src_hist[i] >= 0 that slot's decoded-row
+        // hidden at position src_hist[i]
         std::vector<int> src;
+        std::vector<int64_t> src_hist;
     } djob_;
     std::vector<float> demb_;                                              // [M][H]
     std::vector<uint16_t> dple_;                                           // [M][H] fp16

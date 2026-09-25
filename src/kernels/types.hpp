@@ -22,6 +22,7 @@ constexpr int MAX_ROWS = 16;
 constexpr int QSA_LAYERS_MAX = N_QSA + 1;  // + the MTP layer
 constexpr int D_PAD = 328;                 // HC down outputs (320 + 4 inject) padded to 16 bytes
 constexpr int LIST_W = 2052;               // QSA attention token-list width (512 groups x 4 + tail)
+constexpr int MTP_HIST = 256;              // decoded rows' hiddens kept per slot (MTP catch-up)
 
 // K/V/ck hold fp16 bits: store with __half_as_ushort (assigning a __half to a
 // uint16_t converts the value to an integer).
@@ -32,6 +33,7 @@ struct SlotPtrs {
     float *ring;      // [N_GDN][GDN_RING][2560]
     float *ple;       // [PLE_RING][2560]
     float *mtp_pend;  // [HC][SH] pre-final-mixer hidden of the slot's last token (MTP input)
+    float *mtp_hist;  // [MTP_HIST][HC][SH] the same for decoded positions, at pos % MTP_HIST
 };
 
 // Recurrent-state captures inside a prefill chunk: dst[i] receives the state

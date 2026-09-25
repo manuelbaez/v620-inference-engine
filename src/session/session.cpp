@@ -100,11 +100,20 @@ void Session::release(int slot) {
 int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     QW_CHECK(!prompt.empty(), "empty prompt");
     QW_CHECK(int64_t(prompt.size()) <= e_.slot_capacity(slot), "prompt longer than the slot's KV capacity");
-    slots_[size_t(slot)].drafts_for = -1;
-    slots_[size_t(slot)].accept = 0.8f;
-    auto &hist = slots_[size_t(slot)].hist;
+    SlotInfo &si = slots_[size_t(slot)];
+    si.drafts_for = -1;
+    si.accept = 0.8f;
+    auto &hist = si.hist;
     size_t common = 0;
     while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) ++common;
+    if (si.mtp_lag > 0 && common == hist.size() && prompt.size() > hist.size()) {
+        // continuing after plain decoding: the MTP rows it skipped (the newest one runs in prefill)
+        const int64_t p0 = int64_t(hist.size()) - si.mtp_lag;
+        e_.mtp_catch_up(slot, p0, std::vector<int32_t>(hist.begin() + ptrdiff_t(p0 + 1), hist.end()));
+    }
+    si.mtp_lag = 0;
+    si.plain_left = 0;
+    si.plain_len = 32;
 
     // the block store, when it holds more of the prompt than this slot can
     if (restore_from_store(slot, prompt, reusable(slot, prompt), common) && common == prompt.size()) {

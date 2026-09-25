@@ -28,6 +28,8 @@ void mtp_shift(const float *pend, const float *X, int o, int rows, float *Xm, hi
 // dst[m][0..n) = src[m][0..n) (src: device array of row pointers)
 void gather_rows(const float *const *src, int rows, int n, float *dst, hipStream_t s);
 // tab[run_slot].mtp_pend = X[run_start + run_len - 1] for each run
+// mtp_hist[pos % MTP_HIST] of each row's slot = its row of X (decoded rows' MTP inputs).
+void save_rows_hist(const float *X, const SlotPtrs *tab, Rows rows, hipStream_t s);
 void save_last_rows(const float *X, const SlotPtrs *tab, const int32_t *run_start, const int32_t *run_len,
                     const int32_t *run_slot, int M, hipStream_t s);
 

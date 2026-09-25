@@ -79,6 +79,19 @@ void save_last_rows(const float *X, const SlotPtrs *tab, const int32_t *run_star
     save_last_rows_kernel<<<M, 256, 0, s>>>(X, tab, run_start, run_len, run_slot);
 }
 
+__global__ __launch_bounds__(256) void save_rows_hist_kernel(const float *X, const SlotPtrs *tab, Rows rows) {
+    const int r = blockIdx.x;
+    float *dst = tab[rows.slot[r]].mtp_hist;
+    if (!dst) return;
+    dst += size_t(rows.pos[r] % MTP_HIST) * XW;
+    const float *src = X + size_t(r) * XW;
+    for (int i = threadIdx.x; i < XW; i += blockDim.x) dst[i] = src[i];
+}
+
+void save_rows_hist(const float *X, const SlotPtrs *tab, Rows rows, hipStream_t s) {
+    save_rows_hist_kernel<<<rows.M, 256, 0, s>>>(X, tab, rows);
+}
+
 __global__ __launch_bounds__(256) void mtp_shift_kernel(const float *pend, const float *X, int o, float *Xm) {
     const int t = blockIdx.x;
     const float *src = t < o ? pend : X + size_t(t - o) * XW;
