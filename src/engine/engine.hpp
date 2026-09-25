@@ -143,6 +143,25 @@ public:
     // state is only loadable by an engine with the same id.
     uint64_t state_layout_id() const;
 
+    // ---- CacheBlend experiment (blend.hip; docs/DESIGN.md). Reusing a chunk
+    // cached after another prefix: its KV is copied to the new positions (keys
+    // re-rotated, compressed keys rebuilt) and the GDN state is carried across
+    // it with the chunk's affine transfer, S_out = M S_in + U.
+    // Between begin and end, prefills also accumulate M (from the identity).
+    void blend_transfer_begin();
+    void blend_transfer_end();
+    // Copies the KV of positions [src_p0, src_p0 + n) of slot src to
+    // [dst_p0, dst_p0 + n) of slot dst.
+    void blend_splice(int dst, int src, int64_t src_p0, int64_t dst_p0, int64_t n);
+    // Carries dst's recurrent state across a spliced chunk: S = S_out + M (S -
+    // S_in) with snapshots snap_in / snap_out taken around the chunk where M
+    // was accumulated (their positions: old_end = the chunk's end there); the
+    // conv rings and MTP input come from snap_out. The slot then holds new_len
+    // tokens (tail: its last ones). with_transfer = false: S = S_out (no
+    // correction, a baseline).
+    void blend_compose(int dst, int snap_in, int snap_out, int64_t old_end, int64_t new_len,
+                       const std::vector<int32_t> &tail, bool with_transfer = true);
+
     // Single-sequence convenience API on slot 0 (tools, tests).
     void reset();
     const std::vector<float> &prefill(const std::vector<int32_t> &tokens, std::vector<float> *all_logits = nullptr,
@@ -183,6 +202,7 @@ private:
     std::vector<SlotHost> slots_;
 
     bool mtp_ = false;
+    bool blend_transfer_ = false;
     int debug_layers_ = cfg::N_LAYERS;
     // current jobs (host side, read by every rank thread)
     enum class Job { Prefill, Decode, Mtp } job_ = Job::Decode;
@@ -194,6 +214,7 @@ private:
         bool reset = false;
         bool mtp_pend = false;  // the MTP pass may start one row early, from the slot's MTP input store
         std::vector<Capture> captures;  // in (start, start + T]
+        bool transfer = false;          // accumulate the GDN transfer (CacheBlend experiment)
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16

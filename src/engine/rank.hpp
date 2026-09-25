@@ -108,6 +108,9 @@ struct Rank {
         float *S = nullptr, *ring = nullptr, *ple = nullptr, *pend = nullptr;
     };
     std::array<Snap, Engine::SNAPSHOTS> snaps{};
+    // CacheBlend experiment (blend.hip), allocated on first use: a chunk's GDN
+    // transfer [N_GDN][12][128][128] and a scratch copy of a slot's state
+    float *transfer = nullptr, *blend_tmp = nullptr;
     // batched decode scratch, MAX_ROWS rows
     struct Batch {
         float *X, *emb, *hc_send, *hc_red, *proj, *gate, *iq, *scores, *att_partial, *partial, *out_attn, *out_moe;

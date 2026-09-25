@@ -176,23 +176,48 @@ The state that makes a prefix reusable:
 - Speculative drafts never enter the cache. Only committed tokens do, which
   sidesteps the relocation window that cost LMCache the tail of every request.
 
-## CacheBlend-style non-prefix reuse (experimental, last)
+## CacheBlend-style non-prefix reuse (measured 2026-09-25: rejected)
 
 CacheBlend reuses the KV of chunks that are not a prefix (RAG documents,
 reordered tool outputs) and recomputes the ~15% of tokens whose KV deviates
 most. That works because attention KV can be spliced. Here 36 of 48 layers are
-GDN, whose state after a chunk depends on everything before it, so KV splicing
-alone cannot work.
+GDN, whose state after a chunk depends on everything before it.
 
-The one workable version: the gated delta rule is affine in its incoming state
-(`S_out = S_in * T_chunk + U_chunk`, with `T` and `U` 128x128 per head), so a
-chunk cached with its per-layer `(T, U)` (~450-900 MB) can be composed onto any
-prefix state. QSA layers splice KV and recompute selected tokens as in
-CacheBlend. Like CacheBlend, this assumes the chunk's activations computed out
-of context are close enough to the in-context ones, and in the GDN layers
-nothing later corrects that error. It ships only behind a flag, and only if a
-quality eval (next-token agreement and long-context QA against a full
-prefill) passes.
+The workable version was built as an experiment (`src/engine/blend.hip`,
+`src/kernels/blend.hip`, `tools/qw_blend_eval.hip`, cases from
+`tools/blend_cases.py`). The delta rule is affine in its incoming state, so a
+chunk recorded after one prefix carries its transfer M = prod decay (I - beta
+k k^T) (128 x 128 per v-head, accumulated by a v = 0 scan during its prefill),
+and after another prefix the state is composed as S = S_out + M (S - S_in).
+The chunk's KV is copied to its new positions with the keys re-rotated and the
+compressed indexer keys rebuilt; its first W tokens are prefilled in context.
+
+The transfer is exact where it can be: layer 0's inputs do not depend on the
+context, and its composed state matches a full prefill (relative error 0.000,
+against 0.05-0.19 without the correction). Deeper layers are not: their
+activations over the whole chunk change with the prefix, and nothing corrects
+that (selective recompute cannot, the recurrence needs every token). Composed
+states are off by 2-29% at middle layers, 20-100x the noise of prefilling the
+same prompt in different pieces, and W (32 to 512) barely matters.
+
+Agent-style cases (a source file returned by a tool, reused after other files
+or after an edited earlier message, then a question about it; KL over the
+question's tokens against a full prefill, and greedy tokens that agree out of
+48):
+
+| case | rechunked (noise) | blend W=32 | no correction | chunk dropped |
+|---|---|---|---|---|
+| file moved after another file | 0.020, 45/48 | 0.048, 15/48 | 0.066, 15/48 | 1.45 |
+| file moved (8k source prefix) | 0.057, 0/48 | 0.227, 18/48 | 0.125, 18/48 | 2.94 |
+| file first in the source, third now | 0.004, 48/48 | **1.25**, 3/48 | 0.216, 0/48 | 1.47 |
+| earlier message edited | 0.047, 48/48 | 0.520, 48/48 | 0.245, 48/48 | 2.18 |
+| question about the file before it | 0.021, 0/48 | 0.062, 0/48 | 0.040, 4/48 | 0.63 |
+
+The error is 2-300x the noise floor and erratic (in one case close to leaving
+the file out), so the gate fails and non-prefix reuse is not served. The
+experiment code stays for future attempts (e.g. recomputing only the deep
+layers). `/health`'s `blend_candidate_tokens` keeps measuring how much such
+reuse could have saved on real traffic.
 
 ## Measured baseline (2026-09-24)
 
@@ -441,4 +466,5 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 6. **Prefill kernels.** Done (two micro-batches, optional W4A8); chunked GDN next.
 7. **OpenAI-compatible server and tokenizer.** Done (continuous batching); a
    llama-swap entry in home-infra pending.
-8. **CacheBlend experiment.**
+8. **CacheBlend experiment.** Done: rejected on quality (see above); exact
+   block-level reuse shipped instead.

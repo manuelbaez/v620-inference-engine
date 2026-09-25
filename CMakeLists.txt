@@ -71,6 +71,7 @@ set(QW_HIP_SOURCES
   src/kernels/ple.hip
   src/kernels/mtp.hip
   src/kernels/logits.hip
+  src/kernels/blend.hip
   src/comm/comm.hip
   src/engine/weights.hip
   src/engine/buffers.hip
@@ -79,7 +80,8 @@ set(QW_HIP_SOURCES
   src/engine/speculative.hip
   src/engine/prefill.hip
   src/engine/snapshot.hip
-  src/engine/host_tier.hip)
+  src/engine/host_tier.hip
+  src/engine/blend.hip)
 # host code that includes HIP headers
 set(QW_HIP_HOST_SOURCES
   src/engine/device_mem.cpp
@@ -114,6 +116,7 @@ endfunction()
 
 qw_gpu_program(qw_gpu_cli tools/qw_gpu.hip)
 qw_gpu_program(qw_layer_diff tools/qw_layer_diff.hip)
+qw_gpu_program(qw_blend_eval tools/qw_blend_eval.hip)
 set_target_properties(qw_gpu_cli PROPERTIES OUTPUT_NAME qw_gpu)
 
 foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench)

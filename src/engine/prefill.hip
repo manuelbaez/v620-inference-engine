@@ -15,6 +15,7 @@
 #include "engine/engine.hpp"
 #include "engine/rank.hpp"
 #include "engine/weight_convert.hpp"
+#include "kernels/blend.hpp"
 #include "kernels/gdn.hpp"
 #include "kernels/gemm.hpp"
 #include "kernels/gemv.hpp"
@@ -175,6 +176,7 @@ void Engine::run_prefill_rank(Rank &rk) {
             wait(m, l, 1);
             gpu::gdn_scan_T(b.qkv, b.gb, sl.S + size_t(gi) * GDN_STATE, T, b.o_raw, s, start,
                             captures([&](const Rank::Snap &sn) { return sn.S + size_t(gi) * GDN_STATE; }));
+            if (pjob_.transfer) gpu::gdn_transfer_T(b.qkv, b.gb, rk.transfer + size_t(gi) * GDN_STATE, T, s);
             record(m, l, 1);
             gpu::gdn_norm_T(b.o_raw, b.P, w.gdn_norm, T, b.act, s);
             gemm(m, w.gdn_out, H, GDN_VL * GDN_DIM, b.act, GDN_VL * GDN_DIM, T, b.part16, H, true);
@@ -322,7 +324,7 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
             ple_->gather(ids[size_t(t)], e.data());
             for (int j = 0; j < H; ++j) pple_[size_t(t) * H + j] = f32_to_f16(e[size_t(j)]);
         }
-        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}};
+        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}, blend_transfer_};
         for (const Capture &c : captures)
             if (c.pos > sh.len && c.pos <= sh.len + T) pjob_.captures.push_back(c);
         QW_CHECK(int(pjob_.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
