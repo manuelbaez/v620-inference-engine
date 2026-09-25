@@ -91,12 +91,11 @@ set(QW_HIP_HOST_SOURCES
   src/session/generate.cpp
   src/session/prefix_cache.cpp
   src/session/block_store.cpp
-  src/session/chunker.cpp
   src/session/disk_tier.cpp
   src/session/sampling.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} src/capi/capi.cpp PROPERTIES LANGUAGE HIP)
 
-add_library(qw_gpu STATIC ${QW_HIP_SOURCES} ${QW_HIP_HOST_SOURCES})
+add_library(qw_gpu STATIC ${QW_HIP_SOURCES} ${QW_HIP_HOST_SOURCES} src/session/chunker.cpp)
 target_include_directories(qw_gpu PUBLIC src include)
 target_compile_options(qw_gpu PRIVATE -Wall)
 if(QW_DEVICE_CHECKS)
