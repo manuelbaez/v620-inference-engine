@@ -12,9 +12,15 @@ using namespace cfg;
 
 namespace {
 
-inline float sigmoidf(float x) { return 1.f / (1.f + std::exp(-x)); }
-inline float siluf(float x) { return x * sigmoidf(x); }
-inline float softplusf(float x) { return x > 20.f ? x : std::log1p(std::exp(x)); }
+inline float sigmoidf(float x) {
+    return 1.f / (1.f + std::exp(-x));
+}
+inline float siluf(float x) {
+    return x * sigmoidf(x);
+}
+inline float softplusf(float x) {
+    return x > 20.f ? x : std::log1p(std::exp(x));
+}
 
 inline float dot(const float *a, const float *b, int n) {
     float s = 0.f;
@@ -66,8 +72,7 @@ void State::reset() {
     ple_conv.assign(size_t((PLE_CONV - 1) * PLE_DILATION) * HCH, 0.f);
 }
 
-Model::Model(const std::string &model_dir, const std::string &ple_dir, int threads)
-    : pool_(threads) {
+Model::Model(const std::string &model_dir, const std::string &ple_dir, int threads) : pool_(threads) {
     check_config(model_dir);
     st_.add_index(model_dir);
     ple_ = std::make_unique<PleTable>(ple_dir);
@@ -92,8 +97,8 @@ void Model::linear(const TensorView &w, const float *x, int T, int ldx, float *y
 }
 
 // Same for a compressed-tensors int4 g128 expert matrix.
-void Model::expert_linear(const TensorView &packed, const TensorView &scale, const float *x,
-                          int T, int ldx, float *y, int ldy) {
+void Model::expert_linear(const TensorView &packed, const TensorView &scale, const float *x, int T, int ldx, float *y,
+                          int ldy) {
     const int out = int(packed.dim(0)), in = int(packed.dim(1)) * 8;
     QW_CHECK(scale.dim(0) == out && scale.dim(1) == in / QGROUP, packed.name + ": scale shape");
     const int32_t *P = packed.i32();
@@ -106,32 +111,28 @@ void Model::expert_linear(const TensorView &packed, const TensorView &scale, con
             for (int c = 0; c < in / 8; ++c) {
                 float sc = bf16_to_f32(s[c * 8 / QGROUP]);
                 uint32_t word = p[c];
-                for (int i = 0; i < 8; ++i)
-                    row[size_t(c * 8 + i)] = float(int((word >> (4 * i)) & 0xf) - 8) * sc;
+                for (int i = 0; i < 8; ++i) row[size_t(c * 8 + i)] = float(int((word >> (4 * i)) & 0xf) - 8) * sc;
             }
             for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
         }
     });
 }
 
-void Model::hc_mix(const std::string &prefix, bool with_inject, const float *X, int T,
-                   float *block_in, float *inj) {
+void Model::hc_mix(const std::string &prefix, bool with_inject, const float *X, int T, float *block_in, float *inj) {
     std::vector<float> w = bf16_vec(st_.get(prefix + "hc_norm.weight", DType::BF16, {HCH}));
     std::vector<float> xn(size_t(T) * HCH);
     for (int t = 0; t < T; ++t)
         for (int s = 0; s < HC; ++s)
-            rmsnorm(X + size_t(t) * HCH + s * H, xn.data() + size_t(t) * HCH + s * H, H,
-                    w.data() + s * H, true);
+            rmsnorm(X + size_t(t) * HCH + s * H, xn.data() + size_t(t) * HCH + s * H, H, w.data() + s * H, true);
     std::vector<float> d(size_t(T) * HC_RANK);
-    linear(st_.get(prefix + "input_mix_weight_down.weight", DType::BF16, {HC_RANK, HCH}),
-           xn.data(), T, HCH, d.data(), HC_RANK);
+    linear(st_.get(prefix + "input_mix_weight_down.weight", DType::BF16, {HC_RANK, HCH}), xn.data(), T, HCH, d.data(),
+           HC_RANK);
     if (with_inject)
-        linear(st_.get(prefix + "block_inject_weight.weight", DType::BF16, {HC, HCH}), xn.data(),
-               T, HCH, inj, HC);
+        linear(st_.get(prefix + "block_inject_weight.weight", DType::BF16, {HC, HCH}), xn.data(), T, HCH, inj, HC);
     for (auto &v : d) v = siluf(v / HC);
     std::vector<float> g(size_t(T) * HCH);
-    linear(st_.get(prefix + "input_mix_weight_up.weight", DType::BF16, {HCH, HC_RANK}), d.data(),
-           T, HC_RANK, g.data(), HCH);
+    linear(st_.get(prefix + "input_mix_weight_up.weight", DType::BF16, {HCH, HC_RANK}), d.data(), T, HC_RANK, g.data(),
+           HCH);
     for (int t = 0; t < T; ++t)
         for (int j = 0; j < H; ++j) {
             float acc = 0.f;
@@ -156,8 +157,7 @@ void Model::combine(float *X, const float *block_out, const float *inj, int T) {
 void Model::ple(State &st, float *X, const std::vector<int32_t> &tokens) {
     const int T = int(tokens.size());
     const std::string p = lp(PLE_LAYER) + "ple.";
-    std::vector<int32_t> hist(st.tokens.end() - std::min<ptrdiff_t>(st.tokens.size(), 2),
-                              st.tokens.end());
+    std::vector<int32_t> hist(st.tokens.end() - std::min<ptrdiff_t>(st.tokens.size(), 2), st.tokens.end());
     // Only the last 2 tokens matter: an EOS further back cannot change a 3-gram.
     auto ids = hasher_.ids_for(hist, tokens);
 
@@ -173,7 +173,7 @@ void Model::ple(State &st, float *X, const std::vector<int32_t> &tokens) {
     auto cw = bf16_vec(st_.get(p + "conv1d.weight", DType::BF16, {HCH, 1, PLE_CONV}));
 
     const int hist_len = (PLE_CONV - 1) * PLE_DILATION;  // 9
-    std::vector<float> seq(size_t(hist_len + T) * HCH);   // conv inputs incl. history
+    std::vector<float> seq(size_t(hist_len + T) * HCH);  // conv inputs incl. history
     std::copy(st.ple_conv.begin(), st.ple_conv.end(), seq.begin());
     std::vector<float> gv(size_t(T) * HCH), tmp(HCH), q(HCH);
     for (int t = 0; t < T; ++t) {
@@ -227,8 +227,7 @@ void Model::gdn(State &st, int layer, const float *x, int T, float *out) {
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < GDN_QKV; ++c) {
             float acc = 0.f;
-            for (int k = 0; k < GDN_CONV; ++k)
-                acc += cw[size_t(c) * GDN_CONV + k] * seq[size_t(t + k) * GDN_QKV + c];
+            for (int k = 0; k < GDN_CONV; ++k) acc += cw[size_t(c) * GDN_CONV + k] * seq[size_t(t + k) * GDN_QKV + c];
             qkv[size_t(t) * GDN_QKV + c] = siluf(acc);
         }
     std::copy(seq.end() - (GDN_CONV - 1) * GDN_QKV, seq.end(), hist);
@@ -401,8 +400,7 @@ void Model::qsa(State &st, int layer, const float *x, int T, float *out) {
             }
         }
     });
-    linear(st_.get(p + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), o.data(), T,
-           Q_HEADS * HEAD_DIM, out, H);
+    linear(st_.get(p + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), o.data(), T, Q_HEADS * HEAD_DIM, out, H);
 }
 
 void Model::moe(int layer, const float *x, int T, float *out) {
@@ -448,15 +446,15 @@ void Model::moe(int layer, const float *x, int T, float *out) {
         u.resize(size_t(n) * FFN);
         y.resize(size_t(n) * H);
         expert_linear(st_.get(ep + "gate_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                      st_.get(ep + "gate_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(),
-                      n, H, g.data(), FFN);
+                      st_.get(ep + "gate_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, g.data(),
+                      FFN);
         expert_linear(st_.get(ep + "up_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                      st_.get(ep + "up_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(),
-                      n, H, u.data(), FFN);
+                      st_.get(ep + "up_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, u.data(),
+                      FFN);
         for (size_t i = 0; i < g.size(); ++i) g[i] = siluf(g[i]) * u[i];
         expert_linear(st_.get(ep + "down_proj.weight_packed", DType::I32, {H, FFN / 8}),
-                      st_.get(ep + "down_proj.weight_scale", DType::BF16, {H, FFN / QGROUP}), g.data(),
-                      n, FFN, y.data(), H);
+                      st_.get(ep + "down_proj.weight_scale", DType::BF16, {H, FFN / QGROUP}), g.data(), n, FFN,
+                      y.data(), H);
         for (int i = 0; i < n; ++i) {
             float w = toks[size_t(i)].second;
             float *o = out + size_t(toks[size_t(i)].first) * H;
@@ -480,8 +478,7 @@ void Model::moe(int layer, const float *x, int T, float *out) {
     }
 }
 
-void Model::forward(State &st, const std::vector<int32_t> &tokens, std::vector<float> &logits,
-                    bool all_logits) {
+void Model::forward(State &st, const std::vector<int32_t> &tokens, std::vector<float> &logits, bool all_logits) {
     const int T = int(tokens.size());
     QW_CHECK(T > 0, "empty forward");
     if (st.gdn_S.empty()) st.reset();
@@ -496,16 +493,18 @@ void Model::forward(State &st, const std::vector<int32_t> &tokens, std::vector<f
         for (int s = 1; s < HC; ++s) std::copy(row, row + H, row + s * H);
     }
 
-    std::vector<float> bin(size_t(T) * H), bout(size_t(T) * H), inj(size_t(T) * HC),
-        pend_out(size_t(T) * H), pend_inj(size_t(T) * HC);
+    std::vector<float> bin(size_t(T) * H), bout(size_t(T) * H), inj(size_t(T) * HC), pend_out(size_t(T) * H),
+        pend_inj(size_t(T) * HC);
     bool pending = false;
     if (dump_layers) dump_layers->clear();
     for (int L = 0; L < N_LAYERS; ++L) {
         if (pending) combine(X.data(), pend_out.data(), pend_inj.data(), T);
         if (L == PLE_LAYER) ple(st, X.data(), tokens);
         hc_mix(lp(L) + "attn_hyper_connection.", true, X.data(), T, bin.data(), inj.data());
-        if (is_qsa(L)) qsa(st, L, bin.data(), T, bout.data());
-        else gdn(st, L, bin.data(), T, bout.data());
+        if (is_qsa(L))
+            qsa(st, L, bin.data(), T, bout.data());
+        else
+            gdn(st, L, bin.data(), T, bout.data());
         combine(X.data(), bout.data(), inj.data(), T);
         hc_mix(lp(L) + "mlp_hyper_connection.", true, X.data(), T, bin.data(), pend_inj.data());
         moe(L, bin.data(), T, pend_out.data());

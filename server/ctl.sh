@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start / stop / restart the qw server on this box.
-#   server/ctl.sh start [extra qw_server.py args]   |   stop   |   restart ...   |   status
+#   server/ctl.sh start [extra python -m qwserve args]   |   stop   |   restart ...   |   status
 set -u
 DIR=$(cd "$(dirname "$0")/.." && pwd)
 PY=${QW_PYTHON:-$HOME/qwenv/bin/python}
@@ -15,7 +15,7 @@ stop() {
 }
 start() {
   cd $DIR
-  nohup $PY server/qw_server.py --port $PORT "$@" > $LOG 2>&1 &
+  PYTHONPATH=$DIR/server nohup $PY -m qwserve --port $PORT "$@" > $LOG 2>&1 &
   echo $! > $PIDFILE
   for i in $(seq 1 120); do
     curl -s -m2 localhost:$PORT/health >/dev/null && { tail -1 $LOG; echo "up (pid $(cat $PIDFILE))"; return 0; }

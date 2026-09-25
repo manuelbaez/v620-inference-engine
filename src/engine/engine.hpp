@@ -18,11 +18,13 @@
 #include <thread>
 #include <vector>
 
+#include "comm/comm.hpp"
 #include "core/ple.hpp"
 #include "core/safetensors.hpp"
-#include "engine/comm.hpp"
 
 namespace qw {
+
+struct Rank;  // per-GPU state (rank.hpp)
 
 struct EngineOptions {
     std::string model_dir = "/mnt/llms/qwen3.8-flash-next-awq";
@@ -30,10 +32,10 @@ struct EngineOptions {
     std::array<int, RANKS> devices{0, 1, 2, 3};
     // KV capacity (tokens) of each sequence slot; multiples of 256.
     std::vector<int> slot_tokens{131072, 65536, 32768, 32768};
-    int prefill_chunk = 8192; // tokens per prefill step (two micro-batches of half)
-    bool warmup = true;       // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
-    int load_threads = 12;    // host threads per rank for weight conversion
-    bool mtp = true;          // load the MTP head (speculative decoding drafts)
+    int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
+    bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
+    int load_threads = 12;     // host threads per rank for weight conversion
+    bool mtp = true;           // load the MTP head (speculative decoding drafts)
 };
 
 class Engine {
@@ -109,7 +111,7 @@ public:
     int64_t max_tokens() const { return slot_capacity(0); }
 
 private:
-    struct Rank;
+    void warmup();
     void rank_loop(int r);
     void run_prefill_rank(Rank &rk);
     void run_decode_rank(Rank &rk);
@@ -132,7 +134,7 @@ private:
         bool reset = true;          // device state must be zeroed before use
         int run_first = -1;         // the slot's rows in the last decode batch (MTP inputs), or -1
         int run_len = 0;
-        bool pend_valid = false;    // the device MTP input store holds the hidden of token len-1
+        bool pend_valid = false;  // the device MTP input store holds the hidden of token len-1
     };
     std::vector<SlotHost> slots_;
 
@@ -160,11 +162,11 @@ private:
         // input store of slot -1 - src
         std::vector<int> src;
     } djob_;
-    std::vector<float> demb_;     // [M][H]
-    std::vector<uint16_t> dple_;  // [M][H] fp16
-    std::vector<float> dlogits_;  // [M][VOCAB]
-    std::vector<float> dlse_;     // [M]
-    std::vector<float> dlse_parts_ = std::vector<float>(RANKS * 16 * 2);  // [rank][MAX_ROWS][max, sumexp]
+    std::vector<float> demb_;                                              // [M][H]
+    std::vector<uint16_t> dple_;                                           // [M][H] fp16
+    std::vector<float> dlogits_;                                           // [M][VOCAB]
+    std::vector<float> dlse_;                                              // [M]
+    std::vector<float> dlse_parts_ = std::vector<float>(RANKS * 16 * 2);   // [rank][MAX_ROWS][max, sumexp]
     std::vector<float> damax_parts_ = std::vector<float>(RANKS * 16 * 2);  // [rank][MAX_ROWS][max, index bits]
     std::vector<std::vector<int32_t>> drafts_;
     std::vector<float> logits_;

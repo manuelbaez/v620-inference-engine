@@ -27,8 +27,7 @@ public:
 
     // Ids for every position of a token sequence, with `history` the (up to
     // 2) tokens that precede tokens[0] in the same sequence.
-    std::vector<NgramIds> ids_for(const std::vector<int32_t> &history,
-                                  const std::vector<int32_t> &tokens) const;
+    std::vector<NgramIds> ids_for(const std::vector<int32_t> &history, const std::vector<int32_t> &tokens) const;
 
     const std::array<int64_t, cfg::NGRAM_HEADS> &sizes() const { return sizes_; }
     const std::array<uint64_t, cfg::NGRAM> &multipliers() const { return mult_; }

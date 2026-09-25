@@ -78,7 +78,11 @@ __device__ __forceinline__ float dot_int4x32(const uint4 &w, const uint4 *x, flo
     return acc;
 }
 
-__device__ __forceinline__ float sigmoid(float x) { return 1.f / (1.f + __expf(-x)); }
-__device__ __forceinline__ float silu(float x) { return x * sigmoid(x); }
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.f / (1.f + __expf(-x));
+}
+__device__ __forceinline__ float silu(float x) {
+    return x * sigmoid(x);
+}
 
 }  // namespace qw::gpu

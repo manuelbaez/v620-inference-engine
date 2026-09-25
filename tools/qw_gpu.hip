@@ -18,7 +18,8 @@ static std::vector<int32_t> parse_ids(const std::string &s) {
     std::vector<int32_t> v;
     std::stringstream ss(s);
     std::string tok;
-    while (std::getline(ss, tok, ',')) if (!tok.empty()) v.push_back(int32_t(std::stol(tok)));
+    while (std::getline(ss, tok, ','))
+        if (!tok.empty()) v.push_back(int32_t(std::stol(tok)));
     return v;
 }
 
@@ -30,18 +31,32 @@ int main(int argc, char **argv) {
     long prefill_n = -1;  // prefill this many tokens, then feed the rest through decode
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&] { if (i + 1 >= argc) fail("missing value for " + a); return std::string(argv[++i]); };
-        if (a == "--model") opt.model_dir = next();
-        else if (a == "--ple") opt.ple_dir = next();
-        else if (a == "--tokens") ids_s = next();
-        else if (a == "--gen") gen = std::stoi(next());
-        else if (a == "--logprobs") lp_file = next();
-        else if (a == "--max-tokens") opt.slot_tokens = {std::stoi(next())};
-        else if (a == "--chunk") opt.prefill_chunk = std::stoi(next());
-        else if (a == "--token-by-token") tbt = true;
-        else if (a == "--no-warmup") opt.warmup = false;
-        else if (a == "--prefill-n") prefill_n = std::stol(next());
-        else fail("unknown argument " + a);
+        auto next = [&] {
+            if (i + 1 >= argc) fail("missing value for " + a);
+            return std::string(argv[++i]);
+        };
+        if (a == "--model")
+            opt.model_dir = next();
+        else if (a == "--ple")
+            opt.ple_dir = next();
+        else if (a == "--tokens")
+            ids_s = next();
+        else if (a == "--gen")
+            gen = std::stoi(next());
+        else if (a == "--logprobs")
+            lp_file = next();
+        else if (a == "--max-tokens")
+            opt.slot_tokens = {std::stoi(next())};
+        else if (a == "--chunk")
+            opt.prefill_chunk = std::stoi(next());
+        else if (a == "--token-by-token")
+            tbt = true;
+        else if (a == "--no-warmup")
+            opt.warmup = false;
+        else if (a == "--prefill-n")
+            prefill_n = std::stol(next());
+        else
+            fail("unknown argument " + a);
     }
     try {
         auto prompt = parse_ids(ids_s);
@@ -97,8 +112,8 @@ int main(int argc, char **argv) {
         }
         if (f) std::fclose(f);
         auto t2 = now();
-        log("prompt: %zu tokens in %.2f s (%.1f tok/s, %s)", prompt.size(), secs(t1, t2),
-            prompt.size() / secs(t1, t2), tbt ? "token-by-token" : "prefill");
+        log("prompt: %zu tokens in %.2f s (%.1f tok/s, %s)", prompt.size(), secs(t1, t2), prompt.size() / secs(t1, t2),
+            tbt ? "token-by-token" : "prefill");
         std::printf("generated:");
         auto t3 = now();
         for (int i = 0; i < gen; ++i) {
@@ -112,7 +127,8 @@ int main(int argc, char **argv) {
                 logsoftmax(l);
                 std::vector<int> idx(l.size());
                 for (size_t j = 0; j < idx.size(); ++j) idx[j] = int(j);
-                std::partial_sort(idx.begin(), idx.begin() + 3, idx.end(), [&](int a, int b) { return lp[size_t(a)] > lp[size_t(b)]; });
+                std::partial_sort(idx.begin(), idx.begin() + 3, idx.end(),
+                                  [&](int a, int b) { return lp[size_t(a)] > lp[size_t(b)]; });
                 std::fprintf(stderr, "  step %d top: %d %.3f | %d %.3f | %d %.3f\n", i + 1, idx[0], lp[size_t(idx[0])],
                              idx[1], lp[size_t(idx[1])], idx[2], lp[size_t(idx[2])]);
             }

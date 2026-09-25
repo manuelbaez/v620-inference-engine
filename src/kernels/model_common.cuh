@@ -1,9 +1,10 @@
-// Device functions shared by the decode (model_ops.hip) and prefill
-// (prefill_ops.hip) kernels, so both paths run the same math.
+// Device functions shared by the prefill (_T) and batched decode (_B) kernels
+// of each layer type, so both paths run the same math.
 #pragma once
 
-#include "core/config.hpp"
+#include "core/shard.hpp"
 #include "kernels/common.cuh"
+#include "kernels/types.hpp"
 
 namespace qw::gpu {
 
@@ -12,7 +13,7 @@ using namespace cfg;
 // NeoX rotation of the first ROPE_DIM dims of buf (shared, n >= ROPE_DIM) in
 // place, block-cooperative. The angle is reduced in double: pos * inv_freq is
 // up to ~2.6e5 rad, far outside fast sin/cos's accurate range.
-__device__ void rope_shared(float *buf, int64_t pos) {
+__device__ inline void rope_shared(float *buf, int64_t pos) {
     constexpr int half = ROPE_DIM / 2;
     __syncthreads();
     if (threadIdx.x < half) {
@@ -29,7 +30,7 @@ __device__ void rope_shared(float *buf, int64_t pos) {
 }
 
 // buf[0..n) = gemma_rmsnorm(src) with w1 = 1 + w. Block-cooperative.
-__device__ void norm_shared(const float *src, const float *w1, float *buf, int n, float *red) {
+__device__ inline void norm_shared(const float *src, const float *w1, float *buf, int n, float *red) {
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float v = src[i];
@@ -40,7 +41,7 @@ __device__ void norm_shared(const float *src, const float *w1, float *buf, int n
     for (int i = threadIdx.x; i < n; i += blockDim.x) buf[i] = src[i] * r * w1[i];
 }
 
-constexpr int QSA_LOCAL_HEADS = Q_HEADS / 4;  // 6
+constexpr int QSA_LOCAL_HEADS = QH_L;  // 6
 
 __device__ __forceinline__ uint32_t order_key(float f) {
     uint32_t u = __float_as_uint(f);
@@ -48,7 +49,7 @@ __device__ __forceinline__ uint32_t order_key(float f) {
 }
 
 // Exclusive scan over the 1024 threads of a block.
-__device__ int block_exscan_1024(int v, int *sh, int *total) {
+__device__ inline int block_exscan_1024(int v, int *sh, int *total) {
     const int t = threadIdx.x;
     sh[t] = v;
     __syncthreads();
@@ -67,7 +68,7 @@ __device__ int block_exscan_1024(int v, int *sh, int *total) {
 // One block of 1024 threads. Radix-select the 512th largest key, then an
 // ordered compaction: everything above the threshold, plus ties by lowest
 // group index, matching the reference's tie-break.
-__device__ void select_body(const float *scores, int64_t pos, int32_t *list, int32_t *count) {
+__device__ inline void select_body(const float *scores, int64_t pos, int32_t *list, int32_t *count) {
     const int nb = int((pos + 1) / IDX_RATIO);
     if (nb <= IDX_TOPK_BLOCKS) {  // dense: every token so far
         for (int i = threadIdx.x; i <= pos; i += blockDim.x) list[i] = i;
@@ -113,8 +114,10 @@ __device__ void select_body(const float *scores, int64_t pos, int32_t *list, int
     int n_sel = 0, eq_seen = eq_before;
     for (int i = b0; i < b1; ++i) {
         const uint32_t key = order_key(scores[i]);
-        if (key > thr) ++n_sel;
-        else if (key == thr && eq_seen++ < k) ++n_sel;
+        if (key > thr)
+            ++n_sel;
+        else if (key == thr && eq_seen++ < k)
+            ++n_sel;
     }
     const int out0 = block_exscan_1024(n_sel, scan, nullptr);
     int o = out0;
@@ -136,12 +139,13 @@ __device__ void select_body(const float *scores, int64_t pos, int32_t *list, int
 
 constexpr int ATT_CHUNK = 64;
 constexpr int ATT_BLOCKS = (IDX_BUDGET + IDX_RATIO - 1 + ATT_CHUNK - 1) / ATT_CHUNK;  // 33
-constexpr int ATT_REC = HEAD_DIM + 2;  // m, l, acc[256]
+constexpr int ATT_REC = HEAD_DIM + 2;                                                 // m, l, acc[256]
+constexpr int ATT_PART = ATT_BLOCKS * QSA_LOCAL_HEADS * ATT_REC;                      // per query row
 
 // Block b (256 threads) covers list entries [64b, 64b+64); writes one
 // partial record (m, l, acc[256]) per head.
-__device__ void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const int32_t *list, int n,
-                            float *partial) {
+__device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const int32_t *list, int n,
+                                   float *partial) {
     constexpr int NH = QSA_LOCAL_HEADS;
     __shared__ float sh[8][NH][ATT_REC];
     const int lane = threadIdx.x % WAVE, w = threadIdx.x / WAVE;
@@ -217,7 +221,7 @@ __device__ void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, cons
 
 // HEAD_DIM threads: merge the ATT_BLOCKS partials, apply the sigmoid gate.
 template <typename G>
-__device__ void combine_body(const float *partial, const G *gate, __half *out) {
+__device__ inline void combine_body(const float *partial, const G *gate, __half *out) {
     constexpr int NH = QSA_LOCAL_HEADS;
     const int d = threadIdx.x;
     for (int h = 0; h < NH; ++h) {
@@ -239,11 +243,10 @@ __device__ void combine_body(const float *partial, const G *gate, __half *out) {
     }
 }
 
-
 // 512 threads (one per expert): softmax over the router logits, then the
 // top-k by repeated argmax (ties: lowest index). top/topp are shared arrays
 // of the caller; valid for all threads on return.
-__device__ void route_body(const float *logits, int *top, float *topp) {
+__device__ inline void route_body(const float *logits, int *top, float *topp) {
     __shared__ float red[16];
     __shared__ int redi[16];
     const int t = threadIdx.x, lane = t % WAVE, w = t / WAVE;

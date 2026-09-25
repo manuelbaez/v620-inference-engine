@@ -62,10 +62,9 @@ private:
         const std::function<void(int64_t, int64_t)> *fn;
         int64_t n, chunks;
         std::atomic<int64_t> next{0};
-        int64_t done = 0;    // guarded by mu_
-        int active = 0;      // workers holding a pointer; guarded by mu_
-        Job(const std::function<void(int64_t, int64_t)> *f, int64_t n_, int64_t c)
-            : fn(f), n(n_), chunks(c) {}
+        int64_t done = 0;  // guarded by mu_
+        int active = 0;    // workers holding a pointer; guarded by mu_
+        Job(const std::function<void(int64_t, int64_t)> *f, int64_t n_, int64_t c) : fn(f), n(n_), chunks(c) {}
     };
 
     void run(Job &job) {
@@ -73,7 +72,7 @@ private:
         for (;;) {
             int64_t c = job.next.fetch_add(1);
             if (c >= job.chunks) break;
-            (*job.fn)(job.n * c / job.chunks, job.n * (c + 1) / job.chunks);
+            (*job.fn)(job.n *c / job.chunks, job.n * (c + 1) / job.chunks);
             ++mine;
         }
         if (mine) {

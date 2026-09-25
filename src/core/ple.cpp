@@ -38,7 +38,10 @@ bool is_prime(uint64_t n) {
         if (n % p == 0) return n == p;
     uint64_t d = n - 1;
     int s = 0;
-    while (d % 2 == 0) { d /= 2; ++s; }
+    while (d % 2 == 0) {
+        d /= 2;
+        ++s;
+    }
     for (uint64_t a : {2ull, 325ull, 9375ull, 28178ull, 450775ull, 9780504ull, 1795265022ull}) {
         if (a % n == 0) continue;
         uint64_t x = powmod(a, d, n);
@@ -46,7 +49,10 @@ bool is_prime(uint64_t n) {
         bool comp = true;
         for (int r = 1; r < s; ++r) {
             x = mulmod(x, x, n);
-            if (x == n - 1) { comp = false; break; }
+            if (x == n - 1) {
+                comp = false;
+                break;
+            }
         }
         if (comp) return false;
     }
@@ -99,8 +105,7 @@ NgramIds NgramHasher::ids(const int32_t *ctx, int n, int prev_eos) const {
 
 std::vector<NgramIds> NgramHasher::ids_for(const std::vector<int32_t> &history,
                                            const std::vector<int32_t> &tokens) const {
-    std::vector<int32_t> ctx(history.end() - std::min<ptrdiff_t>(history.size(), cfg::NGRAM - 1),
-                             history.end());
+    std::vector<int32_t> ctx(history.end() - std::min<ptrdiff_t>(history.size(), cfg::NGRAM - 1), history.end());
     int hist = int(ctx.size());
     ctx.insert(ctx.end(), tokens.begin(), tokens.end());
     std::vector<NgramIds> out;

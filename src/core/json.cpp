@@ -56,10 +56,14 @@ struct Parser {
         for (int i = 0; i < 4; ++i) {
             char c = s[p++];
             v <<= 4;
-            if (c >= '0' && c <= '9') v |= uint32_t(c - '0');
-            else if (c >= 'a' && c <= 'f') v |= uint32_t(c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') v |= uint32_t(c - 'A' + 10);
-            else error("bad hex digit");
+            if (c >= '0' && c <= '9')
+                v |= uint32_t(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                v |= uint32_t(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F')
+                v |= uint32_t(c - 'A' + 10);
+            else
+                error("bad hex digit");
         }
         return v;
     }
@@ -78,18 +82,33 @@ struct Parser {
             if (p >= s.size()) error("bad escape");
             char e = s[p++];
             switch (e) {
-                case '"': out += '"'; break;
-                case '\\': out += '\\'; break;
-                case '/': out += '/'; break;
-                case 'b': out += '\b'; break;
-                case 'f': out += '\f'; break;
-                case 'n': out += '\n'; break;
-                case 'r': out += '\r'; break;
-                case 't': out += '\t'; break;
+                case '"':
+                    out += '"';
+                    break;
+                case '\\':
+                    out += '\\';
+                    break;
+                case '/':
+                    out += '/';
+                    break;
+                case 'b':
+                    out += '\b';
+                    break;
+                case 'f':
+                    out += '\f';
+                    break;
+                case 'n':
+                    out += '\n';
+                    break;
+                case 'r':
+                    out += '\r';
+                    break;
+                case 't':
+                    out += '\t';
+                    break;
                 case 'u': {
                     uint32_t cp = hex4();
-                    if (cp >= 0xd800 && cp < 0xdc00 && p + 6 <= s.size() && s[p] == '\\' &&
-                        s[p + 1] == 'u') {
+                    if (cp >= 0xd800 && cp < 0xdc00 && p + 6 <= s.size() && s[p] == '\\' && s[p + 1] == 'u') {
                         p += 2;
                         uint32_t lo = hex4();
                         cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
@@ -97,7 +116,8 @@ struct Parser {
                     put_utf8(out, cp);
                     break;
                 }
-                default: error("bad escape");
+                default:
+                    error("bad escape");
             }
         }
         return out;

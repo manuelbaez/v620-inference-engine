@@ -16,23 +16,37 @@ namespace qw {
 
 size_t dtype_size(DType t) {
     switch (t) {
-        case DType::F32: case DType::I32: return 4;
-        case DType::F16: case DType::BF16: return 2;
-        case DType::I64: return 8;
-        case DType::U8: case DType::I8: return 1;
+        case DType::F32:
+        case DType::I32:
+            return 4;
+        case DType::F16:
+        case DType::BF16:
+            return 2;
+        case DType::I64:
+            return 8;
+        case DType::U8:
+        case DType::I8:
+            return 1;
     }
     return 0;
 }
 
 const char *dtype_name(DType t) {
     switch (t) {
-        case DType::F32: return "F32";
-        case DType::F16: return "F16";
-        case DType::BF16: return "BF16";
-        case DType::I32: return "I32";
-        case DType::I64: return "I64";
-        case DType::U8: return "U8";
-        case DType::I8: return "I8";
+        case DType::F32:
+            return "F32";
+        case DType::F16:
+            return "F16";
+        case DType::BF16:
+            return "BF16";
+        case DType::I32:
+            return "I32";
+        case DType::I64:
+            return "I64";
+        case DType::U8:
+            return "U8";
+        case DType::I8:
+            return "I8";
     }
     return "?";
 }
@@ -80,7 +94,9 @@ MappedFile::~MappedFile() {
     if (data_) ::munmap(data_, size_);
 }
 
-void MappedFile::prefetch() const { ::madvise(data_, size_, MADV_WILLNEED); }
+void MappedFile::prefetch() const {
+    ::madvise(data_, size_, MADV_WILLNEED);
+}
 
 void SafeTensors::add_file(const std::string &path) {
     files_.push_back(std::make_unique<MappedFile>(path));
@@ -123,8 +139,7 @@ const TensorView &SafeTensors::get(const std::string &name) const {
     return it->second;
 }
 
-const TensorView &SafeTensors::get(const std::string &name, DType dt,
-                                   std::vector<int64_t> shape) const {
+const TensorView &SafeTensors::get(const std::string &name, DType dt, std::vector<int64_t> shape) const {
     const TensorView &t = get(name);
     if (t.dtype != dt || t.shape != shape) {
         std::ostringstream os;

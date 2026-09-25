@@ -12,8 +12,8 @@ void check_config(const std::string &model_dir) {
     auto want = [&](const char *key, int64_t v) {
         int64_t got = t[key].as_int();
         if (got != v)
-            fail(std::string("config.json: ") + key + " = " + std::to_string(got) +
-                 ", engine is built for " + std::to_string(v));
+            fail(std::string("config.json: ") + key + " = " + std::to_string(got) + ", engine is built for " +
+                 std::to_string(v));
     };
     want("hidden_size", H);
     want("hc_count", HC);
@@ -59,8 +59,7 @@ void check_config(const std::string &model_dir) {
         QW_CHECK(full == is_qsa(i), "config.json: layer_types pattern differs");
     }
     const Json &q = root["quantization_config"]["config_groups"]["group_0"]["weights"];
-    QW_CHECK(q["num_bits"].as_int() == 4 && q["group_size"].as_int() == QGROUP &&
-                 q["symmetric"].as_bool(),
+    QW_CHECK(q["num_bits"].as_int() == 4 && q["group_size"].as_int() == QGROUP && q["symmetric"].as_bool(),
              "config.json: experts are not symmetric int4 g128");
 }
 

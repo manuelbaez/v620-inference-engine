@@ -1,0 +1,267 @@
+#include "comm/comm.hpp"
+
+#include <hip/hip_fp16.h>
+
+#include <algorithm>
+#include <string>
+
+#include "core/common.hpp"
+
+namespace qw {
+
+namespace {
+
+constexpr int FLAG_STRIDE = 16;  // uint32 per flag slot (64 bytes)
+constexpr long SPIN_LIMIT = 1L << 26;
+constexpr size_t BLOCK_BYTES = 64 * 1024;  // push payload per block
+constexpr int MAX_BLOCKS = 64;
+
+void ck(hipError_t e, const char *what) {
+    if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled)
+        fail(std::string("comm: ") + what + ": " + hipGetErrorString(e));
+}
+
+struct PushArgs {
+    const uint8_t *src;
+    int rows;
+    size_t row16;            // uint4 per row per destination
+    size_t src_row_stride;   // bytes
+    size_t src_dest_offset;  // bytes between destinations' parts (0 = broadcast)
+    size_t slot;
+    uint8_t *recv[RANKS];    // each destination's receive buffer
+    uint32_t *flags[RANKS];  // each destination's flags
+    uint32_t *counter;       // this rank's per-destination completion counters
+    const uint32_t *base;    // this rank's sequence base
+    uint32_t k;
+    int rank;
+    int concurrent;
+};
+
+// grid.x = blocks. All blocks serve one destination at a time, in an order
+// rotated by rank (rank r sends to r, r+1, r+2, r+3): at any moment each GPU
+// feeds one peer and no two GPUs target the same one. Writing to all peers at
+// once (12 concurrent cross-NUMA flows) measured ~6x slower on this box.
+// The last block to finish a destination raises its flag; every block fences
+// its own stores before counting.
+__global__ __launch_bounds__(256) void push_kernel(PushArgs a) {
+    const uint32_t seq = *a.base + a.k;
+    const int par = int(seq & 1);
+    const int row16 = int(a.row16);
+    // Small payloads (latency-bound) go to all peers at once: block b serves
+    // destination b. Large ones rotate as described above.
+    const bool concurrent = a.concurrent != 0;
+    for (int dd = concurrent ? int(blockIdx.x) : 0; dd < (concurrent ? int(blockIdx.x) + 1 : RANKS); ++dd) {
+        const int d = (a.rank + dd) % RANKS;
+        const int nblk = concurrent ? 1 : int(gridDim.x);
+        const int blk = concurrent ? 0 : int(blockIdx.x);
+        uint4 *dst = reinterpret_cast<uint4 *>(a.recv[d] + (size_t(par) * RANKS + a.rank) * a.slot);
+        const uint8_t *src = a.src + a.src_dest_offset * d;
+        if (a.rows == 1) {
+            const uint4 *s0 = reinterpret_cast<const uint4 *>(src);
+            for (int c = blk * blockDim.x + threadIdx.x; c < row16; c += nblk * blockDim.x) dst[c] = s0[c];
+        } else {  // 32-bit row loop: 64-bit divisions are emulated
+            for (int row = blk; row < a.rows; row += nblk) {
+                const uint4 *s0 = reinterpret_cast<const uint4 *>(src + size_t(row) * a.src_row_stride);
+                uint4 *d0 = dst + size_t(row) * row16;
+                for (int c = threadIdx.x; c < row16; c += blockDim.x) d0[c] = s0[c];
+            }
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const uint32_t done = atomicAdd(&a.counter[d], 1u);
+            if (done == uint32_t(nblk) - 1) {
+                a.counter[d] = 0;  // next use of this counter is ordered after this kernel
+                __threadfence_system();
+                __hip_atomic_store(a.flags[d] + (par * RANKS + a.rank) * FLAG_STRIDE, seq, __ATOMIC_RELEASE,
+                                   __HIP_MEMORY_SCOPE_SYSTEM);
+            }
+        }
+    }
+}
+
+struct RecvArgs {
+    const uint8_t *recv;  // this rank's receive buffer [parity][src][slot]
+    uint32_t *flags;      // this rank's flags [parity][src]
+    size_t slot;
+    int rows;
+    size_t row_bytes;  // payload bytes per row per source
+    const uint32_t *base;
+    uint32_t k;
+    int op;
+    int wait;  // poll the flags here (else a preceding wait kernel did)
+    void *dst;
+    uint32_t *err;
+};
+
+// Polling is done by a handful of threads only: many blocks spinning on
+// uncached flags flood the receiver's memory with reads and slow the very P2P
+// writes they are waiting for (measured: 10x on a 10 MB all-reduce).
+__device__ void wait_flags(const RecvArgs &a, int par, uint32_t seq) {
+    if (threadIdx.x < RANKS) {
+        const uint32_t *f = a.flags + (par * RANKS + threadIdx.x) * FLAG_STRIDE;
+        long spins = 0;
+        while (__hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < seq) {
+            __builtin_amdgcn_s_sleep(2);
+            if (++spins > SPIN_LIMIT) {
+                *a.err = 1;
+                break;
+            }
+        }
+    }
+}
+
+__global__ void wait_kernel(RecvArgs a) {
+    const uint32_t seq = *a.base + a.k;
+    wait_flags(a, int(seq & 1), seq);
+}
+
+__global__ __launch_bounds__(256) void recv_kernel(RecvArgs a) {
+    const uint32_t seq = *a.base + a.k;
+    const int par = int(seq & 1);
+    const uint8_t *slots = a.recv + size_t(par) * RANKS * a.slot;
+    if (a.wait) wait_flags(a, par, seq);
+    __syncthreads();
+    const size_t stride = size_t(gridDim.x) * blockDim.x;
+    const size_t start = blockIdx.x * size_t(blockDim.x) + threadIdx.x;
+    if (a.op == 0) {  // sum fp32 -> fp32, same layout
+        const size_t n = size_t(a.rows) * a.row_bytes / 4;
+        const float *s0 = reinterpret_cast<const float *>(slots);
+        float *dst = static_cast<float *>(a.dst);
+        const size_t qs = a.slot / 4;
+        for (size_t i = start; i < n; i += stride) {
+            float v = 0.f;
+#pragma unroll
+            for (int q = 0; q < RANKS; ++q) v += s0[q * qs + i];
+            dst[i] = v;
+        }
+    } else if (a.op == 1) {  // sum fp16 -> fp32
+        const size_t n = size_t(a.rows) * a.row_bytes / 2;
+        const __half *s0 = reinterpret_cast<const __half *>(slots);
+        float *dst = static_cast<float *>(a.dst);
+        const size_t qs = a.slot / 2;
+        for (size_t i = start; i < n; i += stride) {
+            float v = 0.f;
+#pragma unroll
+            for (int q = 0; q < RANKS; ++q) v += __half2float(s0[q * qs + i]);
+            dst[i] = v;
+        }
+    } else {  // concat, interleaved per row: dst[t][q][row_bytes]
+        const int r16 = int(a.row_bytes / 16);
+        uint4 *dst = static_cast<uint4 *>(a.dst);
+        for (int row = blockIdx.x; row < a.rows; row += gridDim.x)
+            for (int c = threadIdx.x; c < r16 * RANKS; c += blockDim.x) {
+                const int q = c / r16, cc = c - q * r16;
+                dst[size_t(row) * r16 * RANKS + c] =
+                    reinterpret_cast<const uint4 *>(slots + q * a.slot)[size_t(row) * r16 + cc];
+            }
+    }
+}
+
+}  // namespace
+
+Comm::Comm(const std::array<int, RANKS> &devices, size_t slot_bytes) : dev_(devices), slot_(slot_bytes) {
+    QW_CHECK(slot_ % 16 == 0, "comm: slot size must be a multiple of 16");
+    for (int r = 0; r < RANKS; ++r) {
+        ck(hipSetDevice(dev_[size_t(r)]), "set device");
+        for (int q = 0; q < RANKS; ++q)
+            if (q != r) ck(hipDeviceEnablePeerAccess(dev_[size_t(q)], 0), "enable peer access");
+        (void)hipGetLastError();  // clear the sticky already-enabled error
+        void *p;
+        ck(hipExtMallocWithFlags(&p, 2 * RANKS * slot_, hipDeviceMallocUncached), "alloc recv");
+        recv_[size_t(r)] = static_cast<uint8_t *>(p);
+        ck(hipExtMallocWithFlags(&p, 2 * RANKS * FLAG_STRIDE * 4, hipDeviceMallocUncached), "alloc flags");
+        flags_[size_t(r)] = static_cast<uint32_t *>(p);
+        ck(hipMemset(p, 0, 2 * RANKS * FLAG_STRIDE * 4), "clear flags");
+        ck(hipMalloc(&p, 64), "alloc counters");
+        ck(hipMemset(p, 0, 64), "clear counters");
+        counters_[size_t(r)] = static_cast<uint32_t *>(p);
+        ck(hipMalloc(&p, 64), "alloc base");
+        ck(hipMemset(p, 0, 64), "clear base");
+        base_[size_t(r)] = static_cast<uint32_t *>(p);
+        ck(hipHostMalloc(&p, 64, 0), "alloc base staging");
+        base_host_[size_t(r)] = static_cast<uint32_t *>(p);
+        *base_host_[size_t(r)] = 0;
+    }
+    void *e;
+    ck(hipHostMalloc(&e, 64, hipHostMallocCoherent), "alloc err");
+    err_ = static_cast<uint32_t *>(e);
+    *err_ = 0;
+}
+
+Comm::~Comm() {
+    for (int r = 0; r < RANKS; ++r) {
+        (void)hipSetDevice(dev_[size_t(r)]);
+        (void)hipFree(recv_[size_t(r)]);
+        (void)hipFree(flags_[size_t(r)]);
+        (void)hipFree(counters_[size_t(r)]);
+        (void)hipFree(base_[size_t(r)]);
+        (void)hipHostFree(base_host_[size_t(r)]);
+    }
+    (void)hipHostFree(err_);
+}
+
+void Comm::set_base(int r, uint32_t base, hipStream_t s) {
+    // The staging word is only rewritten after the previous step synchronized.
+    *base_host_[size_t(r)] = base;
+    ck(hipMemcpyAsync(base_[size_t(r)], base_host_[size_t(r)], 4, hipMemcpyHostToDevice, s), "set base");
+}
+
+void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t src_row_stride, size_t src_dest_offset,
+                    Op op, void *dst, uint32_t k, hipStream_t s) {
+    const size_t bytes = size_t(rows) * row_bytes;
+    QW_CHECK(row_bytes % 16 == 0 && src_row_stride % 16 == 0 && bytes <= slot_, "comm: bad message size");
+    QW_CHECK(k > 0, "comm: sequence offsets start at 1");
+    PushArgs pa;
+    pa.src = static_cast<const uint8_t *>(src);
+    pa.rows = rows;
+    pa.row16 = row_bytes / 16;
+    pa.src_row_stride = src_row_stride;
+    pa.src_dest_offset = src_dest_offset;
+    pa.slot = slot_;
+    for (int d = 0; d < RANKS; ++d) {
+        pa.recv[d] = recv_[size_t(d)];
+        pa.flags[d] = flags_[size_t(d)];
+    }
+    pa.counter = counters_[size_t(r)];
+    pa.base = base_[size_t(r)];
+    pa.k = k;
+    pa.rank = r;
+    const int blocks = int(std::min<size_t>(rows > 1 ? std::min<size_t>(MAX_BLOCKS, size_t(rows)) : MAX_BLOCKS,
+                                            (bytes + BLOCK_BYTES - 1) / BLOCK_BYTES));
+    pa.concurrent = bytes <= BLOCK_BYTES;
+    push_kernel<<<pa.concurrent ? RANKS : std::max(blocks, 1), 256, 0, s>>>(pa);
+    RecvArgs ra;
+    ra.recv = recv_[size_t(r)];
+    ra.flags = flags_[size_t(r)];
+    ra.slot = slot_;
+    ra.rows = rows;
+    ra.row_bytes = row_bytes;
+    ra.base = base_[size_t(r)];
+    ra.k = k;
+    ra.op = int(op);
+    ra.dst = dst;
+    ra.err = err_;
+    const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS / 16 + 4095) / 4096)));
+    ra.wait = rblocks == 1;
+    if (!ra.wait) wait_kernel<<<1, 64, 0, s>>>(ra);
+    recv_kernel<<<rblocks, 256, 0, s>>>(ra);
+}
+
+void Comm::allreduce(int r, const void *src, float *dst, int n, uint32_t k, hipStream_t s, int rows, bool src_f16) {
+    const size_t es = src_f16 ? 2 : 4;
+    exchange(r, src, rows, size_t(n) * es, size_t(n) * es, 0, src_f16 ? SUM_F16 : SUM_F32, dst, k, s);
+}
+
+void Comm::reduce_scatter(int r, const void *src, float *dst, int n, uint32_t k, hipStream_t s, int rows,
+                          bool src_f16) {
+    const size_t es = src_f16 ? 2 : 4;
+    exchange(r, src, rows, size_t(n) * es, size_t(n) * RANKS * es, size_t(n) * es, src_f16 ? SUM_F16 : SUM_F32, dst, k,
+             s);
+}
+
+void Comm::allgather(int r, const void *src, void *dst, size_t bytes, uint32_t k, hipStream_t s, int rows) {
+    exchange(r, src, rows, bytes, bytes, 0, CONCAT, dst, k, s);
+}
+
+}  // namespace qw

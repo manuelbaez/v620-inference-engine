@@ -22,7 +22,8 @@ static std::vector<int32_t> parse_ids(const std::string &s) {
     std::vector<int32_t> v;
     std::stringstream ss(s);
     std::string tok;
-    while (std::getline(ss, tok, ',')) if (!tok.empty()) v.push_back(int32_t(std::stol(tok)));
+    while (std::getline(ss, tok, ','))
+        if (!tok.empty()) v.push_back(int32_t(std::stol(tok)));
     return v;
 }
 
@@ -41,14 +42,24 @@ int main(int argc, char **argv) {
     int gen = 8, threads = 0;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&] { if (i + 1 >= argc) fail("missing value for " + a); return std::string(argv[++i]); };
-        if (a == "--model") model = next();
-        else if (a == "--ple") ple = next();
-        else if (a == "--tokens") ids_s = next();
-        else if (a == "--gen") gen = std::stoi(next());
-        else if (a == "--logprobs") lp_file = next();
-        else if (a == "--threads") threads = std::stoi(next());
-        else fail("unknown argument " + a);
+        auto next = [&] {
+            if (i + 1 >= argc) fail("missing value for " + a);
+            return std::string(argv[++i]);
+        };
+        if (a == "--model")
+            model = next();
+        else if (a == "--ple")
+            ple = next();
+        else if (a == "--tokens")
+            ids_s = next();
+        else if (a == "--gen")
+            gen = std::stoi(next());
+        else if (a == "--logprobs")
+            lp_file = next();
+        else if (a == "--threads")
+            threads = std::stoi(next());
+        else
+            fail("unknown argument " + a);
     }
     try {
         auto prompt = parse_ids(ids_s);

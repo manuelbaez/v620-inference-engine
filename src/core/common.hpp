@@ -11,12 +11,13 @@
 
 namespace qw {
 
-[[noreturn]] inline void fail(const std::string &msg) { throw std::runtime_error(msg); }
+[[noreturn]] inline void fail(const std::string &msg) {
+    throw std::runtime_error(msg);
+}
 
-#define QW_CHECK(cond, msg)                                                          \
-    do {                                                                             \
-        if (!(cond)) ::qw::fail(std::string(__FILE__ ":") + std::to_string(__LINE__) + \
-                                ": " + (msg));                                       \
+#define QW_CHECK(cond, msg)                                                                           \
+    do {                                                                                              \
+        if (!(cond)) ::qw::fail(std::string(__FILE__ ":") + std::to_string(__LINE__) + ": " + (msg)); \
     } while (0)
 
 inline void log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -46,7 +47,10 @@ inline float f16_to_f32(uint16_t h) {
             u = sign;
         } else {  // subnormal: renormalize
             exp = 127 - 15 + 1;
-            while (!(man & 0x400)) { man <<= 1; --exp; }
+            while (!(man & 0x400)) {
+                man <<= 1;
+                --exp;
+            }
             man &= 0x3ff;
             u = sign | (exp << 23) | (man << 13);
         }
