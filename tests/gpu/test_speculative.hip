@@ -60,7 +60,8 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
         for (size_t i = 0; i < seqs.size(); ++i) {
             Seq &q = seqs[i];
             if (int(q.out.size()) >= gen) continue;
-            const int k = std::min<int>(int(q.drafts.size()), gen - int(q.out.size()) - 1);
+            int k = std::min<int>(int(q.drafts.size()), gen - int(q.out.size()) - 1);
+            if (std::getenv("QW_SPEC_MIXED")) k = std::min(k, int((q.steps * 7 + i * 3) % 4));  // mixed run lengths
             first[i] = int(rows.size());
             rows.push_back({q.slot, q.out.back()});
             for (int j = 0; j < k; ++j) rows.push_back({q.slot, q.drafts[size_t(j)]});
@@ -113,6 +114,7 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
 int main(int argc, char **argv) {
     std::vector<std::vector<int32_t>> prompts;
     int gen = 128, K = 3;
+    bool session_only = false;
     EngineOptions opt;
     opt.slot_tokens = {32768, 32768, 32768, 32768};
     for (int i = 1; i < argc; ++i) {
@@ -124,6 +126,8 @@ int main(int argc, char **argv) {
             gen = std::stoi(next());
         else if (a == "--k")
             K = std::stoi(next());
+        else if (a == "--session-only")
+            session_only = true;
         else if (a == "--no-warmup")
             opt.warmup = false;
     }
@@ -132,49 +136,52 @@ int main(int argc, char **argv) {
         Engine e(opt);
         QW_CHECK(e.has_mtp(), "no MTP head loaded");
         int fails = 0;
-        std::vector<std::vector<int32_t>> ref;
-        for (size_t p = 0; p < prompts.size(); ++p) {
-            e.slot_reset(0);
-            std::vector<int32_t> out{argmax(e.prefill(0, prompts[p]).data())};
-            const double t0 = now();
-            while (int(out.size()) < gen) out.push_back(argmax(e.decode({{0, out.back()}}).data()));
-            const double t_plain = now() - t0;
-            ref.push_back(out);
 
-            e.slot_reset(0);
-            std::vector<Seq> one{{0, {argmax(e.prefill(0, prompts[p]).data())}}};
-            const double t1 = now();
-            g_time = {};
-            run_spec(e, one, gen, K);
-            const double t_spec = now() - t1;
-            std::printf("  per step: verify %.2f ms, accept %.2f ms, draft %.2f ms\n",
-                        1e3 * g_time.decode / one[0].steps, 1e3 * g_time.accept / one[0].steps,
-                        1e3 * g_time.draft / one[0].steps);
-            const bool same = one[0].out == out;
-            fails += !same;
-            std::printf("prompt %zu: plain %.1f tok/s, spec %.1f tok/s, %.2f tokens/step (%d steps), %s\n", p,
-                        (gen - 1) / t_plain, (gen - 1) / t_spec, double(gen - 1) / one[0].steps, one[0].steps,
-                        same ? "SAME tokens" : "DIFFERENT tokens");
-            if (!same) {
-                size_t k = 0;
-                while (k < out.size() && out[k] == one[0].out[k]) ++k;
-                std::printf("  first difference at %zu: plain %d, spec %d\n", k, out[k], one[0].out[k]);
-            }
-        }
-        if (prompts.size() > 1) {
-            std::vector<Seq> seqs;
+        std::vector<std::vector<int32_t>> ref;
+        if (!session_only) {
             for (size_t p = 0; p < prompts.size(); ++p) {
-                e.slot_reset(int(p));
-                seqs.push_back({int(p), {argmax(e.prefill(int(p), prompts[p]).data())}});
+                e.slot_reset(0);
+                std::vector<int32_t> out{argmax(e.prefill(0, prompts[p]).data())};
+                const double t0 = now();
+                while (int(out.size()) < gen) out.push_back(argmax(e.decode({{0, out.back()}}).data()));
+                const double t_plain = now() - t0;
+                ref.push_back(out);
+
+                e.slot_reset(0);
+                std::vector<Seq> one{{0, {argmax(e.prefill(0, prompts[p]).data())}}};
+                const double t1 = now();
+                g_time = {};
+                run_spec(e, one, gen, K);
+                const double t_spec = now() - t1;
+                std::printf("  per step: verify %.2f ms, accept %.2f ms, draft %.2f ms\n",
+                            1e3 * g_time.decode / one[0].steps, 1e3 * g_time.accept / one[0].steps,
+                            1e3 * g_time.draft / one[0].steps);
+                const bool same = one[0].out == out;
+                fails += !same;
+                std::printf("prompt %zu: plain %.1f tok/s, spec %.1f tok/s, %.2f tokens/step (%d steps), %s\n", p,
+                            (gen - 1) / t_plain, (gen - 1) / t_spec, double(gen - 1) / one[0].steps, one[0].steps,
+                            same ? "SAME tokens" : "DIFFERENT tokens");
+                if (!same) {
+                    size_t k = 0;
+                    while (k < out.size() && out[k] == one[0].out[k]) ++k;
+                    std::printf("  first difference at %zu: plain %d, spec %d\n", k, out[k], one[0].out[k]);
+                }
             }
-            const double t0 = now();
-            run_spec(e, seqs, gen, K);
-            const double dt = now() - t0;
-            bool same = true;
-            for (size_t p = 0; p < prompts.size(); ++p) same = same && seqs[p].out == ref[p];
-            fails += !same;
-            std::printf("%zu prompts together: %.1f tok/s aggregate, %s\n", prompts.size(),
-                        double(prompts.size() * size_t(gen - 1)) / dt, same ? "SAME tokens" : "DIFFERENT tokens");
+            if (prompts.size() > 1) {
+                std::vector<Seq> seqs;
+                for (size_t p = 0; p < prompts.size(); ++p) {
+                    e.slot_reset(int(p));
+                    seqs.push_back({int(p), {argmax(e.prefill(int(p), prompts[p]).data())}});
+                }
+                const double t0 = now();
+                run_spec(e, seqs, gen, K);
+                const double dt = now() - t0;
+                bool same = true;
+                for (size_t p = 0; p < prompts.size(); ++p) same = same && seqs[p].out == ref[p];
+                fails += !same;
+                std::printf("%zu prompts together: %.1f tok/s aggregate, %s\n", prompts.size(),
+                            double(prompts.size() * size_t(gen - 1)) / dt, same ? "SAME tokens" : "DIFFERENT tokens");
+            }
         }
         // Session::generate (the server's path): speculative (k = 3) vs plain (k = 0), all prompts at once
         {
@@ -218,12 +225,14 @@ int main(int argc, char **argv) {
             const auto spec = gen_all(K);
             bool same = true;
             for (size_t p = 0; p < prompts.size(); ++p) {
-                const bool sp = plain[p] == spec[p] && plain[p] == ref[p];
+                const bool sp = plain[p] == spec[p] && (ref.empty() || plain[p] == ref[p]);
                 if (!sp) {
                     size_t kk = 0;
-                    while (kk < plain[p].size() && plain[p][kk] == spec[p][kk] && plain[p][kk] == ref[p][kk]) ++kk;
-                    std::printf("  session prompt %zu differs at %zu: ref %d plain %d spec %d\n", p, kk, ref[p][kk],
-                                plain[p][kk], spec[p][kk]);
+                    while (kk < plain[p].size() && plain[p][kk] == spec[p][kk] &&
+                           (ref.empty() || plain[p][kk] == ref[p][kk]))
+                        ++kk;
+                    std::printf("  session prompt %zu differs at %zu: ref %d plain %d spec %d\n", p, kk,
+                                ref.empty() ? -1 : ref[p][kk], plain[p][kk], spec[p][kk]);
                 }
                 same = same && sp;
             }

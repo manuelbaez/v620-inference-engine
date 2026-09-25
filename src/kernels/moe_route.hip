@@ -210,14 +210,17 @@ __global__ __launch_bounds__(256) void moe_combine_B_kernel(const __half *yp, co
     }
     float acc = shared[size_t(r) * H + n];
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k)
+    for (int k = 0; k < TOP_K; ++k) {
+        QW_DCHECK(slot[k] < 32 * TOP_K);
         if (slot[k] >= 0) acc += wt[k] * __half2float(yp[size_t(slot[k]) * H + n]);
+    }
     out[size_t(r) * H + n] = acc;
 }
 
 void moe_combine_B(const uint16_t *yp, const int32_t *tok_slot, const float *tok_w, const float *shared, int M,
                    float *out, hipStream_t s) {
-    moe_combine_B_kernel<<<dim3(M, H / 256), 256, 0, s>>>(reinterpret_cast<const __half *>(yp), tok_slot, tok_w, shared, out);
+    moe_combine_B_kernel<<<dim3(M, H / 256), 256, 0, s>>>(reinterpret_cast<const __half *>(yp), tok_slot, tok_w, shared,
+                                                          out);
 }
 
 }  // namespace qw::gpu

@@ -58,7 +58,7 @@ Measured through HTTP (2026-09-24/25):
 | 5.4k-token prompt | TTFT 2.97 s (1,816 tok/s), decode 58 tok/s |
 | 36k-token prompt | TTFT 16.5 s (2,201 tok/s), decode 53 tok/s |
 | follow-up turn on the same conversation | fully cached, TTFT 0.10-0.18 s |
-| 4 concurrent requests | 180 tok/s aggregate with MTP (158 without) |
+| 4 concurrent requests | 223 tok/s aggregate with MTP (174 without) |
 
 ## Inputs
 

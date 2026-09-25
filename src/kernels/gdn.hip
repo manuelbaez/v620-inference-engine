@@ -159,9 +159,10 @@ __global__ __launch_bounds__(GDN_DIM) void gdn_conv_B_kernel(const float *proj_a
     for (int k = 0; k < GDN_CONV; ++k) {
         const int64_t q = pos - (GDN_CONV - 1 - k);
         float x;
-        if (q >= first_pos)
+        if (q >= first_pos) {
+            QW_DCHECK(r - (pos - q) >= 0 && r - (pos - q) <= r);
             x = proj_all[size_t(r - (pos - q)) * GDN_PROJ_L + ch];
-        else if (q >= 0)
+        } else if (q >= 0)
             x = ring[int(q % GDN_RING) * GDN_QKV_L + ch];
         else
             x = 0.f;
@@ -186,7 +187,8 @@ __global__ __launch_bounds__(GDN_DIM) void gdn_conv_B_kernel(const float *proj_a
 
 void gdn_conv_B(const float *proj, const float *conv_w, const float *A_log, const float *dt_bias, const SlotPtrs *tab,
                 int gi, Rows rows, float *qkv, float *gb, hipStream_t s) {
-    gdn_conv_B_kernel<<<dim3(rows.M, GDN_QKV_L / GDN_DIM), GDN_DIM, 0, s>>>(proj, conv_w, A_log, dt_bias, tab, gi, rows, qkv, gb);
+    gdn_conv_B_kernel<<<dim3(rows.M, GDN_QKV_L / GDN_DIM), GDN_DIM, 0, s>>>(proj, conv_w, A_log, dt_bias, tab, gi, rows,
+                                                                            qkv, gb);
 }
 
 __global__ void gdn_ring_B_kernel(const float *proj, const SlotPtrs *tab, int gi, Rows rows) {
@@ -209,6 +211,7 @@ __global__ __launch_bounds__(256) void gdn_scan_B_kernel(const float *qkv, const
     const int n = run_len[run];
     if (n == 0) return;
     const int r0 = run_start[run];
+    QW_DCHECK(n > 0 && r0 >= 0 && r0 + n <= int(gridDim.x) && run_slot[run] >= 0 && run_slot[run] < 8);
     const int h = blockIdx.y / 4, slice = blockIdx.y % 4;
     const int kh = h / (GDN_V_HEADS / GDN_QK_HEADS);
     const int c = threadIdx.x % 32, rg = threadIdx.x / 32;

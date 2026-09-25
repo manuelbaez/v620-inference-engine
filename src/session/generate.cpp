@@ -67,7 +67,11 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
     if (reqs.empty()) return out_;
     const int n = int(reqs.size());
     QW_CHECK(n <= Engine::MAX_BATCH_ROWS, "generate: too many requests for one batch");
-    const int k_max = e_.has_mtp() ? std::max(0, std::min(k, Engine::MAX_BATCH_ROWS / n - 1)) : 0;
+    // Verification batches are capped at 8 rows: batches of 11-16 rows (3-4 requests x 1 + 3 drafts)
+    // intermittently produce wrong tokens or GPU faults on this box, cause not yet found
+    // (docs/DESIGN.md, "Open issue"). QW_SPEC_MAX_ROWS=16 lifts the cap.
+    static const int max_rows = std::getenv("QW_SPEC_MAX_ROWS") ? std::atoi(std::getenv("QW_SPEC_MAX_ROWS")) : 8;
+    const int k_max = e_.has_mtp() ? std::max(0, std::min({k, Engine::MAX_BATCH_ROWS / n - 1, max_rows / n - 1})) : 0;
     // free positions of a slot; drafting k tokens needs k + 2
     auto room = [&](int slot) { return e_.slot_capacity(slot) - e_.slot_len(slot); };
 
@@ -133,6 +137,10 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
             if (j == n_drafts[i] || tok != si.drafts[size_t(j)]) break;
         }
         const int keep = int(o.tokens.size());  // rows kept: their inputs are committed
+        if (g_trace.on)
+            std::printf("gen: slot %d len %lld drafts %d keep %d%s\n", rq.slot,
+                        (long long)(e_.slot_len(rq.slot) - n_drafts[i] - 1), n_drafts[i], keep,
+                        o.stopped ? " stop" : "");
         // acceptance: drafts 0..keep-2 confirmed, draft keep-1 rejected (unless all were or a stop cut it)
         constexpr float rate = 0.1f;
         const int confirmed = keep - 1;

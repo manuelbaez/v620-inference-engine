@@ -159,11 +159,16 @@ void Engine::dispatch() {
             const char *kind = job_ == Job::Prefill ? "prefill" : job_ == Job::Mtp ? "mtp" : "decode";
             log("watchdog: %s job (M=%d, prefill T=%d) running for %d s; rank phases %d %d %d %d "
                 "(1 enqueueing, 2 waiting for GPU, 0 done); comm errors: %s / %s",
-                kind, djob_.M, pjob_.T, waited, phase_[0].load(), phase_[1].load(), phase_[2].load(),
-                phase_[3].load(), Comm::describe_error(comm_->error()).c_str(),
-                Comm::describe_error(comm2_->error()).c_str());
+                kind, djob_.M, pjob_.T, waited, phase_[0].load(), phase_[1].load(), phase_[2].load(), phase_[3].load(),
+                Comm::describe_error(comm_->error()).c_str(), Comm::describe_error(comm2_->error()).c_str());
         }
     }
+    if (guards_enabled() && check_guards())
+        fail("guard check failed after a " +
+             std::string(job_ == Job::Prefill ? "prefill"
+                         : job_ == Job::Mtp   ? "mtp"
+                                              : "decode") +
+             " job (M=" + std::to_string(djob_.M) + ")");
     if (!error_.empty()) fail(error_);
     if (comm_->error()) fail("collective timed out: " + Comm::describe_error(comm_->error()));
     if (comm2_->error()) fail("collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error()));

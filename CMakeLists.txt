@@ -13,6 +13,7 @@ set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O3 -g")
 set(CMAKE_HIP_FLAGS_RELWITHDEBINFO "-O3 -g")
 
 option(QW_GPU "Build the GPU engine (needs ROCm)" ON)
+option(QW_DEVICE_CHECKS "Device-side bounds assertions in the kernels (debugging)" OFF)
 find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------- host libraries
@@ -86,10 +87,14 @@ set(QW_HIP_HOST_SOURCES
   src/capi/capi.cpp)
 set_source_files_properties(${QW_HIP_HOST_SOURCES} PROPERTIES LANGUAGE HIP)
 
-add_library(qw_gpu STATIC ${QW_HIP_SOURCES} src/engine/weight_convert.cpp src/session/session.cpp
+set_source_files_properties(src/engine/device_mem.cpp PROPERTIES LANGUAGE HIP)
+add_library(qw_gpu STATIC ${QW_HIP_SOURCES} src/engine/device_mem.cpp src/engine/weight_convert.cpp src/session/session.cpp
                           src/session/generate.cpp src/session/host_tier.cpp src/session/sampling.cpp)
 target_include_directories(qw_gpu PUBLIC src include)
 target_compile_options(qw_gpu PRIVATE -Wall)
+if(QW_DEVICE_CHECKS)
+  target_compile_definitions(qw_gpu PRIVATE QW_DEVICE_CHECKS)
+endif()
 target_link_libraries(qw_gpu PUBLIC qw_core roc::rocblas hip::host)
 
 # The engine as a shared library with a C API (include/qw/capi.h), for server/.
@@ -109,8 +114,9 @@ set_target_properties(qw_gpu_cli PROPERTIES OUTPUT_NAME qw_gpu)
 foreach(b p2p_bench gemm_bench uncached_bench)
   qw_gpu_program(${b} bench/${b}.hip)
 endforeach()
+qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)
 
-foreach(t test_comm test_batch_decode test_speculative test_host_tier)
+foreach(t test_comm test_batch_decode test_speculative test_host_tier test_moe test_gemv)
   qw_gpu_program(${t} tests/gpu/${t}.hip)
 endforeach()
 add_test(NAME comm COMMAND test_comm)

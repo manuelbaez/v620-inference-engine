@@ -55,6 +55,7 @@ void mtp_add(const float *out, int rows, float *X, hipStream_t s) {
 
 __global__ __launch_bounds__(256) void gather_rows_kernel(const float *const *src, int n, float *dst) {
     const float *p = src[blockIdx.x];
+    QW_DCHECK(p != nullptr);
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[size_t(blockIdx.x) * n + i] = p[i];
 }
 

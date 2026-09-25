@@ -361,6 +361,32 @@ collective that times out makes every later wait give up at once and the
 engine fails with the waiting rank, missing peer and collective offset; a
 dispatch watchdog logs the stuck job and each rank's phase every 60 s.
 
+## Open issue: multi-request speculative batches (2026-09-25)
+
+Speculative decoding of 3-4 requests at once (verification batches of 11-16
+rows) intermittently goes wrong: tokens that differ from plain decoding, GPU
+page faults (a data read past an allocation on one rank, or instruction
+fetch faults on all), or a stuck step. Serializing every kernel
+(`AMD_SERIALIZE_KERNEL=3`) makes it pass, so it is timing-dependent. Ruled out
+so far, each with a test that passes in isolation:
+
+- the per-pair expert kernels vs the tiled ones and an fp32 reference (`tests/gpu/test_moe`);
+- `gemv_rows` for every row count and model shape, with stray-write guards (`tests/gpu/test_gemv`);
+- the P2P collectives: 150k verified operations at the decode shapes, also
+  with up to ~1 ms random skew between ranks (`tests/gpu/stress_comm`);
+- out-of-bounds writes into any engine allocation: guard zones after every
+  allocation, checked after every job (`QW_GUARD=1`), never tripped;
+- data-derived indices: device-side assertions (`-DQW_DEVICE_CHECKS=ON`) never tripped;
+- graph replay (also fails without graphs), SDMA vs blit copies, the
+  concurrent-push threshold.
+
+Single-request speculative decoding, two requests together, and plain
+batched decoding at any size are reliable. Until the cause is found,
+verification batches are capped at 8 rows (`QW_SPEC_MAX_ROWS`): one or two
+requests draft 3 tokens, three or four draft 1. With the cap the failing case
+passed 5/5 (it failed ~6/8 without), and it is also faster at 4 concurrent
+requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
+
 ## Roadmap
 
 1. **Reference and spec.** Done: CPU fp32 reference (`src/ref`), validated against vLLM.

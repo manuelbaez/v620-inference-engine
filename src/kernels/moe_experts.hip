@@ -196,9 +196,11 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
     if (p >= offsets[EXP_L]) return;
     const int lane = threadIdx.x % WAVE, row = blockIdx.x * 8 + threadIdx.x / WAVE;
     const int e = pair_expert(offsets, p);
+    QW_DCHECK(offsets[EXP_L] <= 32 * TOP_K && e >= 0 && e < EXP_L && offsets[e] <= p && p < offsets[e + 1]);
     const size_t rbase = size_t(e) * FFN + row;
     const uint4 *g = gw + rbase * CH, *u = uw + rbase * CH;
     const __half *gsc = gs + rbase * (H / QGROUP), *usc = us + rbase * (H / QGROUP);
+    QW_DCHECK(pair_tok[p] >= 0 && pair_tok[p] < 32);
     const uint4 *x = bin + size_t(pair_tok[p]) * (H / 8);
     float ag = 0.f, au = 0.f;
     for (int c = lane; c < CH; c += WAVE) {
@@ -221,6 +223,7 @@ __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict
     if (p >= offsets[EXP_L]) return;
     const int lane = threadIdx.x % WAVE, row = blockIdx.x * 8 + threadIdx.x / WAVE;
     const int e = pair_expert(offsets, p);
+    QW_DCHECK(offsets[EXP_L] <= 32 * TOP_K && e >= 0 && e < EXP_L && offsets[e] <= p && p < offsets[e + 1]);
     const size_t rbase = size_t(e) * H + row;
     float acc = 0.f;
     if (lane < CH)

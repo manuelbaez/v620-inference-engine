@@ -10,6 +10,19 @@ namespace qw::gpu {
 
 constexpr int WAVE = 32;
 
+// Device-side assertions for debugging (cmake -DQW_DEVICE_CHECKS=ON): a failed
+// check traps, and the runtime's fault dump names the kernel.
+#ifdef QW_DEVICE_CHECKS
+#define QW_DCHECK(cond)                \
+    do {                               \
+        if (!(cond)) __builtin_trap(); \
+    } while (0)
+#else
+#define QW_DCHECK(cond) \
+    do {                \
+    } while (0)
+#endif
+
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
     for (int o = WAVE / 2; o > 0; o >>= 1) v += __shfl_xor(v, o, WAVE);

@@ -146,6 +146,7 @@ constexpr int ATT_PART = ATT_BLOCKS * QSA_LOCAL_HEADS * ATT_REC;                
 // partial record (m, l, acc[256]) per head.
 __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const int32_t *list, int n,
                                    float *partial) {
+    QW_DCHECK(n >= 0 && n <= LIST_W);
     constexpr int NH = QSA_LOCAL_HEADS;
     __shared__ float sh[8][NH][ATT_REC];
     const int lane = threadIdx.x % WAVE, w = threadIdx.x / WAVE;
@@ -169,6 +170,7 @@ __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *
     const int base = blockIdx.x * ATT_CHUNK;
     for (int i = base + w; i < min(n, base + ATT_CHUNK); i += 8) {
         const int tok = list[i];
+        QW_DCHECK(tok >= 0 && tok < (1 << 20));
         uint4 kv = K[size_t(tok) * (HEAD_DIM / 8) + lane];
         uint4 vv = V[size_t(tok) * (HEAD_DIM / 8) + lane];
         const __half *kh = reinterpret_cast<const __half *>(&kv);

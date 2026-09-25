@@ -121,7 +121,7 @@ void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const uint16_t *K, 
                                                             reinterpret_cast<const uint4 *>(K),
                                                             reinterpret_cast<const uint4 *>(V), lists, counts, partial);
     qsa_combine_T_kernel<<<dim3(Q, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, reinterpret_cast<const __half *>(gate),
-                                                reinterpret_cast<__half *>(out));
+                                                                       reinterpret_cast<__half *>(out));
 }
 
 // ---- batched decode rows
@@ -222,6 +222,7 @@ __global__ __launch_bounds__(256) void qsa_attend_B_kernel(const uint4 *q16, con
                                                            const int32_t *lists, const int32_t *counts,
                                                            float *partial) {
     const int r = blockIdx.y;
+    QW_DCHECK(rows.slot[r] >= 0 && rows.slot[r] < 8 && counts[r] <= rows.pos[r] + 1);
     const SlotPtrs &sp = tab[rows.slot[r]];
     attend_body(q16 + size_t(r) * QSA_LOCAL_HEADS * (HEAD_DIM / 8), reinterpret_cast<const uint4 *>(sp.K[qi]),
                 reinterpret_cast<const uint4 *>(sp.V[qi]), lists + size_t(r) * LIST_W, counts[r],
@@ -241,7 +242,8 @@ void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const
     qsa_select_B_kernel<<<rows.M, 1024, 0, s>>>(scores, ld, rows, lists, counts);
     qsa_attend_B_kernel<<<dim3(ATT_BLOCKS, rows.M), 256, 0, s>>>(reinterpret_cast<const uint4 *>(q16), tab, qi, rows,
                                                                  lists, counts, partial);
-    qsa_combine_B_kernel<<<dim3(rows.M, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, gate, reinterpret_cast<__half *>(out));
+    qsa_combine_B_kernel<<<dim3(rows.M, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, gate,
+                                                                            reinterpret_cast<__half *>(out));
 }
 
 }  // namespace qw::gpu
