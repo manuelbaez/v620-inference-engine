@@ -1,0 +1,13 @@
+build/
+*.o
+*.d
+*.gguf
+*.safetensors
+__pycache__/
+*.pyc
+*.log
+*.pid
+.cache/
+.vscode/
+.idea/
+compile_commands.json

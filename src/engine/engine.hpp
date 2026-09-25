@@ -1,0 +1,180 @@
+// The 4-GPU engine: TP4 dense layers, EP4 experts, residual stream sharded
+// along H (docs/DESIGN.md). One host thread per GPU enqueues its rank's work;
+// ranks meet only in the device-side collectives.
+//
+// The engine holds several sequences ("slots"), each with its own recurrent
+// state and KV region. Prefill runs one slot at a time in chunks. Decode runs
+// a batch of rows (up to 16): one token per slot for plain decoding, or several
+// consecutive tokens of one slot (speculative verification). Every row count
+// has its own captured HIP graph.
+#pragma once
+
+#include <array>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "core/ple.hpp"
+#include "core/safetensors.hpp"
+#include "engine/comm.hpp"
+
+namespace qw {
+
+struct EngineOptions {
+    std::string model_dir = "/mnt/llms/qwen3.8-flash-next-awq";
+    std::string ple_dir = "/mnt/llms/qwen3.8-flash-next-ple/ples_int4";
+    std::array<int, RANKS> devices{0, 1, 2, 3};
+    // KV capacity (tokens) of each sequence slot; multiples of 256.
+    std::vector<int> slot_tokens{131072, 65536, 32768, 32768};
+    int prefill_chunk = 8192; // tokens per prefill step (two micro-batches of half)
+    bool warmup = true;       // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
+    int load_threads = 12;    // host threads per rank for weight conversion
+    bool mtp = true;          // load the MTP head (speculative decoding drafts)
+};
+
+class Engine {
+public:
+    static constexpr int MAX_SLOTS = 8;
+    static constexpr int SNAPSHOTS = 8;
+
+    explicit Engine(const EngineOptions &opt);
+    ~Engine();
+
+    int num_slots() const { return int(slots_.size()); }
+    int64_t slot_capacity(int slot) const;
+    int64_t slot_len(int slot) const;
+    int max_slot_tokens() const;
+    // Empties a slot (its state is zeroed lazily by the next prefill/decode).
+    void slot_reset(int slot);
+
+    // Appends tokens to a slot (chunked). Returns the logits after the last one;
+    // with all_logits, also the logits after every token ([n][VOCAB]).
+    const std::vector<float> &prefill(int slot, const std::vector<int32_t> &tokens,
+                                      std::vector<float> *all_logits = nullptr,
+                                      const std::function<void(int64_t)> &after_chunk = nullptr);
+
+    struct Row {
+        int slot;
+        int32_t token;
+    };
+    // One batched step: each row appends its token to its slot. Rows of a slot
+    // must be consecutive. Returns logits [rows][VOCAB].
+    const std::vector<float> &decode(const std::vector<Row> &rows);
+
+    // Logits of the last prefill (or single-slot step).
+    const std::vector<float> &logits() const { return logits_; }
+    // Logits of the last decode, [rows][VOCAB].
+    const std::vector<float> &logits_rows() const { return dlogits_; }
+    // log-sum-exp of each row of the last decode (computed on the GPUs)
+    const std::vector<float> &logits_rows_lse() const { return dlse_; }
+    void set_logits(const std::vector<float> &l) { logits_ = l; }
+
+    // ---- MTP speculative decoding
+    bool has_mtp() const { return mtp_; }
+    // Keeps the first n rows of `slot`'s run in the last decode (1 <= n <= run
+    // length) and drops the rest: the slot's length, n-gram context and
+    // recurrent state go back to right after row n-1.
+    void accept(int slot, int n);
+    // Drafts k tokens per request with the MTP head. The MTP layer runs over
+    // the slot's newest committed tokens whose MTP rows have not run yet:
+    // next.size() of them (1 after a prefill or a plain decode step, the kept
+    // count after accept()), with next[i] the token that follows the i-th (the
+    // last one is the pending token, not decoded yet). Requests' slots must be
+    // distinct. Returns [requests][k].
+    struct DraftReq {
+        int slot;
+        std::vector<int32_t> next;
+    };
+    const std::vector<std::vector<int32_t>> &draft(const std::vector<DraftReq> &reqs, int k);
+
+    // Recurrent-state snapshots (GDN state and conv tails, PLE conv tail) in a
+    // VRAM pool. KV is position-indexed and needs no copy: restoring a slot to
+    // n tokens is valid while its positions < n were not overwritten since the
+    // save (the caller enforces that).
+    void snapshot_save(int snap, int slot);
+    void snapshot_restore(int snap, int slot, int64_t n, const std::vector<int32_t> &tail);
+
+    // Single-sequence convenience API on slot 0 (tools, tests).
+    void reset();
+    const std::vector<float> &prefill(const std::vector<int32_t> &tokens, std::vector<float> *all_logits = nullptr,
+                                      const std::function<void(int64_t)> &after_chunk = nullptr) {
+        return prefill(0, tokens, all_logits, after_chunk);
+    }
+    const std::vector<float> &step(int32_t token);
+    int64_t position() const;
+    int64_t max_tokens() const { return slot_capacity(0); }
+
+private:
+    struct Rank;
+    void rank_loop(int r);
+    void run_prefill_rank(Rank &rk);
+    void run_decode_rank(Rank &rk);
+    void run_mtp_rank(Rank &rk);
+    uint32_t record_batch(Rank &rk, int M, int kind);
+    void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos);
+    void dispatch();  // run the current job on every rank and wait
+
+    EngineOptions opt_;
+    SafeTensors st_;
+    std::unique_ptr<PleTable> ple_;
+    NgramHasher hasher_;
+    std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch
+    std::vector<std::unique_ptr<Rank>> ranks_;
+    std::vector<std::thread> threads_;
+
+    struct SlotHost {
+        int64_t len = 0;
+        std::vector<int32_t> hist;  // last tokens (n-gram context uses two; more kept for accept())
+        bool reset = true;          // device state must be zeroed before use
+        int run_first = -1;         // the slot's rows in the last decode batch (MTP inputs), or -1
+        int run_len = 0;
+        bool pend_valid = false;    // the device MTP input store holds the hidden of token len-1
+    };
+    std::vector<SlotHost> slots_;
+
+    bool mtp_ = false;
+    // current jobs (host side, read by every rank thread)
+    enum class Job { Prefill, Decode, Mtp } job_ = Job::Decode;
+    struct PrefillJob {
+        int64_t start = 0;
+        int T = 0;
+        bool all_logits = false;
+        int slot = 0;
+        bool reset = false;
+        bool mtp_pend = false;  // the MTP pass may start one row early, from the slot's MTP input store
+    } pjob_;
+    std::vector<float> pemb_;     // [T][H]
+    std::vector<uint16_t> pple_;  // [T][H] fp16
+    std::vector<float> plogits_;  // [T][VOCAB] when all_logits
+    struct DecodeJob {
+        int M = 0;
+        std::vector<int32_t> i32;  // [5][MAX_ROWS]: row_slot, row_first, run_start, run_len, run_slot
+        std::vector<int64_t> pos;  // [MAX_ROWS]
+        std::vector<int> reset_slots;
+        bool save = false;  // keep per-row GDN states (for accept())
+        // MTP job: per row, the hidden source: >= 0 a row of the batch hidden, < 0 the MTP
+        // input store of slot -1 - src
+        std::vector<int> src;
+    } djob_;
+    std::vector<float> demb_;     // [M][H]
+    std::vector<uint16_t> dple_;  // [M][H] fp16
+    std::vector<float> dlogits_;  // [M][VOCAB]
+    std::vector<float> dlse_;     // [M]
+    std::vector<float> dlse_parts_ = std::vector<float>(RANKS * 16 * 2);  // [rank][MAX_ROWS][max, sumexp]
+    std::vector<float> damax_parts_ = std::vector<float>(RANKS * 16 * 2);  // [rank][MAX_ROWS][max, index bits]
+    std::vector<std::vector<int32_t>> drafts_;
+    std::vector<float> logits_;
+
+    std::mutex mu_;
+    std::condition_variable cv_, done_cv_;
+    uint64_t gen_ = 0;
+    int done_ = 0;
+    bool stop_ = false;
+    std::string error_;
+};
+
+}  // namespace qw
