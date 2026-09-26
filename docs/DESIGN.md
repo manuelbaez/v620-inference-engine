@@ -501,7 +501,14 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] GPU-side sampling (temperature via Gumbel-max per vocab shard; top-k/top-p need more)
    - [x] prefill profiled: collective-bound; flat pushes +4-10%
    - [x] scheduling A: prefill in pieces interleaved with decode (see "Interleaved prefill")
-   - [ ] scheduling B: batch several waiting prompts into one prefill (short-prompt bursts)
+   - [ ] batched prefill: several waiting prompts in one prefill pass (pays the ~90 ms fixed cost
+         once; measured upside on 16 x 300-token bursts ~109 -> ~123 tok/s, +13%; multi-sequence
+         prefill kernels needed)
+   - [x] more drafts per request with 4 concurrent (QW_SPEC_MAX_ROWS=16): no gain at temperature
+         0.7 (1.83 -> 2.35 tokens per request-step but 33.6 -> 41.7 ms per step), so the 8-row cap
+         stays and its bug is not worth chasing for throughput
+   - [ ] int8 dense weights with GPTQ (error-compensating quantization from calibration Hessians):
+         same +16% decode as round-to-nearest, aiming at fp16 accuracy
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
