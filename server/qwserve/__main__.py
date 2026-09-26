@@ -21,7 +21,8 @@ def main():
     ap.add_argument("--slots", default=os.environ.get("QW_SLOTS", "262144,65536,32768,32768"),
                     help="KV capacity (tokens) of each sequence slot, comma-separated; one slot per concurrent "
                          "request (env QW_SLOTS)")
-    ap.add_argument("--prefill-chunk", type=int, default=8192)
+    ap.add_argument("--prefill-chunk", type=int, default=int(os.environ.get("QW_PREFILL_CHUNK", "8192")),
+                    help="tokens per prefill pass; its buffers take VRAM in proportion (env QW_PREFILL_CHUNK)")
     ap.add_argument("--mtp", type=int, default=3, help="MTP draft tokens per step (0: no speculative decoding)")
     ap.add_argument("--host-cache-gb", type=float, default=128,
                     help="pinned host RAM for conversations evicted from their slot (0: off)")
