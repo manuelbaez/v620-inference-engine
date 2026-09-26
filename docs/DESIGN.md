@@ -492,7 +492,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 9. **Performance, next** (details and estimates in "Next steps" below):
    - [~] int8 dense weights: built (+16% decode), fails the quality gate; opt-in `QW_INT8_DENSE=1`
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
-   - [ ] fewer, bigger decode kernels (fuse each sublayer's glue)
+   - [x] fewer, bigger decode kernels: tried (SwiGLU into down GEMV, ring into scan, shared-expert graph branch), no gain; see Next steps 1
    - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
    - [ ] MTP drafting inside one graph (device-side argmax and embedding)
    - [x] MTP off while acceptance stays low, with a catch-up pass on resume
@@ -591,6 +591,14 @@ launches and collectives, in this order of expected payoff:
    step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
    against the fp32 reference (`qw_gpu --logprobs`) must stay near today's
    0.074 (fp16), and greedy output should match on the test prompts.
+   Kernel fusion (item 3) was tried on the two safe candidates and measured
+   against the separate kernels, three alternating runs each, output
+   bit-identical: the shared expert's SwiGLU inside its down projection
+   (recomputed in every output row's wave: no gain at M = 1, slower from
+   M = 4) and the GDN conv-ring update inside the scan (M = 1 within noise,
+   M = 4 22.0 vs 21.4 ms: the scan is on the critical path). The ~3.3 µs per
+   launch is not simply additive: moving work into a critical kernel costs
+   about what the launch saved. Neither was kept.
    Parallel graph branches do not help either: forking the shared expert
    onto a second stream inside the decode graph (it is independent of the
    routed experts) made the step 14.6 -> 16.4 ms; cross-stream graph edges
