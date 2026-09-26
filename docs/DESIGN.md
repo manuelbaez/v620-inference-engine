@@ -494,11 +494,28 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [x] fewer, bigger decode kernels: tried (SwiGLU into down GEMV, ring into scan, shared-expert graph branch), no gain; see Next steps 1
    - [x] one collective fewer per sublayer: not possible with this layout (see Next steps 9)
-   - [ ] MTP drafting inside one graph (device-side argmax and embedding)
+   - [x] MTP drafting without host round trips: a draft's steps are enqueued back to back, the
+         drafted tokens picked on the GPUs (argmax parts all-gathered, `draft_pick`) and their
+         embeddings read from the pinned, mapped embedding table (no VRAM); the collectives'
+         sequence base advances on the device (`Comm::bump_base`). Same drafts; measured host
+         round trip before: 0.27 ms of a 1.63 ms step. Speculative decoding 87 -> 91 and 115 -> 120
+         tok/s on the test prompts
+   - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
+         all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
+         a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop
+         slightly, so it needs measuring
    - [x] MTP off while acceptance stays low, with a catch-up pass on resume
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [x] host sampling: one pass + parallel rows (16 -> 3 ms per 4-request step, +25% aggregate)
-   - [ ] GPU-side sampling (temperature via Gumbel-max per vocab shard; top-k/top-p need more)
+   - [x] GPU-side sampling (`kernels/sampling.hpp`, `QW_GPU_SAMPLING=0` for the host sampler):
+         penalties from per-slot token counts on the GPUs, then per vocab shard the max,
+         normalizer, top 256 candidates and a Gumbel-max draw; the host draws exactly as the CPU
+         sampler from those (same tokens for the same seed with top-k/top-p/min-p, checked in
+         `tests/gpu/test_sampling`), and fetches a row's full logits only when a nucleus reaches
+         past the candidates (1 row in ~10k in real text, only at temperature 1, top-p 0.95).
+         With the chained drafts, through the server (400-token replies, T 0.7 / top-p 0.8 /
+         top-k 20): 1 stream 93-96 -> 107-112 tok/s, 4 streams 195 -> 231, 8 streams 180-198 ->
+         210; temperature alone 217 -> 230 (4 streams); presence penalty 1.5 191 -> 225
    - [x] prefill profiled: collective-bound; flat pushes +4-10%
    - [x] scheduling A: prefill in pieces interleaved with decode (see "Interleaved prefill")
    - [x] batched prefill: several waiting prompts in one prefill pass (`Engine::prefill_batch`:
