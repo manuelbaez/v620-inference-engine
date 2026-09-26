@@ -91,9 +91,12 @@ def main():
     ap.add_argument("--hessians", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--group", type=int, default=32, help="scale group along K; the engine's QW_I8_GROUP")
     ap.add_argument("--rank", default=None, help="only this rank (r0..r3), e.g. one process per GPU")
     args = ap.parse_args()
     dev = args.device
+    global GROUP
+    GROUP = args.group
     for rdir in sorted(glob.glob(os.path.join(args.weights, "r*"))):
         r = os.path.basename(rdir)
         if args.rank and r != args.rank:

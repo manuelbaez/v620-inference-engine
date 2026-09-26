@@ -15,7 +15,10 @@ void gemv_rows(const uint16_t *W, const uint16_t *x, int xs, float *y, int ys, i
 // The same with int8 weights W8 [N][K] and a scale per group of I8_GROUP
 // along K: W[n][k] = W8[n][k] * scale[n][k / I8_GROUP]. Half the bytes of fp16
 // (decode GEMVs are bandwidth-bound).
-constexpr int I8_GROUP = 32;
+#ifndef QW_I8_GROUP
+#define QW_I8_GROUP 32  // 16 or 32 (a multiple of the kernel's 16-weight chunks)
+#endif
+constexpr int I8_GROUP = QW_I8_GROUP;
 void gemv_rows_i8(const int8_t *W8, const float *scale, const uint16_t *x, int xs, float *y, int ys, int N, int K, int M,
                   int rpg, bool accumulate, hipStream_t s);
 
