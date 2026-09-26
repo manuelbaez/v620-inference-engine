@@ -206,7 +206,9 @@ class Server:
             tail = parser.finish()
             if stream and tail:
                 await resp.write(b"data: " + json.dumps(chunk(tail)).encode() + b"\n\n")
-        except (ConnectionResetError, asyncio.CancelledError):
+        except ConnectionResetError:  # the client went away (e.g. an agent cancelled): nothing to answer
+            return resp
+        except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             if stream:
