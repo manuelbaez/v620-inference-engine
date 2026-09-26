@@ -1,5 +1,6 @@
 """Continuous batching over the engine's sequence slots."""
 
+import os
 import sys
 import threading
 import time
@@ -34,6 +35,7 @@ class Request:
         self.generated = 0
         self.next = None    # sampled token not yet fed to the engine
         self.cached = 0     # prompt tokens reused from the prefix cache
+        self.keep = None    # buffers the engine reads while the prompt is prefilled
         self.t_admit = self.t_first = None  # prefill start, first token (time.time())
 
     def timings(self):
@@ -58,10 +60,16 @@ class Request:
 
 class Scheduler:
     """Continuous batching on one thread: admits queued requests into free
-    slots (prefill + first token), then advances every active request by one
-    token per batched engine step."""
+    slots, prefills them, then advances every active request by one token per
+    batched engine step. While requests are decoding, prefills advance one
+    piece (QW_PREFILL_PIECE tokens, default 2048) at a time, and between pieces
+    the running requests decode for QW_DECODE_SHARE (default 0.25) of the
+    piece's time (at least one step): a long prompt never stalls the others for
+    more than one piece, and they keep a share of the GPUs while it goes in."""
 
     DEFAULT_RESERVE = 2048  # room reserved when the request sets no max_tokens
+    PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
+    DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
 
     def __init__(self, engine, mtp_drafts=3):
         self.e = engine
@@ -71,6 +79,7 @@ class Scheduler:
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
+        self.prefilling = []  # in a slot, prompt partly prefilled
         self.active = []
         self.stopping = False
         self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
@@ -82,7 +91,7 @@ class Scheduler:
             self.stopping = True
             self.cv.notify_all()
         self.thread.join(timeout)
-        for r in self.waiting + self.active + self.queue:
+        for r in self.waiting + self.prefilling + self.active + self.queue:
             r.emit("error", "server shutting down")
 
     def submit(self, req):
@@ -135,19 +144,47 @@ class Scheduler:
                 r.limit = min(r.max_new, room) if r.max_new else room
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
                 r.t_admit = time.time()
-                cached = self.e.set_prompt(slot, r.prompt, r.media)
-                r.cached = cached
+                r.cached, r.keep = self.e.begin_prompt(slot, r.prompt, r.media)
                 self.cache_stats = self.e.cache_stats()
-                r.emit("start", cached)
-                top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
-                tid, lp = self.e.sample_prompt(slot, r.sampling)
-                r.t_first = time.time()
+                r.emit("start", r.cached)
             except Exception as ex:  # noqa: BLE001
+                r.emit("error", str(ex))
+                self._finish(r, "abort")
+                continue
+            self.prefilling.append(r)
+
+    def _prefill(self):
+        """Advances the oldest prefill: by one piece while others decode (then
+        returns so they get steps), to the end when nothing is decoding.
+        Returns the seconds spent."""
+        t0 = time.time()
+        while self.prefilling:
+            r = self.prefilling[0]
+            if r.cancelled.is_set():
+                self.prefilling.pop(0)
+                self._finish(r, "abort")
+                continue
+            try:
+                done = self.e.prefill_some(r.slot, self.PREFILL_PIECE if self.active else 1 << 40)
+                if not done:
+                    return time.time() - t0
+                self.prefilling.pop(0)
+                self.cache_stats = self.e.cache_stats()
+                top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
+                tid, lp = self.e.sample_prompt(r.slot, r.sampling)
+                r.t_first = time.time()
+                r.keep = None
+            except Exception as ex:  # noqa: BLE001
+                if self.prefilling and self.prefilling[0] is r:
+                    self.prefilling.pop(0)
                 r.emit("error", str(ex))
                 self._finish(r, "abort")
                 continue
             if self._took(r, tid, lp, top):
                 self.active.append(r)
+            if self.active:
+                return time.time() - t0  # let the running requests take steps before the next prefill
+        return time.time() - t0
 
     def _step(self):
         for r in [r for r in self.active if r.cancelled.is_set()]:
@@ -174,7 +211,8 @@ class Scheduler:
     def _loop(self):
         while True:
             with self.cv:
-                while not self.queue and not self.waiting and not self.active and not self.stopping:
+                while (not self.queue and not self.waiting and not self.prefilling and not self.active
+                       and not self.stopping):
                     self.cv.wait()
                 if self.stopping:
                     return
@@ -182,13 +220,18 @@ class Scheduler:
                 self.queue = []
             try:
                 self._admit()
+                spent = self._prefill()
+                t0 = time.time()
                 self._step()
+                while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
+                    self._step()
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
                 print(f"scheduler error: {ex}", file=sys.stderr, flush=True)
-                for r in self.active:
+                for r in self.prefilling + self.active:
                     r.emit("error", str(ex))
                     try:
                         self._finish(r, "abort")
                     except Exception:  # noqa: BLE001
                         pass
+                self.prefilling = []
                 self.active = []

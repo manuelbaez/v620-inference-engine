@@ -132,6 +132,19 @@ int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64
         int64_t(-1));
 }
 
+int64_t qw_begin_prompt(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media, int n_media) {
+    return guarded(
+        h,
+        [&] {
+            return h->session->begin_prompt(slot, std::vector<int32_t>(tokens, tokens + n), media_of(media, n_media));
+        },
+        int64_t(-1));
+}
+
+int qw_prefill_some(qw_handle *h, int slot, int64_t max_tokens) {
+    return guarded(h, [&] { return h->session->prefill_some(slot, max_tokens) ? 1 : 0; }, -1);
+}
+
 int qw_acquire_media(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new, const qw_media *media,
                      int n_media) {
     return guarded(

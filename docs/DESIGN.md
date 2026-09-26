@@ -499,7 +499,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
    - [x] prefill profiled: collective-bound; flat pushes +4-10%
-   - [ ] scheduling: batch waiting prompts into one prefill, interleave prefill chunks with decode steps
+   - [x] scheduling A: prefill in pieces interleaved with decode (see "Interleaved prefill")
+   - [ ] scheduling B: batch several waiting prompts into one prefill (short-prompt bursts)
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
@@ -561,6 +562,29 @@ more time in all-reduces than in compute).
 Measured through the server: OCR of rendered text, shapes/colors/layout, and
 a question about one line of a 1080p code screenshot all answered correctly;
 two different images at the same prompt position never share cached state.
+
+## Interleaved prefill (2026-09-26)
+
+A new request's prefill used to run to the end before anything else decoded,
+so a long prompt froze every running stream (12.4 s for a 30k-token prompt).
+`Session::begin_prompt` restores what the caches hold and `prefill_some`
+prefills the rest in pieces; the scheduler advances the oldest prefill by one
+piece (`QW_PREFILL_PIECE`, 2048 tokens) and then lets the running requests
+decode for `QW_DECODE_SHARE` (0.25) of the piece's time. With nothing
+decoding, a prompt still goes in whole. Snapshots reach the block store at
+the same points as before (chunk ends, message boundaries, the prompt end),
+not at every piece. Two streams decoding while a 30k-token prompt arrives:
+
+| decode share | longest stall | their speed meanwhile | the prompt's TTFT |
+|---|---|---|---|
+| (before: whole prefill) | 12.4 s | 0 | 12.5 s |
+| 0 (one step per piece) | 1.15 s | 3.7 tok/s | 13.8 s |
+| 0.25 (default) | 1.15 s | 17 tok/s | 16.6 s |
+| 1.0 | 1.15 s | 25.7 tok/s | 20.3 s |
+
+Bursts of short prompts are unchanged (8 concurrent 300-token prompts: 92
+tok/s aggregate either way): each still pays the ~80 ms of collectives that
+make a prefill; batching several prompts into one prefill is the fix for that.
 
 ## Next steps: where the time goes (profiled 2026-09-25)
 

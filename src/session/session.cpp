@@ -97,9 +97,39 @@ void Session::release(int slot) {
     si.busy = false;
     si.stop.clear();
     si.drafts_for = -1;
+    si.pending.clear();  // an unfinished prefill: the slot keeps what went in
+    si.pending_media.clear();
 }
 
 int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
+    const int64_t reused = begin_keys(slot, prompt);
+    prefill_some(slot, INT64_MAX);
+    return reused;
+}
+
+bool Session::prefill_some(int slot, int64_t max_tokens) {
+    SlotInfo &si = slots_[size_t(slot)];
+    if (si.pending.empty()) return true;
+    const int64_t from = int64_t(si.hist.size()), n = int64_t(si.pending.size());
+    media_ = si.pending_media.empty() ? nullptr : &si.pending_media;
+    try {
+        prefill_range(slot, si.pending, max_tokens >= n - from ? n : from + std::max<int64_t>(1, max_tokens));
+    } catch (...) {
+        media_ = nullptr;
+        throw;
+    }
+    media_ = nullptr;
+    if (int64_t(si.hist.size()) < n) return false;
+    si.prompt_end = n;
+    si.pending.clear();
+    si.pending_media.clear();
+    single_ = false;
+    return true;
+}
+
+// Restores what the slot, its snapshots or the block store hold of `prompt`
+// and leaves the rest pending for prefill_some. Returns the reused tokens.
+int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
     QW_CHECK(!prompt.empty(), "empty prompt");
     QW_CHECK(int64_t(prompt.size()) <= e_.slot_capacity(slot), "prompt longer than the slot's KV capacity");
     SlotInfo &si = slots_[size_t(slot)];
@@ -118,8 +148,9 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
     si.plain_len = 32;
 
     // the block store, when it holds more of the prompt than this slot can
+    si.pending.clear();
     if (restore_from_store(slot, prompt, reusable(slot, prompt), common) && common == prompt.size()) {
-        slots_[size_t(slot)].prompt_end = int64_t(common);
+        si.prompt_end = int64_t(common);
         single_ = false;
         count_reuse(prompt, int64_t(common));
         return int64_t(common);
@@ -183,9 +214,12 @@ int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt) {
         }
     }
 
-    if (prompt.size() > hist.size()) prefill_rest(slot, prompt);
-    slots_[size_t(slot)].prompt_end = int64_t(hist.size());
-    single_ = false;
+    if (prompt.size() > hist.size()) {
+        si.pending = prompt;  // prefilled by prefill_some
+    } else {
+        si.prompt_end = int64_t(hist.size());
+        single_ = false;
+    }
     count_reuse(prompt, reused);
     return reused;
 }

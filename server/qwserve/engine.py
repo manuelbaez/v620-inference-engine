@@ -63,6 +63,9 @@ class Engine:
             "qw_set_prompt_media": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
                                                       ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_has_vision": (ctypes.c_int, [P]),
+            "qw_begin_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
+                                                 ctypes.POINTER(MediaStruct), ctypes.c_int]),
+            "qw_prefill_some": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int64]),
             "qw_acquire_media": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64,
                                                  ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_sample_prompt": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
@@ -134,6 +137,18 @@ class Engine:
             return self._check(self.lib.qw_set_prompt(self.h, slot, arr, len(tokens)))
         arr_m, keep = self._media_array(media)
         return self._check(self.lib.qw_set_prompt_media(self.h, slot, arr, len(tokens), arr_m, len(media)))
+
+    def begin_prompt(self, slot, tokens, media=None):
+        """Restores what the caches hold of the prompt; returns (reused tokens, buffers to keep
+        alive until prefill_some has put the rest in)."""
+        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr_m, keep = self._media_array(media or [])
+        reused = self._check(self.lib.qw_begin_prompt(self.h, slot, arr, len(tokens), arr_m, len(media or [])))
+        return reused, keep  # keep: buffers the C side reads until the prompt is in
+
+    def prefill_some(self, slot, max_tokens):
+        """Prefills up to max_tokens more of the slot's prompt; True once it is all in."""
+        return bool(self._check(self.lib.qw_prefill_some(self.h, slot, max_tokens)))
 
     def sample_prompt(self, slot, s):
         lp = ctypes.c_float()

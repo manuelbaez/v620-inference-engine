@@ -74,6 +74,12 @@ int qw_has_vision(qw_handle *h);
  * tokens that are not already cached. */
 int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media,
                             int n_media);
+/* qw_set_prompt in pieces, so other slots can decode between them: begin
+ * restores what the caches hold and returns the reused tokens (media must stay
+ * valid until the prompt is in); prefill_some prefills up to max_tokens more
+ * and returns 1 once the whole prompt is in, 0 while some is left. */
+int64_t qw_begin_prompt(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media, int n_media);
+int qw_prefill_some(qw_handle *h, int slot, int64_t max_tokens);
 /* Samples the token after the prompt of the last qw_set_prompt. */
 int32_t qw_sample_prompt(qw_handle *h, int slot, const qw_sampling *p, float *lp);
 

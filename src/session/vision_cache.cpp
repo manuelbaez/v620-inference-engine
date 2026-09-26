@@ -104,16 +104,15 @@ std::vector<Engine::EmbedSpan> Session::vision_embeds(int64_t from) {
 }
 
 int64_t Session::set_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media) {
-    if (media.empty()) return set_prompt(slot, prompt);
-    media_ = &media;
-    try {
-        const int64_t r = set_prompt(slot, media_keys(prompt, media));
-        media_ = nullptr;
-        return r;
-    } catch (...) {
-        media_ = nullptr;
-        throw;
-    }
+    const int64_t reused = begin_prompt(slot, prompt, media);
+    prefill_some(slot, INT64_MAX);
+    return reused;
+}
+
+int64_t Session::begin_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media) {
+    const int64_t reused = begin_keys(slot, media.empty() ? prompt : media_keys(prompt, media));
+    slots_[size_t(slot)].pending_media = slots_[size_t(slot)].pending.empty() ? std::vector<Media>{} : media;
+    return reused;
 }
 
 }  // namespace qw

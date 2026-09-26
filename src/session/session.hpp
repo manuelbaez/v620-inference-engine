@@ -58,6 +58,14 @@ public:
         std::vector<int64_t> starts;  // first token of each slice (h*w/4 tokens each)
     };
     int64_t set_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media);
+
+    // set_prompt in resumable form, so other slots can decode between pieces
+    // of a long prefill: begin_prompt restores what the caches hold and returns
+    // the reused tokens (media must stay valid until the prompt is in);
+    // prefill_some prefills up to max_tokens more and returns true once the
+    // whole prompt is in (logits for sample_prompt ready).
+    int64_t begin_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media = {});
+    bool prefill_some(int slot, int64_t max_tokens);
     int acquire(const std::vector<int32_t> &prompt, int64_t max_new, const std::vector<Media> &media) {
         return acquire(media.empty() ? prompt : media_keys(prompt, media), max_new);
     }
@@ -136,13 +144,16 @@ private:
         // plain decoding while drafting does not pay (MTP off): steps left, the
         // next plain stretch's length, and decoded tokens whose MTP rows are missing
         int plain_left = 0, plain_len = 32, mtp_lag = 0;
+        std::vector<int32_t> pending;  // prompt being prefilled (begin_prompt .. prefill_some)
+        std::vector<Media> pending_media;
     };
     // prefix cache (prefix_cache.cpp)
     bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
     // Snapshot points inside the prefill of prompt[from..): message boundaries
     // at least min_gap_ apart, at most Engine::MAX_CAPTURES per prefill chunk.
-    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from);
-    void prefill_rest(int slot, const std::vector<int32_t> &prompt);
+    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to);
+    void prefill_range(int slot, const std::vector<int32_t> &prompt, int64_t to);  // [hist.size(), to)
+    int64_t begin_keys(int slot, const std::vector<int32_t> &prompt);
     int save_snapshot(int slot);  // returns the VRAM snapshot index
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     // vision (vision_cache.cpp): the prompt with its media tokens as content-derived ids, and the

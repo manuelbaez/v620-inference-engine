@@ -30,10 +30,10 @@ bool Session::restore_from_store(int slot, const std::vector<int32_t> &prompt, s
     return true;
 }
 
-std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from) {
+std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to) {
     std::vector<Engine::Capture> caps;
     if (!store_ || boundary_ < 0) return caps;
-    const int64_t chunk = e_.prefill_chunk(), n = int64_t(prompt.size());
+    const int64_t chunk = e_.prefill_chunk(), n = to;
     // chunk k of this prefill covers positions (from + k * chunk, from + (k + 1) * chunk]
     std::vector<std::vector<int64_t>> per_chunk(size_t((n - from + chunk - 1) / chunk));
     for (int64_t p = from + 1, last = from; p < n; ++p) {
@@ -66,16 +66,16 @@ std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &
     return caps;
 }
 
-// Prefills prompt[hist.size()..) into the slot, snapshotting at chunk ends
+// Prefills prompt[hist.size(), to) into the slot, snapshotting at chunk ends
 // and at the planned captures, and saving those to the block store.
-void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
+void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_t to) {
     auto &hist = slots_[size_t(slot)].hist;
     const int64_t from = int64_t(hist.size());
-    const std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(from), prompt.end());
+    const std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(from), prompt.begin() + ptrdiff_t(to));
     drop_snapshots_after(slot, from);
-    const auto caps = plan_captures(prompt, from);
+    const auto caps = plan_captures(prompt, from, to);
     if (store_) {  // pin the saves' memory while the GPUs prefill
-        const size_t n = prompt.size(), chunks = size_t((int64_t(n) - from + e_.prefill_chunk() - 1) / e_.prefill_chunk());
+        const size_t n = size_t(to), chunks = size_t((int64_t(n) - from + e_.prefill_chunk() - 1) / e_.prefill_chunk());
         store_->reserve((n - size_t(from)) / BlockStore::BLOCK + 2 * (caps.size() + chunks), caps.size() + chunks);
     }
     const auto embeds = vision_embeds(from);
@@ -88,7 +88,9 @@ void Session::prefill_rest(int slot, const std::vector<int32_t> &prompt) {
                              std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(caps[next].pos)), nullptr);
             hist.insert(hist.end(), prompt.begin() + ptrdiff_t(hist.size()), prompt.begin() + ptrdiff_t(pos));
             const int idx = save_snapshot(slot);
-            if (store_ && pos >= min_gap_) store_->save(slot, idx, hist, &snaps_[size_t(idx)].logits);
+            // to the store at the prompt's end and every prefill chunk, not at every piece
+            const bool keep = pos == int64_t(prompt.size()) || pos % e_.prefill_chunk() == 0;
+            if (store_ && keep && pos >= min_gap_) store_->save(slot, idx, hist, &snaps_[size_t(idx)].logits);
         },
         caps, embeds);
     reserved_.clear();
