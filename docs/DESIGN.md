@@ -507,8 +507,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [x] more drafts per request with 4 concurrent (QW_SPEC_MAX_ROWS=16): no gain at temperature
          0.7 (1.83 -> 2.35 tokens per request-step but 33.6 -> 41.7 ms per step), so the 8-row cap
          stays and its bug is not worth chasing for throughput
-   - [ ] int8 dense weights with GPTQ (error-compensating quantization from calibration Hessians):
-         same +16% decode as round-to-nearest, aiming at fp16 accuracy
+   - [x] int8 dense weights with GPTQ: built and measured (item 1 below); does not reach fp16
+         accuracy even with group-16 scales, and the decode gain is small (+13% at M = 1, 0% at
+         M = 8), so int8 stays off
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
@@ -618,7 +619,35 @@ launches and collectives, in this order of expected payoff:
    reference over 500 tokens (teacher-forced decode) mean |dlogprob| goes
    0.094 -> 0.127 and top-1 agreement 95.4% -> 92.6% (per-row scales were
    worse: 0.161 against fp16). Every weight group contributes (bisected with
-   `QW_INT8_SKIP`), so it stays opt-in: a speed/accuracy choice. Original
+   `QW_INT8_SKIP`), so it stays opt-in: a speed/accuracy choice.
+   **GPTQ (2026-09-26).** Calibration Hessians H = XᵀX of every int8 matrix's
+   input from 203k tokens of code, docs and chat text (`tools/gptq_calib_data.py`,
+   `tools/qw_calibrate`, per-stream Hessians for the HC down rows), then GPTQ
+   (`tools/gptq_int8.py`: block 128, damp 0.01) into `.q8` sidecars the engine
+   loads from `QW_INT8_DIR`. Per-matrix output error on the calibration inputs
+   falls 1.5-18x, but the model-level gain is modest. Measured on a held-out
+   4,000-token set (DESIGN.md, Python code, license text) against the fp32
+   reference, paired bootstrap over tokens:
+
+   | variant | mean \|dlogprob\| | top-1 | vs fp16 (95% CI) |
+   |---|---|---|---|
+   | fp16 | 0.042 | 98.0% | |
+   | GPTQ int8, group 32 | 0.054 | 97.1% | +0.012 (+0.009, +0.016) |
+   | GPTQ int8, lm_head + PLE only | 0.048 | 97.1% | +0.006 (+0.003, +0.010) |
+   | GPTQ int8, group 16 (first 1,594 tokens) | | | +0.018 (+0.010, +0.026); group 32 there: +0.029 |
+
+   Per group (group 32, 500 tokens), every dense group alone costs about as much
+   as all of them together (GDN alone +0.023, all +0.022): the errors do not add,
+   the recurrent state turns any weight error into about the same divergence, so
+   no subset of fp16 groups closes the gap. Treating the errors as independent,
+   group-16 int8 adds a perturbation about 60% the size of fp16 arithmetic's own;
+   matching fp16 would need several times less weight error than 8 bits give.
+   The speed is also smaller than first measured: `test_batch_decode` 14.69 ->
+   12.99 ms/step at M = 1 (+13%), 21.4 -> 20.0 at M = 4 (+7%), 26.9 -> 26.9 at
+   M = 8; int8 lm_head alone gains nothing. Kept as tooling (`QW_I8_GROUP` build
+   option for the scale group), off by default. (The group-16 build with every
+   group int8 also stalled under HIP graphs, ~0.9 s per step, fine with
+   `QW_NOGRAPH=1`; not chased since group 16 is not used.) Original
    note: Dense fp16 weights are 88% of the bytes
    read per token. Per-channel int8 copies halve the GEMV time (~-2.4 ms per
    step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
