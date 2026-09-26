@@ -105,10 +105,11 @@ __global__ __launch_bounds__(64) void rope2d_kernel(uint16_t *qkv, const int32_t
 // consecutive keys (the output update is 36 dot2 per key too). All lanes of a
 // wave read the same LDS words (broadcast), 16 bytes at a time. Online softmax
 // per group of ATT_GROUP keys, fp32 accumulation.
-constexpr int ATT_HD = 72, ATT_TILE = 64, ATT_GROUP = 16, ATT_Q = 128;
-constexpr int KW = ATT_HD / 8;          // uint4 per key row (8 halves each)
-constexpr int VW = ATT_TILE / 2 / 4;    // uint4 per value column (4 key pairs each)
+constexpr int ATT_HD = 72;
+constexpr int KW = ATT_HD / 8;  // uint4 per key row (8 halves each)
+template <int ATT_Q, int ATT_TILE, int ATT_GROUP>
 __global__ __launch_bounds__(ATT_Q) void attention_kernel(const uint16_t *qkv, int L, int heads, uint16_t *out) {
+    constexpr int VW = ATT_TILE / 2 / 4;  // uint4 per value column (4 key pairs each)
     __shared__ uint4 k_s[ATT_TILE][KW];  // [key][8 dims]
     __shared__ uint4 vt_s[ATT_HD][VW];   // [dim][4 key pairs]
     const int h = blockIdx.y, q = blockIdx.x * ATT_Q + threadIdx.x;
@@ -176,16 +177,15 @@ __global__ __launch_bounds__(ATT_Q) void attention_kernel(const uint16_t *qkv, i
             const int gp = g / 8;  // first uint4 of this group's key pairs
 #pragma unroll
             for (int d = 0; d < ATT_HD; ++d) {
-                const uint4 v0 = vt_s[d][gp], v1 = vt_s[d][gp + 1];
                 float acc = o[d] * alpha;
-                acc = dot2(pp[0], v0.x, acc);
-                acc = dot2(pp[1], v0.y, acc);
-                acc = dot2(pp[2], v0.z, acc);
-                acc = dot2(pp[3], v0.w, acc);
-                acc = dot2(pp[4], v1.x, acc);
-                acc = dot2(pp[5], v1.y, acc);
-                acc = dot2(pp[6], v1.z, acc);
-                acc = dot2(pp[7], v1.w, acc);
+#pragma unroll
+                for (int u = 0; u < ATT_GROUP / 8; ++u) {
+                    const uint4 v = vt_s[d][gp + u];
+                    acc = dot2(pp[4 * u], v.x, acc);
+                    acc = dot2(pp[4 * u + 1], v.y, acc);
+                    acc = dot2(pp[4 * u + 2], v.z, acc);
+                    acc = dot2(pp[4 * u + 3], v.w, acc);
+                }
                 o[d] = acc;
             }
             m = m_new;
@@ -241,8 +241,20 @@ void vit_embed(float *x, const uint16_t *y, const float *bias, const float *tabl
 void vit_rope2d(uint16_t *qkv, const int32_t *pos_hw, int N, int heads, hipStream_t s) {
     rope2d_kernel<<<N, 64, 0, s>>>(qkv, pos_hw, heads);
 }
+template <int Q, int TILE, int GROUP>
+void launch_attention(const uint16_t *qkv, int L, int heads, uint16_t *out, hipStream_t s) {
+    attention_kernel<Q, TILE, GROUP><<<dim3(unsigned((L + Q - 1) / Q), unsigned(heads)), Q, 0, s>>>(qkv, L, heads, out);
+}
+
+// 256 queries per block pays from ~6k patches (a 1080p image: 1.34 -> 1.23 s
+// for the whole tower); below that the grid gets too small (720p: 0.34 ->
+// 0.37 s). Keys per LDS tile and per softmax group were swept too (32-128,
+// 8-32): within noise of 64 / 16.
 void vit_attention(const uint16_t *qkv, int L, int heads, uint16_t *out, hipStream_t s) {
-    attention_kernel<<<dim3(unsigned((L + ATT_Q - 1) / ATT_Q), unsigned(heads)), ATT_Q, 0, s>>>(qkv, L, heads, out);
+    if (L >= 6000)
+        launch_attention<256, 64, 16>(qkv, L, heads, out, s);
+    else
+        launch_attention<128, 64, 16>(qkv, L, heads, out, s);
 }
 
 void vit_softmax(uint16_t *s_rows, int rows, int n, int ld, hipStream_t s) {

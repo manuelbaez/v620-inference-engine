@@ -499,7 +499,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
    - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention
-   - [ ] vision attention kernel at ~20% of peak: tile/occupancy work
+   - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
 ## Vision: images and video (2026-09-25)
@@ -520,9 +520,9 @@ more time in all-reduces than in compute).
   online softmax over groups of 16 keys). Matches HF's `Qwen4ExpVisionModel`
   in fp32 to 2-6e-3 relative error (`tests/gpu/test_vision_encoder` against
   `tools/vision_ref.py` dumps).
-- Encode time on one card: 720p 0.33 s, 1080p 1.37 s (attention is 80% of
-  it, at ~20% of the packed-dot peak: the next thing to improve); four 1080p
-  images 1.66 s. Images are scaled to at most ~1920x1088 by default
+- Encode time on one card: 720p 0.34 s, 1080p 1.23 s (attention is ~80% of
+  it, at ~20% of the packed-dot peak; 256 queries per block from 6k patches,
+  128 below; tile and group sizes swept); four 1080p images ~1.6 s. Images are scaled to at most ~1920x1088 by default
   (`QW_VISION_MAX_PIXELS`; the model allows 16.7 MP).
 - Inputs: the server mirrors the Qwen3-VL processor (PIL backend) exactly for
   images (pixels within 1.2e-7, identical token ids) and video (ffmpeg decode,
