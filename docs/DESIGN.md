@@ -500,6 +500,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          sequence base advances on the device (`Comm::bump_base`). Same drafts; measured host
          round trip before: 0.27 ms of a 1.63 ms step. Speculative decoding 87 -> 91 and 115 -> 120
          tok/s on the test prompts
+   - [x] longer drafts for a request decoding alone: server default `--mtp 5` (was 3); the
+         draft count stays adaptive per request. Single stream, 400-token replies: T 0.7 / top-p
+         0.8 / top-k 20 100-106 -> 111-112 tok/s, greedy 110 -> 117; `--mtp 7` no better (109-110 /
+         116). Concurrent requests are unaffected (the 8-row verification cap leaves them 1 draft)
+   - [ ] intermittent: greedy speculative output differing from plain decoding in
+         `test_speculative` (different prompt from run to run, 4-12-row verification batches;
+         also on the pre-GPU-sampling build), likely the open issue below; to root-cause
    - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
          all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
          a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop

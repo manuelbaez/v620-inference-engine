@@ -23,7 +23,9 @@ def main():
                          "request (env QW_SLOTS)")
     ap.add_argument("--prefill-chunk", type=int, default=int(os.environ.get("QW_PREFILL_CHUNK", "8192")),
                     help="tokens per prefill pass; its buffers take VRAM in proportion (env QW_PREFILL_CHUNK)")
-    ap.add_argument("--mtp", type=int, default=3, help="MTP draft tokens per step (0: no speculative decoding)")
+    ap.add_argument("--mtp", type=int, default=5,
+                    help="most MTP draft tokens per step (0: no speculative decoding); each request drafts "
+                         "adaptively up to it (5 measured best single-stream, docs/DESIGN.md)")
     ap.add_argument("--host-cache-gb", type=float, default=128,
                     help="pinned host RAM for conversations evicted from their slot (0: off)")
     ap.add_argument("--disk-cache-dir", default=os.path.expanduser("~/.cache/qw/prefix-cache"),
