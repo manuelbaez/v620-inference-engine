@@ -71,6 +71,7 @@ set(QW_HIP_SOURCES
   src/kernels/ple.hip
   src/kernels/mtp.hip
   src/kernels/logits.hip
+  src/kernels/sampling.hip
   src/kernels/blend.hip
   src/kernels/vision.hip
   src/vision/vision_encoder.hip
@@ -80,6 +81,7 @@ set(QW_HIP_SOURCES
   src/engine/engine.hip
   src/engine/decode.hip
   src/engine/speculative.hip
+  src/engine/gpu_sample.hip
   src/engine/prefill.hip
   src/engine/snapshot.hip
   src/engine/host_tier.hip
@@ -131,7 +133,7 @@ foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_be
 endforeach()
 qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)
 
-foreach(t test_comm test_batch_decode test_batch_prefill test_speculative test_host_tier test_snapshot_capture test_block_store test_vision_encoder test_moe test_gemv)
+foreach(t test_comm test_batch_decode test_batch_prefill test_sampling test_speculative test_host_tier test_snapshot_capture test_block_store test_vision_encoder test_moe test_gemv)
   qw_gpu_program(${t} tests/gpu/${t}.hip)
 endforeach()
 add_test(NAME comm COMMAND test_comm)

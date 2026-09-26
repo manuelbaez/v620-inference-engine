@@ -139,6 +139,127 @@ int32_t sample_token(const float *raw, const SamplingParams &p, const std::vecto
     return finish(idx[keep - 1]);
 }
 
+int32_t sample_candidates(const gpu::SampleOut *out, int shards, const SamplingParams &p, size_t n_hist,
+                          std::mt19937_64 &rng, float *logprob, float lse) {
+    constexpr int C = gpu::SAMPLE_CAND;
+    auto finish = [&](int32_t tok, float raw) {
+        if (logprob) *logprob = raw - lse;
+        return tok;
+    };
+    auto before = [](float la, int32_t ia, float lb, int32_t ib) { return la > lb || (la == lb && ia < ib); };
+    if (p.temperature <= 0.f) {  // the best first candidate
+        int best = -1;
+        for (int r = 0; r < shards; ++r)
+            if (out[r].n > 0 &&
+                (best < 0 || before(out[r].cand_l[0], out[r].cand_idx[0], out[best].cand_l[0], out[best].cand_idx[0])))
+                best = r;
+        return finish(out[best].cand_idx[0], out[best].cand_raw[0]);
+    }
+    const float inv_t = 1.f / p.temperature;
+    float lmax = -INFINITY;
+    for (int r = 0; r < shards; ++r) lmax = std::max(lmax, out[r].lmax);
+    std::mt19937_64 seeded(p.seed + n_hist);
+    std::mt19937_64 &g = p.seed ? seeded : rng;
+    struct Cand {
+        float l, raw;
+        int32_t idx;
+    };
+    // z of the last listed candidate of a full list: tokens it left out lie at or below it
+    auto cut_z = [&](const gpu::SampleOut &o) { return o.n < C ? -INFINITY : (o.cand_l[C - 1] - lmax) * inv_t; };
+
+    if (p.top_p >= 1.f && p.top_k <= 0) {
+        const float zmin = std::max(-30.f, p.min_p > 0.f ? std::log(p.min_p) : -30.f);
+        if (zmin <= -30.f) {  // untruncated: the best of the shards' Gumbel-max draws
+            int best = -1;
+            for (int r = 0; r < shards; ++r)
+                if (out[r].g_idx >= 0 && (best < 0 || out[r].g_score > out[best].g_score ||
+                                          (out[r].g_score == out[best].g_score && out[r].g_idx < out[best].g_idx)))
+                    best = r;
+            return finish(out[best].g_idx, out[best].g_raw);
+        }
+        // min_p: every token with weight >= min_p must be a candidate
+        std::vector<Cand> kept;
+        for (int r = 0; r < shards; ++r) {
+            if (cut_z(out[r]) >= zmin) return -1;
+            for (int i = 0; i < out[r].n; ++i)
+                if ((out[r].cand_l[i] - lmax) * inv_t >= zmin)
+                    kept.push_back({out[r].cand_l[i], out[r].cand_raw[i], out[r].cand_idx[i]});
+        }
+        std::sort(kept.begin(), kept.end(), [](const Cand &a, const Cand &b) { return a.idx < b.idx; });  // vocab order
+        std::vector<double> w(kept.size());
+        double z = 0;
+        for (size_t i = 0; i < kept.size(); ++i) z += w[i] = double(std::exp((kept[i].l - lmax) * inv_t));
+        double r = std::uniform_real_distribution<double>(0, z)(g);
+        for (size_t i = 0; i < kept.size(); ++i)
+            if ((r -= w[i]) <= 0) return finish(kept[i].idx, kept[i].raw);
+        size_t best = 0;
+        for (size_t i = 1; i < kept.size(); ++i)
+            if (before(kept[i].l, kept[i].idx, kept[best].l, kept[best].idx)) best = i;
+        return finish(kept[best].idx, kept[best].raw);
+    }
+
+    // Truncation: the shards' candidates within 30 nats of the max, in order.
+    // They are the global order down to the highest cut of a full list; when
+    // every cut lies below the 30-nat floor they hold every token that counts.
+    std::vector<Cand> merged;
+    float cut_l = -INFINITY;
+    bool all_in = true;
+    double z_all = 0;  // normalizer of the untruncated distribution
+    for (int r = 0; r < shards; ++r) {
+        const gpu::SampleOut &o = out[r];
+        if (o.n == C) {
+            cut_l = std::max(cut_l, o.cand_l[C - 1]);
+            all_in = all_in && cut_z(o) < -30.f;
+        }
+        z_all += double(o.sumexp) * std::exp(double((o.lmax - lmax) * inv_t));
+        for (int i = 0; i < o.n; ++i)
+            if ((o.cand_l[i] - lmax) * inv_t >= -30.f) merged.push_back({o.cand_l[i], o.cand_raw[i], o.cand_idx[i]});
+    }
+    std::sort(merged.begin(), merged.end(), [&](const Cand &a, const Cand &b) { return before(a.l, a.idx, b.l, b.idx); });
+    size_t valid = merged.size();
+    if (!all_in) {
+        valid = 0;
+        while (valid < merged.size() && merged[valid].l > cut_l) ++valid;
+    }
+    size_t K = valid;
+    if (p.top_k > 0) {
+        K = size_t(p.top_k);
+        if (all_in) K = std::min(K, merged.size());
+        if (K > valid) return -1;
+    }
+    std::vector<double> prob(K);
+    double zk = 0;
+    for (size_t i = 0; i < K; ++i) zk += prob[i] = double(std::exp((merged[i].l - lmax) * inv_t));
+    const double norm = p.top_k > 0 ? zk : z_all;
+    for (auto &x : prob) x /= norm;
+    size_t keep = K;
+    if (p.top_p < 1.f) {
+        double acc = 0;
+        keep = 0;
+        for (size_t i = 0; i < K && keep == 0; ++i)
+            if ((acc += prob[i]) >= p.top_p) keep = i + 1;
+        if (keep == 0) {
+            if (p.top_k <= 0 && !all_in) return -1;  // the nucleus reaches past the candidates
+            keep = K;
+        }
+    }
+    if (keep == 0) return -1;
+    if (p.min_p > 0.f) {
+        const double thr = p.min_p * prob[0];
+        size_t k = 0;
+        while (k < keep && prob[k] >= thr) ++k;
+        keep = std::max<size_t>(k, 1);
+    }
+    double tot = 0;
+    for (size_t i = 0; i < keep; ++i) tot += prob[i];
+    double r = std::uniform_real_distribution<double>(0, tot)(g);
+    for (size_t i = 0; i < keep; ++i) {
+        r -= prob[i];
+        if (r <= 0) return finish(merged[i].idx, merged[i].raw);
+    }
+    return finish(merged[keep - 1].idx, merged[keep - 1].raw);
+}
+
 void top_logprobs(const float *raw, int k, std::vector<int32_t> &ids, std::vector<float> &lps, float lse_known) {
     const int V = cfg::VOCAB;
     const float lse = std::isnan(lse_known) ? log_sum_exp(raw) : lse_known;

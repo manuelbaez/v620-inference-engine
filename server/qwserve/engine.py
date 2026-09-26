@@ -22,7 +22,7 @@ class StepReq(ctypes.Structure):
         ("slot", ctypes.c_int32),
         ("pending", ctypes.c_int32),
         ("budget", ctypes.c_int32),
-        ("reserved", ctypes.c_int32),
+        ("flags", ctypes.c_int32),  # 1: keep the rows' full logits (top_logprobs)
         ("sampling", Sampling),
     ]
 
@@ -193,10 +193,10 @@ class Engine:
         self._check(self.lib.qw_set_stop_tokens(self.h, slot, (ctypes.c_int32 * max(1, len(ids)))(*ids), len(ids)))
 
     def generate(self, reqs, k):
-        """reqs: (slot, pending, budget, Sampling). Returns per request
+        """reqs: (slot, pending, budget, Sampling, wants top_logprobs). Returns per request
         (tokens, logprobs, first_row, stopped); token j came from row first_row + j."""
         n, w = len(reqs), k + 1
-        arr = (StepReq * n)(*[StepReq(s, p, b, 0, smp) for s, p, b, smp in reqs])
+        arr = (StepReq * n)(*[StepReq(s, p, b, 1 if top else 0, smp) for s, p, b, smp, top in reqs])
         toks, lps = (ctypes.c_int32 * (n * w))(), (ctypes.c_float * (n * w))()
         counts, firsts, stopped = (ctypes.c_int32 * n)(), (ctypes.c_int32 * n)(), (ctypes.c_int32 * n)()
         self._check(self.lib.qw_generate(self.h, n, arr, k, toks, lps, counts, firsts, stopped))

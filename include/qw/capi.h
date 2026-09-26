@@ -97,9 +97,11 @@ typedef struct qw_step_req {
     int32_t slot;
     int32_t pending; /* sampled token, not decoded yet */
     int32_t budget;  /* tokens the request may still emit (>= 1) */
-    int32_t reserved;
+    int32_t flags;   /* QW_STEP_LOGITS: keep the full logits of its rows (for qw_top_logprobs) */
     qw_sampling sampling;
 } qw_step_req;
+
+#define QW_STEP_LOGITS 1
 
 /* 1 if the MTP head is loaded (qw_generate drafts tokens), else 0. */
 int qw_has_mtp(qw_handle *h);

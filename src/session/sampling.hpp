@@ -6,6 +6,8 @@
 #include <random>
 #include <vector>
 
+#include "kernels/sampling_types.hpp"
+
 namespace qw {
 
 struct SamplingParams {
@@ -30,6 +32,15 @@ float log_sum_exp(const float *raw);
 // computed here).
 int32_t sample_token(const float *raw, const SamplingParams &p, const std::vector<int32_t> &hist, size_t hist_len,
                      int64_t prompt_end, std::mt19937_64 &rng, float *logprob, float lse_known = NAN);
+
+// sample_token() from the GPU sampling results of one row (out[r] per vocab
+// shard r, kernels/sampling.hpp): the same draw from the same distribution,
+// from the shards' top candidates and normalizers (untruncated: their
+// Gumbel-max draws). Returns -1 when the candidates do not settle it (a
+// nucleus or min_p set wider than them): sample the row's full logits then.
+// lse: the row's log-sum-exp of the raw logits (for logprob).
+int32_t sample_candidates(const gpu::SampleOut *out, int shards, const SamplingParams &p, size_t n_hist,
+                          std::mt19937_64 &rng, float *logprob, float lse);
 
 // The k most likely tokens and their log-probabilities.
 void top_logprobs(const float *raw, int k, std::vector<int32_t> &ids, std::vector<float> &lps, float lse_known = NAN);

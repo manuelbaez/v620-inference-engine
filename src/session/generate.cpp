@@ -6,6 +6,7 @@
 
 #include "core/common.hpp"
 #include "core/config.hpp"
+#include "core/shard.hpp"
 #include "session/session.hpp"
 
 namespace qw {
@@ -17,6 +18,11 @@ namespace {
 float env_or(const char *name, float def) {
     const char *v = std::getenv(name);
     return v ? float(std::atof(v)) : def;
+}
+uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
 }
 const float SPEC_BASE = env_or("QW_SPEC_BASE", 1.25f), SPEC_BETA = env_or("QW_SPEC_COST", 0.25f);
 
@@ -89,6 +95,7 @@ namespace {
 struct GenTrace {
     bool on = std::getenv("QW_TRACE") != nullptr;
     double t[5] = {}, sample = 0, accept = 0;  // within phase 3
+    uint64_t fallbacks = 0, rows = 0;         // GPU-sampled rows, and those needing their full logits
     int steps = 0;
     std::chrono::steady_clock::time_point last;
     void start() { last = std::chrono::steady_clock::now(); }
@@ -100,8 +107,9 @@ struct GenTrace {
     void step() {
         if (!on || ++steps % 100) return;
         std::printf("generate: first drafts %.2f, rows %.2f, decode %.2f, sample+accept %.2f (sample %.2f, accept "
-                    "%.2f), drafts %.2f ms/step\n",
-                    t[0] / steps, t[1] / steps, t[2] / steps, t[3] / steps, sample / steps, accept / steps, t[4] / steps);
+                    "%.2f), drafts %.2f ms/step; sampling fallbacks %llu of %llu rows\n",
+                    t[0] / steps, t[1] / steps, t[2] / steps, t[3] / steps, sample / steps, accept / steps, t[4] / steps,
+                    (unsigned long long)fallbacks, (unsigned long long)rows);
         std::fflush(stdout);
     }
 };
@@ -161,21 +169,47 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         rows.push_back({rq.slot, rq.pending});
         for (int j = 0; j < n_drafts[i]; ++j) rows.push_back({rq.slot, si.drafts[size_t(j)]});
     }
-    g_trace.lap(1);
-    decode(rows);
-    g_trace.lap(2);
-
-    // Sample every row in parallel (each row only reads its own logits; the
-    // acceptance below then walks them in order). Each row draws from its own
-    // generator, seeded in order from the session's: exact sampling as before.
-    const auto ts = std::chrono::steady_clock::now();
-    std::vector<int32_t> row_tok(rows.size());
-    std::vector<float> row_lp(rows.size());
+    // Each row draws from its own generator, seeded in order from the
+    // session's: exact sampling. On the GPUs (QW_GPU_SAMPLING, default on) the
+    // rows' Gumbel keys come from the same seeds, and only the sampling
+    // results come back (the full logits too when a request wants top logprobs).
+    static const bool gpu_sampling = !std::getenv("QW_GPU_SAMPLING") || std::atoi(std::getenv("QW_GPU_SAMPLING")) != 0;
     std::vector<uint64_t> row_seed(rows.size());
     std::vector<std::pair<int, int>> row_of;  // (request, j)
     for (size_t i = 0; i < reqs.size(); ++i)
         for (int j = 0; j <= n_drafts[i]; ++j) row_of.push_back({int(i), j});
     for (auto &sd : row_seed) sd = rng_();
+    Engine::SampleSpec spec;
+    if (gpu_sampling) {
+        for (size_t i = 0; i < reqs.size(); ++i) {
+            const SamplingParams &p = reqs[i].params;
+            const SlotInfo &si = slots_[size_t(reqs[i].slot)];
+            spec.logits = spec.logits || reqs[i].want_logits;
+            if (p.presence_penalty != 0.f || p.frequency_penalty != 0.f || p.repetition_penalty != 1.f)
+                e_.penalty_sync(reqs[i].slot, si.epoch, si.prompt_end, si.hist);
+        }
+        for (size_t r = 0; r < rows.size(); ++r) {
+            const auto [i, j] = row_of[r];
+            const SamplingParams &p = reqs[size_t(i)].params;
+            const size_t n_hist = slots_[size_t(reqs[size_t(i)].slot)].hist.size() + size_t(j) + 1;
+            gpu::SampleRow sr{};
+            sr.inv_t = p.temperature > 0.f ? 1.f / p.temperature : 0.f;
+            sr.presence = p.presence_penalty;
+            sr.frequency = p.frequency_penalty;
+            sr.repetition = p.repetition_penalty;
+            sr.key = mix64(p.seed ? p.seed + n_hist : row_seed[r]);
+            spec.rows.push_back(sr);
+        }
+    }
+    g_trace.lap(1);
+    decode(rows, gpu_sampling ? &spec : nullptr);
+    g_trace.lap(2);
+
+    // Sample every row in parallel (each row only reads its own logits; the
+    // acceptance below then walks them in order).
+    const auto ts = std::chrono::steady_clock::now();
+    std::vector<int32_t> row_tok(rows.size(), -1);
+    std::vector<float> row_lp(rows.size());
     sample_pool_.parallel_for(int64_t(rows.size()), 1, [&](int64_t a, int64_t b) {
         for (int64_t r = a; r < b; ++r) {
             const auto [i, j] = row_of[size_t(r)];
@@ -183,11 +217,37 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
             const SlotInfo &si = slots_[size_t(rq.slot)];
             const size_t base = si.hist.size() - size_t(n_drafts[size_t(i)] + 1);
             std::mt19937_64 g(row_seed[size_t(r)]);
-            row_tok[size_t(r)] = sample_token(e_.logits_rows().data() + size_t(r) * cfg::VOCAB, rq.params, si.hist,
-                                              base + size_t(j) + 1, si.prompt_end, g, &row_lp[size_t(r)],
-                                              e_.logits_rows_lse()[size_t(r)]);
+            if (gpu_sampling)
+                row_tok[size_t(r)] = sample_candidates(e_.sample_out().data() + size_t(r) * RANKS, RANKS, rq.params,
+                                                       base + size_t(j) + 1, g, &row_lp[size_t(r)],
+                                                       e_.logits_rows_lse()[size_t(r)]);
+            else
+                row_tok[size_t(r)] = sample_token(e_.logits_rows().data() + size_t(r) * cfg::VOCAB, rq.params, si.hist,
+                                                  base + size_t(j) + 1, si.prompt_end, g, &row_lp[size_t(r)],
+                                                  e_.logits_rows_lse()[size_t(r)]);
         }
     });
+    // rows the GPU candidates did not settle: from their full logits
+    std::vector<float> full;
+    for (size_t r = 0; r < rows.size(); ++r) {
+        if (row_tok[r] >= 0) continue;
+        const auto [i, j] = row_of[r];
+        const StepReq &rq = reqs[size_t(i)];
+        const SlotInfo &si = slots_[size_t(rq.slot)];
+        const size_t base = si.hist.size() - size_t(n_drafts[size_t(i)] + 1);
+        const float *l = e_.logits_rows_valid() ? e_.logits_rows().data() + r * cfg::VOCAB : nullptr;
+        if (!l) {
+            full.resize(cfg::VOCAB);
+            e_.row_logits(int(r), full.data());
+            l = full.data();
+        }
+        std::mt19937_64 g(row_seed[r]);
+        row_tok[r] = sample_token(l, rq.params, si.hist, base + size_t(j) + 1, si.prompt_end, g, &row_lp[r],
+                                  e_.logits_rows_lse()[r]);
+        ++fallbacks_;
+        ++g_trace.fallbacks;
+    }
+    g_trace.rows += rows.size();
     if (g_trace.on)
         g_trace.sample += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
 

@@ -32,5 +32,12 @@ void gather_rows(const float *const *src, int rows, int n, float *dst, hipStream
 void save_rows_hist(const float *X, const SlotPtrs *tab, Rows rows, hipStream_t s);
 void save_last_rows(const float *X, const SlotPtrs *tab, const int32_t *run_start, const int32_t *run_len,
                     const int32_t *run_slot, int M, hipStream_t s);
+// A draft step's tokens, chained on the GPU: for request q, the global argmax
+// of row last[q] from every rank's {max, local index} parts (all[rank][row][2],
+// `stride` floats per rank; ties: the lower token id) goes to tokens[q]; with
+// emb, also this rank's slice of that token's embedding (bf16 [VOCAB][H], row
+// by row) into emb[q][SH], the next step's input.
+void draft_pick(const float *all, int stride, const int32_t *last, int nreq, int rank, int32_t *tokens,
+                const uint16_t *embed, float *emb, hipStream_t s);
 
 }  // namespace qw::gpu

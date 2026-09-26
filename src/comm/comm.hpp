@@ -50,6 +50,10 @@ public:
 
     // Sets rank r's sequence base (enqueued on s, from pinned memory).
     void set_base(int r, uint32_t base, hipStream_t s);
+    // Adds delta to rank r's sequence base on the device (enqueued on s): for
+    // steps chained without a host sync in between (set_base's staging word is
+    // only rewritten after a sync).
+    void bump_base(int r, uint32_t delta, hipStream_t s);
 
     // All of these are called by rank r's thread and enqueue on stream s,
     // with sequence number base + k. Pointers are device pointers on rank r.

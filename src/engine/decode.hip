@@ -23,6 +23,7 @@
 #include "kernels/mtp.hpp"
 #include "kernels/ple.hpp"
 #include "kernels/qsa.hpp"
+#include "kernels/sampling.hpp"
 
 namespace qw {
 
@@ -196,6 +197,7 @@ void Engine::run_decode_rank(Rank &rk) {
     const int r = rk.r, M = djob_.M;
     hipStream_t s = rk.s;
     auto &b = rk.bt;
+    apply_penalty_updates(rk);
     for (int sl : djob_.reset_slots) {
         Rank::Slot &x = rk.slots[size_t(sl)];
         CK(hipMemsetAsync(x.S, 0, SLOT_S * 4, s));
@@ -224,14 +226,25 @@ void Engine::run_decode_rank(Rank &rk) {
         g_dtrace.graph[M] += DecodeTrace::ms(t0, std::chrono::steady_clock::now());
     }
     const auto t1 = std::chrono::steady_clock::now();
-    CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
+    if (djob_.sample) {
+        std::memcpy(b.h_srows, djob_.srows.data(), size_t(M) * sizeof(gpu::SampleRow));
+        CK(hipMemcpyAsync(b.srows, b.h_srows, size_t(M) * sizeof(gpu::SampleRow), hipMemcpyHostToDevice, s));
+        gpu::sample_penalize(b.logits, b.Lpen, b.srows, rk.pen_tab, VOCAB_L, r * VOCAB_L, M, s);
+        gpu::sample_select(b.Lpen, b.logits, b.srows, VOCAB_L, r * VOCAB_L, M, b.sout, s);
+        CK(hipMemcpyAsync(b.h_sout, b.sout, size_t(M) * sizeof(gpu::SampleOut), hipMemcpyDeviceToHost, s));
+    }
+    if (djob_.copy_logits)
+        CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
     CK(hipMemcpyAsync(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
     phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(dlse_parts_.data() + size_t(r) * gpu::MAX_ROWS * 2, b.h_lse, size_t(M) * 2 * 4);
-    for (int i = 0; i < M; ++i)
-        std::memcpy(dlogits_.data() + size_t(i) * VOCAB + size_t(r) * VOCAB_L, b.h_logits + size_t(i) * VOCAB_L,
-                    VOCAB_L * 4);
+    if (djob_.sample)
+        for (int i = 0; i < M; ++i) sout_[size_t(i) * RANKS + size_t(r)] = b.h_sout[i];
+    if (djob_.copy_logits)
+        for (int i = 0; i < M; ++i)
+            std::memcpy(dlogits_.data() + size_t(i) * VOCAB + size_t(r) * VOCAB_L, b.h_logits + size_t(i) * VOCAB_L,
+                        VOCAB_L * 4);
     if (g_dtrace.on && r == 0) g_dtrace.copy[M] += DecodeTrace::ms(t1, std::chrono::steady_clock::now());
 }
 
@@ -266,16 +279,64 @@ void Engine::run_mtp_rank(Rank &rk) {
     std::memcpy(damax_parts_.data() + size_t(r) * MR * 2, b.h_amax, size_t(M) * 2 * 4);
 }
 
+// A draft job: every step's MTP pass enqueued back to back. Each step's
+// drafted tokens are picked on the GPUs (the ranks' argmax parts all-gathered)
+// and their embeddings fetched from the mapped host table, so the next step
+// needs nothing from the host; one sync at the end. The collectives' sequence
+// base advances on the device between steps.
+void Engine::run_draft_rank(Rank &rk) {
+    const int r = rk.r;
+    hipStream_t s = rk.s;
+    auto &b = rk.bt;
+    constexpr int MR = gpu::MAX_ROWS;
+    const int steps = int(dsteps_.size()), nreq = int(dsteps_[0].last.size());
+    comm_->set_base(r, rk.seq_base, s);
+    for (int st = 0; st < steps; ++st) {
+        const DraftStep &d = dsteps_[size_t(st)];
+        const int M = d.M;
+        Rank::Batch::DraftStage &h = b.h_dstage[st];
+        std::memcpy(h.i32, d.i32.data(), sizeof h.i32);
+        std::memcpy(h.pos, d.pos.data(), sizeof h.pos);
+        std::memcpy(h.last, d.last.data(), size_t(nreq) * 4);
+        for (int i = 0; i < M; ++i) {
+            const int src = d.src[size_t(i)];
+            h.src[i] = src >= 0 ? b.X + size_t(src) * XW : rk.slots[size_t(-1 - src)].pend;
+        }
+        CK(hipMemcpyAsync(b.row_slot, h.i32, sizeof h.i32, hipMemcpyHostToDevice, s));
+        CK(hipMemcpyAsync(b.row_pos, h.pos, sizeof h.pos, hipMemcpyHostToDevice, s));
+        CK(hipMemcpyAsync(b.src_ptrs, h.src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
+        CK(hipMemcpyAsync(b.d_last, h.last, size_t(nreq) * 4, hipMemcpyHostToDevice, s));
+        if (st == 0) {  // later steps' embeddings come from draft_pick
+            for (int i = 0; i < M; ++i)
+                std::memcpy(b.h_emb + size_t(i) * SH, demb_.data() + size_t(i) * H + r * SH, SH * 4);
+            CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
+        }
+        gpu::gather_rows(b.src_ptrs, M, XW, b.m_hid, s);
+        auto &g = rk.graphs[2][size_t(M)];
+        auto &nc = rk.n_coll[2][size_t(M)];
+        launch_graph(s, g, nc, [&] { return record_batch(rk, M, 2); });
+        comm_->allgather(r, b.amax, b.amax_all, MR * 2 * 4, nc + 1, s);
+        gpu::draft_pick(b.amax_all, MR * 2, b.d_last, nreq, r, b.dtokens + size_t(st) * MR, rk.embed_dev,
+                        st + 1 < steps ? b.emb : nullptr, s);
+        comm_->bump_base(r, nc + 1, s);
+        rk.seq_base += nc + 1;
+    }
+    CK(hipMemcpyAsync(b.h_dtokens, b.dtokens, size_t(steps) * MR * 4, hipMemcpyDeviceToHost, s));
+    phase_[size_t(rk.r)] = 2;
+    CK(hipStreamSynchronize(s));
+    if (r == 0) dtok_.assign(b.h_dtokens, b.h_dtokens + size_t(steps) * MR);
+}
+
 // Fills the row tables (slot, first row of its run, runs) and embeddings of
 // a batch job; pos[i] is row i's position.
-void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos) {
+void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos, bool embeddings) {
     const int M = int(rows.size());
     QW_CHECK(M >= 1 && M <= gpu::MAX_ROWS, "batch: 1..16 rows");
     constexpr int MR = gpu::MAX_ROWS;
     djob_.M = M;
     djob_.i32.assign(5 * MR, 0);
     djob_.pos.assign(MR, 0);
-    demb_.resize(size_t(M) * H);
+    if (embeddings) demb_.resize(size_t(M) * H);
     int n_runs = 0;
     for (int i = 0; i < M; ++i) {
         const Row &row = rows[size_t(i)];
@@ -293,11 +354,16 @@ void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t>
         djob_.i32[size_t(MR + i)] = djob_.i32[size_t(2 * MR + n_runs - 1)];  // row_first
         djob_.pos[size_t(i)] = pos[size_t(i)];
         QW_CHECK(pos[size_t(i)] >= 0 && pos[size_t(i)] < slot_capacity(row.slot), "batch: slot is full");
-        for (int j = 0; j < H; ++j) demb_[size_t(i) * H + j] = bf16_to_f32(embed_[size_t(row.token) * H + j]);
+        if (embeddings)
+            for (int j = 0; j < H; ++j) demb_[size_t(i) * H + j] = bf16_to_f32(embed_[size_t(row.token) * H + j]);
     }
 }
 
 const std::vector<float> &Engine::decode(const std::vector<Row> &rows) {
+    return decode(rows, nullptr);
+}
+
+const std::vector<float> &Engine::decode(const std::vector<Row> &rows, const SampleSpec *spec) {
     const auto t_start = std::chrono::steady_clock::now();
     const int M = int(rows.size());
     constexpr int MR = gpu::MAX_ROWS;
@@ -329,11 +395,31 @@ const std::vector<float> &Engine::decode(const std::vector<Row> &rows) {
         ple_->gather(ids[0], e.data());
         for (int j = 0; j < H; ++j) dple_[size_t(i) * H + j] = f32_to_f16(e[size_t(j)]);
     }
-    dlogits_.assign(size_t(M) * VOCAB, 0.f);
+    djob_.sample = spec != nullptr;
+    djob_.copy_logits = !spec || spec->logits;
+    if (spec) {
+        QW_CHECK(int(spec->rows.size()) == M, "decode: one sampling row per decode row");
+        djob_.srows = spec->rows;
+        for (int i = 0; i < M; ++i) {
+            gpu::SampleRow &sr = djob_.srows[size_t(i)];
+            sr.slot = rows[size_t(i)].slot;
+            sr.first = djob_.i32[size_t(MR + i)];
+            sr.token = rows[size_t(i)].token;
+        }
+        sout_.resize(size_t(M) * RANKS);
+    }
+    if (djob_.copy_logits) dlogits_.resize(size_t(M) * VOCAB);
+    dlogits_valid_ = djob_.copy_logits;
+    dlogits_on_gpu_ = true;
     const auto t_disp = std::chrono::steady_clock::now();
     if (g_dtrace.on) g_dtrace.prep[M] += DecodeTrace::ms(t_start, t_disp);
     job_ = Job::Decode;
     dispatch();
+    for (auto &ps : pen_) {  // applied by the job
+        ps.reset = false;
+        ps.tok.clear();
+        ps.gen.clear();
+    }
     dlse_.resize(size_t(M));
     for (int i = 0; i < M; ++i) {
         float mx = -INFINITY;

@@ -91,6 +91,7 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
         sl.ple = zeros<float>(SLOT_PLE);
         sl.pend = zeros<float>(XW);
         if (mtp) sl.hist = zeros<float>(size_t(gpu::MTP_HIST) * XW);
+        sl.pen = zeros<int32_t>(size_t(2) * VOCAB_L);
         for (int i = 0; i < N_QSA + int(mtp); ++i) {
             sl.K.push_back(zeros<uint16_t>(cap * HEAD_DIM));
             sl.V.push_back(zeros<uint16_t>(cap * HEAD_DIM));
@@ -113,6 +114,9 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
         rk.slots.push_back(sl);
     }
     rk.dtab = upload(tab);
+    std::vector<int32_t *> pens;
+    for (const auto &sl : rk.slots) pens.push_back(sl.pen);
+    rk.pen_tab = upload(pens);
 }
 
 // Batched-decode scratch for MAX_ROWS rows.
@@ -177,6 +181,11 @@ void alloc_batch(Rank::Batch &b, int max_slot_tokens, bool mtp) {
     b.h_ple = pinned<uint16_t>(M * H);
     b.h_logits = pinned<float>(M * VOCAB_L);
     b.h_lse = pinned<float>(M * 2);
+    b.Lpen = zeros<float>(M * VOCAB_L);
+    b.srows = zeros<gpu::SampleRow>(M);
+    b.h_srows = pinned<gpu::SampleRow>(M);
+    b.sout = zeros<gpu::SampleOut>(M);
+    b.h_sout = pinned<gpu::SampleOut>(M);
     if (mtp) {
         b.gdn_save = zeros<float>(size_t(N_GDN) * M * GDN_STATE);
         b.m_hid = zeros<float>(M * XW);
@@ -189,6 +198,11 @@ void alloc_batch(Rank::Batch &b, int max_slot_tokens, bool mtp) {
         b.src_ptrs = zeros<const float *>(M);
         b.h_src = pinned<const float *>(M);
         b.h_amax = pinned<float>(M * 2);
+        b.h_dstage = pinned<Rank::Batch::DraftStage>(M);
+        b.d_last = zeros<int32_t>(M);
+        b.dtokens = zeros<int32_t>(M * M);
+        b.h_dtokens = pinned<int32_t>(M * M);
+        b.amax_all = zeros<float>(size_t(RANKS) * M * 2);
     }
 }
 

@@ -237,6 +237,16 @@ std::string Comm::describe_error(uint32_t e) {
            " at collective offset " + std::to_string(e & 0xffffffu);
 }
 
+namespace {
+__global__ void bump_base_kernel(uint32_t *base, uint32_t delta) {
+    *base += delta;
+}
+}  // namespace
+
+void Comm::bump_base(int r, uint32_t delta, hipStream_t s) {
+    bump_base_kernel<<<1, 1, 0, s>>>(base_[size_t(r)], delta);
+}
+
 void Comm::set_base(int r, uint32_t base, hipStream_t s) {
     // The staging word is only rewritten after the previous step synchronized.
     *base_host_[size_t(r)] = base;

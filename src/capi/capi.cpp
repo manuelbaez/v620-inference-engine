@@ -232,7 +232,8 @@ int qw_generate(qw_handle *h, int n, const qw_step_req *reqs, int k, int32_t *to
         [&] {
             std::vector<qw::Session::StepReq> rq;
             for (int i = 0; i < n; ++i)
-                rq.push_back({reqs[i].slot, reqs[i].pending, reqs[i].budget, params(&reqs[i].sampling)});
+                rq.push_back({reqs[i].slot, reqs[i].pending, reqs[i].budget, params(&reqs[i].sampling),
+                              (reqs[i].flags & QW_STEP_LOGITS) != 0});
             const auto &out = h->session->generate(rq, k);
             const size_t w = size_t(std::max(k, 0)) + 1;
             for (int i = 0; i < n; ++i) {

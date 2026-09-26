@@ -78,8 +78,9 @@ public:
     // Samples the first token after the slot's prompt is in.
     int32_t sample_prompt(int slot, const SamplingParams &p, float *logprob = nullptr);
 
-    // One batched step; rows of a slot must be consecutive.
-    void decode(const std::vector<Engine::Row> &rows);
+    // One batched step; rows of a slot must be consecutive. With a spec, the
+    // GPUs also run the sampling kernels (Engine::decode).
+    void decode(const std::vector<Engine::Row> &rows, const Engine::SampleSpec *spec = nullptr);
     // Samples from row `row` of the last decode.
     int32_t sample_row(int row, const SamplingParams &p, float *logprob = nullptr);
     void top_logprobs_row(int row, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const;
@@ -107,11 +108,14 @@ public:
         uint64_t prompt_tokens = 0, reused_tokens = 0, blend_candidate_tokens = 0;
     };
     ReuseCounters reuse_counters() const { return counters_; }
+    // GPU-sampled rows whose draw needed the full logits (the candidates did not settle it)
+    uint64_t sampling_fallbacks() const { return fallbacks_; }
     struct StepReq {
         int slot;
         int32_t pending;  // sampled, not decoded yet
         int budget;       // tokens the request may still emit (>= 1)
         SamplingParams params;
+        bool want_logits = false;  // top_logprobs_row() after the step (the full logits come back)
     };
     struct StepOut {
         std::vector<int32_t> tokens;  // 1..k+1 emitted tokens; tokens[i] sampled from row first_row + i
@@ -154,6 +158,7 @@ private:
         std::vector<int32_t> pending;  // prompt being prefilled (begin_prompt .. prefill_some)
         std::vector<Media> pending_media;
         std::vector<float> logits;  // after the prompt's last token (sample_prompt)
+        uint64_t epoch = 0;         // bumped when hist is replaced (GPU penalty counts rebuild)
     };
     // prefix cache (prefix_cache.cpp)
     bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
@@ -200,6 +205,7 @@ private:
     std::vector<StepOut> out_;
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)
     uint64_t clock_ = 0;
+    uint64_t fallbacks_ = 0;
     std::mt19937_64 rng_;
     ThreadPool sample_pool_{8};  // samples a step's rows in parallel
 };

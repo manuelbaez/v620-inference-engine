@@ -40,6 +40,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     QW_CHECK(!opt_.slot_tokens.empty() && opt_.slot_tokens.size() <= size_t(MAX_SLOTS), "1..8 slots");
     for (int c : opt_.slot_tokens) QW_CHECK(c > 0 && c % 256 == 0, "slot sizes must be positive multiples of 256");
     slots_.resize(opt_.slot_tokens.size());
+    pen_.resize(opt_.slot_tokens.size());
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
 
@@ -69,7 +70,15 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         }
     {  // keep the token embeddings (host-side lookups); unmap the checkpoint
         const TensorView &emb = st_.get("model.language_model.embed_tokens.weight", DType::BF16, {VOCAB, H});
-        embed_.assign(emb.u16(), emb.u16() + size_t(VOCAB) * H);
+        const size_t bytes = size_t(VOCAB) * H * 2;
+        CK(hipHostMalloc(reinterpret_cast<void **>(&embed_), bytes, hipHostMallocPortable | hipHostMallocMapped));
+        std::memcpy(embed_, emb.u16(), bytes);
+        for (auto &rkp : ranks_) {
+            CK(hipSetDevice(rkp->dev));
+            void *d = nullptr;
+            CK(hipHostGetDevicePointer(&d, embed_, 0));
+            rkp->embed_dev = static_cast<const uint16_t *>(d);
+        }
         st_.clear();
     }
     if (saturated_weights)
@@ -127,6 +136,7 @@ Engine::~Engine() {
     }
     cv_.notify_all();
     for (auto &t : threads_) t.join();
+    if (embed_) (void)hipHostFree(embed_);
 }
 
 void Engine::rank_loop(int r) {
@@ -147,6 +157,8 @@ void Engine::rank_loop(int r) {
                 run_prefill_rank(rk);
             else if (job_ == Job::Mtp)
                 run_mtp_rank(rk);
+            else if (job_ == Job::Draft)
+                run_draft_rank(rk);
             else if (job_ == Job::Vision)
                 run_vision_rank(rk);
             else
@@ -165,6 +177,7 @@ void Engine::rank_loop(int r) {
 }
 
 void Engine::dispatch() {
+    if (job_ != Job::Decode) dlogits_on_gpu_ = false;  // the batch logits get overwritten
     static const bool trace = std::getenv("QW_TRACE") != nullptr;
     if (trace) {
         if (job_ == Job::Prefill)
@@ -172,7 +185,8 @@ void Engine::dispatch() {
                 log("trace: prefill slot %d [%lld, +%d)%s%s", sg.slot, (long long)sg.start, sg.T,
                     sg.mtp_pend ? " mtp_pend" : "", pjob_.segs.size() > 1 ? " (batched)" : "");
         else
-            log("trace: %s M=%d%s", job_ == Job::Mtp ? "mtp" : "decode", djob_.M, djob_.save ? " save" : "");
+            log("trace: %s M=%d%s", job_ == Job::Mtp ? "mtp" : job_ == Job::Draft ? "draft" : "decode", djob_.M,
+                djob_.save ? " save" : "");
     }
     {
         std::lock_guard<std::mutex> lk(mu_);
@@ -186,7 +200,7 @@ void Engine::dispatch() {
         int waited = 0;
         while (!done_cv_.wait_for(lk, std::chrono::seconds(60), [&] { return done_ == RANKS; })) {
             waited += 60;
-            const char *kind = job_ == Job::Prefill ? "prefill" : job_ == Job::Mtp ? "mtp" : "decode";
+            const char *kind = job_ == Job::Prefill ? "prefill" : job_ == Job::Mtp ? "mtp" : job_ == Job::Draft ? "draft" : "decode";
             log("watchdog: %s job (M=%d, prefill T=%d) running for %d s; rank phases %d %d %d %d "
                 "(1 enqueueing, 2 waiting for GPU, 0 done); comm errors: %s / %s",
                 kind, djob_.M, pjob_.T, waited, phase_[0].load(), phase_[1].load(), phase_[2].load(), phase_[3].load(),

@@ -16,6 +16,7 @@
 #include "core/shard.hpp"
 #include "core/threadpool.hpp"
 #include "engine/engine.hpp"
+#include "kernels/sampling_types.hpp"
 #include "kernels/types.hpp"
 #include "vision/vision_encoder.hpp"
 
@@ -100,6 +101,7 @@ struct Rank {
     std::vector<LayerW> L;
     HcW final_hc{};
     uint16_t *lm_head = nullptr;  // [VOCAB_L][H]
+    const uint16_t *embed_dev = nullptr;  // the engine's pinned token embeddings, bf16 [VOCAB][H], mapped
     Q8 lm_head8, ple_kv8, mtp_fc_h8, mtp_fc_e8;
     // MTP head (QSA layer index N_QSA in the slots' KV)
     LayerW mtp{};
@@ -114,11 +116,13 @@ struct Rank {
         float *S = nullptr, *ring = nullptr, *ple = nullptr;  // GDN state, GDN conv ring, PLE conv ring
         float *pend = nullptr;                                // [XW] MTP input store
         float *hist = nullptr;                                // [MTP_HIST][XW] decoded rows' MTP inputs
+        int32_t *pen = nullptr;  // [2][VOCAB_L] token counts for the penalties: prompt + generated, generated
         std::vector<uint16_t *> K, V, ck;
         std::vector<float *> raw_k;
     };
     std::vector<Slot> slots;
     gpu::SlotPtrs *dtab = nullptr;
+    int32_t **pen_tab = nullptr;  // device [slots]: each slot's pen
     // recurrent-state snapshots (pool, any slot)
     struct Snap {
         float *S = nullptr, *ring = nullptr, *ple = nullptr, *pend = nullptr;
@@ -158,6 +162,25 @@ struct Rank {
         float *lse = nullptr;  // [M][2] per-row {max, sumexp} of this rank's vocab shard
         float *h_emb = nullptr, *h_logits = nullptr, *h_lse = nullptr;
         uint16_t *h_ple = nullptr;
+        // GPU sampling (gpu_sample.hip): penalized logits [MAX_ROWS][VOCAB_L], row table and results
+        float *Lpen = nullptr;
+        gpu::SampleRow *srows = nullptr, *h_srows = nullptr;
+        gpu::SampleOut *sout = nullptr, *h_sout = nullptr;
+        // chained draft steps (Engine::draft): per-step row tables staged from pinned memory, every
+        // rank's argmax parts, and the drafted tokens [step][MAX_ROWS]
+        struct DraftStage {
+            int32_t i32[5 * gpu::MAX_ROWS];
+            int64_t pos[gpu::MAX_ROWS];
+            const float *src[gpu::MAX_ROWS];
+            int32_t last[gpu::MAX_ROWS];
+        };
+        DraftStage *h_dstage = nullptr;  // pinned [MAX_ROWS] (one per step)
+        int32_t *d_last = nullptr, *dtokens = nullptr, *h_dtokens = nullptr;
+        float *amax_all = nullptr;  // [RANKS][MAX_ROWS][2]
+        // penalty count updates: tokens and generated flags (device copies of the engine's staging)
+        int32_t *pen_tok = nullptr;
+        uint8_t *pen_gen = nullptr;
+        size_t pen_cap = 0;
     } bt;
     // captured graphs per row count: [kind][M], kind 0 decode, 1 decode + GDN state save, 2 MTP
     std::array<std::array<hipGraphExec_t, gpu::MAX_ROWS + 1>, 3> graphs{};

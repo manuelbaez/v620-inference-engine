@@ -69,26 +69,12 @@ const std::vector<std::vector<int32_t>> &Engine::draft(const std::vector<DraftRe
     drafts_.assign(reqs.size(), {});
     if (!mtp_ || k <= 0 || reqs.empty()) return drafts_;
     constexpr int MR = gpu::MAX_ROWS;
-    // per-rank argmax parts -> token of row i
-    auto argmax_row = [&](int i) {
-        float best = -INFINITY;
-        int32_t tok = 0;
-        for (int r = 0; r < RANKS; ++r) {
-            const float v = damax_parts_[(size_t(r) * MR + i) * 2];
-            int32_t idx;
-            std::memcpy(&idx, &damax_parts_[(size_t(r) * MR + i) * 2 + 1], 4);
-            if (v > best) {
-                best = v;
-                tok = int32_t(r * VOCAB_L + idx);
-            }
-        }
-        return tok;
-    };
-    // step 1: the slots' not yet MTP-processed tokens
+    QW_CHECK(k <= MR, "draft: at most 16 steps");
+    dsteps_.assign(size_t(k), {});
+    // step 0: the slots' not yet MTP-processed tokens
     std::vector<Row> rows;
     std::vector<int64_t> pos;
-    djob_.src.clear();
-    std::vector<int> last(reqs.size());
+    DraftStep &d0 = dsteps_[0];
     for (size_t q = 0; q < reqs.size(); ++q) {
         const DraftReq &rq = reqs[q];
         QW_CHECK(rq.slot >= 0 && rq.slot < num_slots(), "draft: bad slot");
@@ -100,28 +86,35 @@ const std::vector<std::vector<int32_t>> &Engine::draft(const std::vector<DraftRe
         for (int i = 0; i < n; ++i) {
             rows.push_back({rq.slot, rq.next[size_t(i)]});
             pos.push_back(sh.len - n + i);
-            djob_.src.push_back(i == n - 1 || !from_batch ? -1 - rq.slot : sh.run_first + sh.run_len - n + i);
+            d0.src.push_back(i == n - 1 || !from_batch ? -1 - rq.slot : sh.run_first + sh.run_len - n + i);
         }
-        last[q] = int(rows.size()) - 1;
+        d0.last.push_back(int32_t(rows.size()) - 1);
     }
-    for (int step = 0; step < k; ++step) {
-        if (step > 0) {  // one row per request: the previous step's hidden and draft
-            rows.clear();
-            pos.clear();
-            djob_.src.clear();
-            for (size_t q = 0; q < reqs.size(); ++q) {
-                const SlotHost &sh = slots_[size_t(reqs[q].slot)];
-                rows.push_back({reqs[q].slot, drafts_[q].back()});
-                pos.push_back(sh.len + step - 1);
-                djob_.src.push_back(last[q]);
-                last[q] = int(q);
-            }
+    stage_rows(rows, pos);  // (demb_: step 0's embeddings)
+    d0.M = djob_.M;
+    d0.i32 = djob_.i32;
+    d0.pos = djob_.pos;
+    // later steps: one row per request, the previous step's hidden and draft (picked on the GPUs)
+    for (int st = 1; st < k; ++st) {
+        DraftStep &d = dsteps_[size_t(st)];
+        rows.clear();
+        pos.clear();
+        for (size_t q = 0; q < reqs.size(); ++q) {
+            const SlotHost &sh = slots_[size_t(reqs[q].slot)];
+            rows.push_back({reqs[q].slot, 0});
+            pos.push_back(sh.len + st - 1);
+            d.src.push_back(dsteps_[size_t(st - 1)].last[q]);
+            d.last.push_back(int32_t(q));
         }
-        stage_rows(rows, pos);
-        job_ = Job::Mtp;
-        dispatch();
-        for (size_t q = 0; q < reqs.size(); ++q) drafts_[q].push_back(argmax_row(last[q]));
+        stage_rows(rows, pos, false);
+        d.M = djob_.M;
+        d.i32 = djob_.i32;
+        d.pos = djob_.pos;
     }
+    job_ = Job::Draft;
+    dispatch();
+    for (int st = 0; st < k; ++st)
+        for (size_t q = 0; q < reqs.size(); ++q) drafts_[q].push_back(dtok_[size_t(st) * MR + q]);
     // the batch hidden now holds MTP rows
     for (auto &sh : slots_) sh.run_first = -1;
     return drafts_;

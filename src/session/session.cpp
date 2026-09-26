@@ -141,6 +141,7 @@ int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
     SlotInfo &si = slots_[size_t(slot)];
     si.drafts_for = -1;
     si.accept = 0.8f;
+    ++si.epoch;
     auto &hist = si.hist;
     size_t common = 0;
     while (common < hist.size() && common < prompt.size() && hist[common] == prompt[common]) ++common;
@@ -230,9 +231,9 @@ int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
     return reused;
 }
 
-void Session::decode(const std::vector<Engine::Row> &rows) {
+void Session::decode(const std::vector<Engine::Row> &rows, const Engine::SampleSpec *spec) {
     for (const auto &r : rows) drop_snapshots_after(r.slot, int64_t(slots_[size_t(r.slot)].hist.size()));
-    e_.decode(rows);
+    e_.decode(rows, spec);
     row_slot_.clear();
     for (const auto &r : rows) {
         slots_[size_t(r.slot)].hist.push_back(r.token);
@@ -248,6 +249,7 @@ int32_t Session::sample_prompt(int slot, const SamplingParams &p, float *logprob
 
 int32_t Session::sample_row(int row, const SamplingParams &p, float *logprob) {
     QW_CHECK(row >= 0 && row < int(row_slot_.size()), "sample_row: bad row");
+    QW_CHECK(e_.logits_rows_valid(), "sample_row: the step kept no logits");
     // the slot's history already holds the rows after this one of its run
     const int slot = row_slot_[size_t(row)];
     size_t later = 0;
@@ -268,6 +270,7 @@ int32_t Session::sample_logits(const float *raw, int slot, const SamplingParams 
 }
 
 void Session::top_logprobs_row(int row, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const {
+    QW_CHECK(e_.logits_rows_valid(), "top_logprobs_row: the step kept no logits (StepReq::want_logits)");
     top_logprobs(e_.logits_rows().data() + size_t(row) * cfg::VOCAB, k, ids, lps, e_.logits_rows_lse()[size_t(row)]);
 }
 

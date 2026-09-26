@@ -24,6 +24,7 @@
 #include "comm/comm.hpp"
 #include "core/ple.hpp"
 #include "core/safetensors.hpp"
+#include "kernels/sampling_types.hpp"
 
 namespace qw {
 
@@ -102,6 +103,26 @@ public:
     // One batched step: each row appends its token to its slot. Rows of a slot
     // must be consecutive. Returns logits [rows][VOCAB].
     const std::vector<float> &decode(const std::vector<Row> &rows);
+
+    // ---- sampling on the GPUs (gpu_sample.hip, kernels/sampling.hpp)
+    // decode() with a spec also runs the sampling kernels on each row
+    // (spec->rows[i] for row i; slot, first and token are filled in here) and
+    // brings back only their results, sample_out(); the full logits only when
+    // spec->logits (else logits_rows() is not valid for this step).
+    struct SampleSpec {
+        std::vector<gpu::SampleRow> rows;
+        bool logits = false;
+    };
+    const std::vector<float> &decode(const std::vector<Row> &rows, const SampleSpec *spec);
+    // Results of the last decode with a spec: row i, rank r at [i * RANKS + r].
+    const std::vector<gpu::SampleOut> &sample_out() const { return sout_; }
+    bool logits_rows_valid() const { return dlogits_valid_; }
+    // The full logits of row `row` of the last decode, read from the GPUs (valid until the next job).
+    void row_logits(int row, float *out);
+    // The penalties' token counts of a slot: its tokens `hist` (from prompt_end
+    // on generated). Only the new tokens are sent while the epoch and
+    // prompt_end stay the same and hist only grew; applied by the next decode.
+    void penalty_sync(int slot, uint64_t epoch, int64_t prompt_end, const std::vector<int32_t> &hist);
 
     // Logits of the last prefill (or single-slot step).
     const std::vector<float> &logits() const { return logits_; }
@@ -226,17 +247,20 @@ private:
     void run_prefill_rank(Rank &rk);
     void run_decode_rank(Rank &rk);
     void run_mtp_rank(Rank &rk);
+    void run_draft_rank(Rank &rk);
     void run_vision_rank(Rank &rk);
     bool calibrating(int layer) const { return layer >= calib_lo_ && layer < calib_hi_; }
     void calib_acc(Rank &rk, const std::string &name, const uint16_t *X, int ldx, int rows, int K, rocblas_handle blas);
     int calib_lo_ = -1, calib_hi_ = -1;
     uint32_t record_batch(Rank &rk, int M, int kind);
-    void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos);
+    void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos, bool embeddings = true);
     void dispatch();  // run the current job on every rank and wait
 
     EngineOptions opt_;
     SafeTensors st_;               // checkpoint, mapped only while loading
-    std::vector<uint16_t> embed_;  // token embeddings, bf16 [VOCAB][H] (host-side lookups)
+    // token embeddings, bf16 [VOCAB][H]: host-side lookups, and read by the GPUs
+    // for draft tokens (pinned, mapped into every device's address space)
+    uint16_t *embed_ = nullptr;
     std::unique_ptr<PleTable> ple_;
     NgramHasher hasher_;
     std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch
@@ -257,7 +281,7 @@ private:
     bool blend_transfer_ = false;
     int debug_layers_ = cfg::N_LAYERS;
     // current jobs (host side, read by every rank thread)
-    enum class Job { Prefill, Decode, Mtp, Vision } job_ = Job::Decode;
+    enum class Job { Prefill, Decode, Mtp, Draft, Vision } job_ = Job::Decode;
     bool vision_ = false;
     std::vector<std::vector<VisionSlice>> vjob_;  // per rank
     // One prefill chunk: segments of distinct slots, their rows concatenated.
@@ -295,7 +319,32 @@ private:
         // hidden at position src_hist[i]
         std::vector<int> src;
         std::vector<int64_t> src_hist;
+        bool sample = false, copy_logits = true;  // GPU sampling of the rows; full logits back
+        std::vector<gpu::SampleRow> srows;
     } djob_;
+    std::vector<gpu::SampleOut> sout_;  // [rows][RANKS]
+    // a draft job's steps (chained on the GPUs without host syncs in between)
+    struct DraftStep {
+        int M = 0;
+        std::vector<int32_t> i32;  // row tables as in DecodeJob
+        std::vector<int64_t> pos;
+        std::vector<int> src;       // hidden source per row, as DecodeJob::src (steps > 0: rows of the batch hidden)
+        std::vector<int32_t> last;  // per request: its row whose argmax is its draft
+    };
+    std::vector<DraftStep> dsteps_;
+    std::vector<int32_t> dtok_;  // [steps][MAX_ROWS] drafted tokens (from rank 0)
+    bool dlogits_valid_ = false, dlogits_on_gpu_ = false;
+    // penalty counts per slot: what the GPUs hold, and updates for the next decode
+    struct PenState {
+        uint64_t epoch = ~0ull;
+        int64_t prompt_end = -1;
+        size_t len = 0;
+        bool reset = false;          // pending: zero the counts first
+        std::vector<int32_t> tok;    // pending tokens
+        std::vector<uint8_t> gen;    // pending: generated?
+    };
+    std::vector<PenState> pen_;
+    void apply_penalty_updates(Rank &rk);  // in the decode job, on the rank's stream
     std::vector<float> demb_;                                              // [M][H]
     std::vector<uint16_t> dple_;                                           // [M][H] fp16
     std::vector<float> dlogits_;                                           // [M][VOCAB]

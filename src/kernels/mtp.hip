@@ -102,4 +102,36 @@ void mtp_shift(const float *pend, const float *X, int o, int rows, float *Xm, hi
     if (rows > 0) mtp_shift_kernel<<<rows, 256, 0, s>>>(pend, X, o, Xm);
 }
 
+namespace {
+__global__ __launch_bounds__(256) void draft_pick_kernel(const float *all, int stride, const int32_t *last,
+                                                          int32_t *tokens, const uint16_t *embed, int rank, float *emb) {
+    const int q = blockIdx.x;
+    __shared__ int32_t tok;
+    if (threadIdx.x == 0) {
+        const int row = last[q];
+        float best = -INFINITY;
+        int32_t t = 0;
+        for (int r = 0; r < RANKS; ++r) {
+            const float v = all[size_t(r) * stride + size_t(row) * 2];
+            const int32_t idx = __float_as_int(all[size_t(r) * stride + size_t(row) * 2 + 1]);
+            if (v > best) {  // ranks in order: on a tie the lower rank's (lower) id stays
+                best = v;
+                t = r * VOCAB_L + idx;
+            }
+        }
+        tok = t;
+        tokens[q] = t;
+    }
+    __syncthreads();
+    if (!emb) return;
+    const uint16_t *e = embed + size_t(tok) * H + size_t(rank) * SH;
+    for (int j = threadIdx.x; j < SH; j += blockDim.x) emb[size_t(q) * SH + j] = __uint_as_float(uint32_t(e[j]) << 16);
+}
+}  // namespace
+
+void draft_pick(const float *all, int stride, const int32_t *last, int nreq, int rank, int32_t *tokens,
+                const uint16_t *embed, float *emb, hipStream_t s) {
+    draft_pick_kernel<<<nreq, 256, 0, s>>>(all, stride, last, tokens, embed, rank, emb);
+}
+
 }  // namespace qw::gpu

@@ -236,7 +236,8 @@ class Scheduler:
         batch = self.active[:16]
         self.active = self.active[16:] + batch  # round-robin past 16 requests (at most num_slots anyway)
         t0 = time.time()
-        res = self.e.generate([(r.slot, r.next, r.limit - r.generated, r.sampling) for r in batch], self.k)
+        res = self.e.generate([(r.slot, r.next, r.limit - r.generated, r.sampling, r.want_top > 0) for r in batch],
+                              self.k)
         st = self.stats
         st["time"] += time.time() - t0
         st["steps"] += 1
