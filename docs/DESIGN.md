@@ -493,12 +493,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [~] int8 dense weights: built (+16% decode), fails the quality gate; opt-in `QW_INT8_DENSE=1`
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [x] fewer, bigger decode kernels: tried (SwiGLU into down GEMV, ring into scan, shared-expert graph branch), no gain; see Next steps 1
-   - [ ] one collective fewer per sublayer (HC down on the unreduced block output)
+   - [x] one collective fewer per sublayer: not possible with this layout (see Next steps 9)
    - [ ] MTP drafting inside one graph (device-side argmax and embedding)
    - [x] MTP off while acceptance stays low, with a catch-up pass on resume
    - [ ] root-cause multi-request speculative batches over 8 rows
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
-   - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention
+   - [x] prefill profiled: collective-bound; flat pushes +4-10%
+   - [ ] scheduling: batch waiting prompts into one prefill, interleave prefill chunks with decode steps
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
@@ -647,6 +648,19 @@ launches and collectives, in this order of expected payoff:
 8. **GPU-side sampling.** Top-k/top-p/min-p sampling costs 0.2-0.7 ms per
    token on the host at temperature > 0; doing it per vocab shard on the GPUs
    (like the log-sum-exp) saves most of that.
-9. **Prefill.** ~2,000 tok/s. Profile a long prefill the same way before
+9. **Prefill.** Profiled (`bench/prefill_bench` under rocprofv3): 300 tokens
+   run at ~1,350 tok/s, 8k at ~2,200: every prefill pays a fixed ~80 ms. The
+   collectives are ~75% of GPU time at 300 tokens and ~42% at 8k (the two
+   micro-batches hide part of it); then QSA attention 19%, GEMMs ~12%, MoE
+   ~12%, GDN scan 5% (8k). Done: large multi-row payloads whose rows are
+   contiguous (all-gathers, all-reduces) are pushed as one flat copy instead
+   of a block per 1-2 KB row: +4-10% prefill (300 tokens 0.226 -> 0.213 s,
+   8k 3.80 -> 3.66 s), decode unchanged. Item 4 (one collective fewer) is not
+   possible as stated: the next mixer's RMS norm needs the updated residual,
+   and squares do not distribute over the ranks' partial sums; it needs a
+   different parallel layout. For many concurrent requests the bigger lever
+   is scheduling: batch waiting prompts into one prefill (the fixed cost is
+   paid once) and interleave prefill chunks with decode steps. Original note:
+   ~2,000 tok/s. Profile a long prefill the same way before
    choosing: candidates are the chunked (WY) GDN kernel, the fp32-output
    router GEMM (rocBLAS falls back to a slow HSS kernel), and QSA attention.

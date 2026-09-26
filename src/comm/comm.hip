@@ -250,8 +250,15 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     QW_CHECK(k > 0, "comm: sequence offsets start at 1");
     PushArgs pa;
     pa.src = static_cast<const uint8_t *>(src);
-    pa.rows = rows;
-    pa.row16 = row_bytes / 16;
+    // Large payloads (prefill) whose rows are contiguous in the source and in
+    // the slot are pushed as one flat copy: a block per 1-2 KB row leaves most
+    // threads idle (prefill +4-10%). Small (decode) payloads keep row blocks.
+    static const bool flat_ok = !std::getenv("QW_COMM_ROWWISE");
+    static const size_t flat_min =
+        std::getenv("QW_COMM_CONCURRENT_MAX") ? size_t(std::atol(std::getenv("QW_COMM_CONCURRENT_MAX"))) : 32768;
+    const bool flat = flat_ok && rows > 1 && src_row_stride == row_bytes && bytes > flat_min;
+    pa.rows = flat ? 1 : rows;
+    pa.row16 = (flat ? bytes : row_bytes) / 16;
     pa.src_row_stride = src_row_stride;
     pa.src_dest_offset = src_dest_offset;
     pa.slot = slot_;
@@ -263,7 +270,7 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     pa.base = base_[size_t(r)];
     pa.k = k;
     pa.rank = r;
-    const int blocks = int(std::min<size_t>(rows > 1 ? std::min<size_t>(MAX_BLOCKS, size_t(rows)) : MAX_BLOCKS,
+    const int blocks = int(std::min<size_t>(pa.rows > 1 ? std::min<size_t>(MAX_BLOCKS, size_t(rows)) : MAX_BLOCKS,
                                             (bytes + BLOCK_BYTES - 1) / BLOCK_BYTES));
     // Measured (tests/gpu/test_comm): all peers at once wins up to ~32 KB;
     // above that, rotating destinations is up to 2x faster.
