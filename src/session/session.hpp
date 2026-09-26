@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "core/threadpool.hpp"
 #include "engine/engine.hpp"
 #include "session/block_store.hpp"
 #include "session/sampling.hpp"
@@ -188,6 +189,7 @@ private:
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)
     uint64_t clock_ = 0;
     std::mt19937_64 rng_;
+    ThreadPool sample_pool_{8};  // samples a step's rows in parallel
 };
 
 }  // namespace qw

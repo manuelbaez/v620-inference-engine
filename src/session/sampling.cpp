@@ -50,33 +50,30 @@ int32_t sample_token(const float *raw, const SamplingParams &p, const std::vecto
 
     // Weights w_i = exp((L_i - max) / T); tokens more than 30 nats below the max weigh 0.
     const float lmax = *std::max_element(L, L + V), inv_t = 1.f / p.temperature;
-    auto weight = [&](int i) {
-        const float z = (L[i] - lmax) * inv_t;
-        return z < -30.f ? 0.0 : double(std::exp(z));
-    };
     std::mt19937_64 seeded(p.seed + n_hist);
     std::mt19937_64 &g = p.seed ? seeded : rng;
 
-    // No truncation: one pass over the vocabulary, no sort.
-    if (p.top_p >= 1.f && p.top_k <= 0 && p.min_p <= 0.f) {
-        double z = 0;
-        for (int i = 0; i < V; ++i) z += weight(i);
-        double r = std::uniform_real_distribution<double>(0, z)(g);
-        for (int i = 0; i < V; ++i) {
-            r -= weight(i);
-            if (r <= 0) return finish(i);
-        }
-        return finish(int32_t(std::max_element(L, L + V) - L));
-    }
-
-    // min_p alone: tokens with weight >= min_p (the max weighs 1), one pass, no sort.
+    // No truncation, or min_p alone: one pass over the vocabulary gathers the
+    // tokens that can be drawn (weight >= min_p, and within 30 nats of the
+    // max) with their weights, each computed once; the draw walks that list.
     if (p.top_p >= 1.f && p.top_k <= 0) {
+        thread_local std::vector<int32_t> cand;
+        thread_local std::vector<double> cw;
+        cand.clear();
+        cw.clear();
+        const float zmin = std::max(-30.f, p.min_p > 0.f ? std::log(p.min_p) : -30.f);
         double z = 0;
-        for (int i = 0; i < V; ++i)
-            if (const double wi = weight(i); wi >= p.min_p) z += wi;
+        for (int i = 0; i < V; ++i) {
+            const float zi = (L[i] - lmax) * inv_t;
+            if (zi < zmin) continue;
+            const double wi = double(std::exp(zi));
+            cand.push_back(i);
+            cw.push_back(wi);
+            z += wi;
+        }
         double r = std::uniform_real_distribution<double>(0, z)(g);
-        for (int i = 0; i < V; ++i)
-            if (const double wi = weight(i); wi >= p.min_p && (r -= wi) <= 0) return finish(i);
+        for (size_t c = 0; c < cand.size(); ++c)
+            if ((r -= cw[c]) <= 0) return finish(cand[c]);
         return finish(int32_t(std::max_element(L, L + V) - L));
     }
 

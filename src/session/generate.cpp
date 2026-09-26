@@ -88,7 +88,7 @@ namespace {
 // QW_TRACE: phase times of generate(), printed every 100 steps
 struct GenTrace {
     bool on = std::getenv("QW_TRACE") != nullptr;
-    double t[5] = {};
+    double t[5] = {}, sample = 0, accept = 0;  // within phase 3
     int steps = 0;
     std::chrono::steady_clock::time_point last;
     void start() { last = std::chrono::steady_clock::now(); }
@@ -99,8 +99,9 @@ struct GenTrace {
     }
     void step() {
         if (!on || ++steps % 100) return;
-        std::printf("generate: first drafts %.2f, rows %.2f, decode %.2f, sample+accept %.2f, drafts %.2f ms/step\n",
-                    t[0] / steps, t[1] / steps, t[2] / steps, t[3] / steps, t[4] / steps);
+        std::printf("generate: first drafts %.2f, rows %.2f, decode %.2f, sample+accept %.2f (sample %.2f, accept "
+                    "%.2f), drafts %.2f ms/step\n",
+                    t[0] / steps, t[1] / steps, t[2] / steps, t[3] / steps, sample / steps, accept / steps, t[4] / steps);
         std::fflush(stdout);
     }
 };
@@ -164,7 +165,33 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
     decode(rows);
     g_trace.lap(2);
 
-    // sample rows while they confirm the drafts; keep that prefix
+    // Sample every row in parallel (each row only reads its own logits; the
+    // acceptance below then walks them in order). Each row draws from its own
+    // generator, seeded in order from the session's: exact sampling as before.
+    const auto ts = std::chrono::steady_clock::now();
+    std::vector<int32_t> row_tok(rows.size());
+    std::vector<float> row_lp(rows.size());
+    std::vector<uint64_t> row_seed(rows.size());
+    std::vector<std::pair<int, int>> row_of;  // (request, j)
+    for (size_t i = 0; i < reqs.size(); ++i)
+        for (int j = 0; j <= n_drafts[i]; ++j) row_of.push_back({int(i), j});
+    for (auto &sd : row_seed) sd = rng_();
+    sample_pool_.parallel_for(int64_t(rows.size()), 1, [&](int64_t a, int64_t b) {
+        for (int64_t r = a; r < b; ++r) {
+            const auto [i, j] = row_of[size_t(r)];
+            const StepReq &rq = reqs[size_t(i)];
+            const SlotInfo &si = slots_[size_t(rq.slot)];
+            const size_t base = si.hist.size() - size_t(n_drafts[size_t(i)] + 1);
+            std::mt19937_64 g(row_seed[size_t(r)]);
+            row_tok[size_t(r)] = sample_token(e_.logits_rows().data() + size_t(r) * cfg::VOCAB, rq.params, si.hist,
+                                              base + size_t(j) + 1, si.prompt_end, g, &row_lp[size_t(r)],
+                                              e_.logits_rows_lse()[size_t(r)]);
+        }
+    });
+    if (g_trace.on)
+        g_trace.sample += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+
+    // keep each request's rows while they confirm its drafts
     std::vector<Engine::DraftReq> next;
     which.clear();
     for (size_t i = 0; i < reqs.size(); ++i) {
@@ -174,11 +201,9 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         const size_t base = si.hist.size() - size_t(n_drafts[i] + 1);  // history before this step
         for (int j = 0; j <= n_drafts[i]; ++j) {
             const int row = o.first_row + j;
-            float lp = 0.f;
-            const int32_t tok = sample_logits(e_.logits_rows().data() + size_t(row) * cfg::VOCAB, rq.slot, rq.params,
-                                              &lp, e_.logits_rows_lse()[size_t(row)], base + size_t(j) + 1);
+            const int32_t tok = row_tok[size_t(row)];
             o.tokens.push_back(tok);
-            o.logprobs.push_back(lp);
+            o.logprobs.push_back(row_lp[size_t(row)]);
             if (std::find(si.stop.begin(), si.stop.end(), tok) != si.stop.end()) {
                 o.stopped = true;
                 break;
@@ -195,7 +220,10 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
         const int confirmed = keep - 1;
         for (int j = 0; j < confirmed; ++j) si.accept += rate * (1.f - si.accept);
         if (!o.stopped && confirmed < n_drafts[i]) si.accept += rate * (0.f - si.accept);
+        const auto ta = std::chrono::steady_clock::now();
         e_.accept(rq.slot, keep);
+        if (g_trace.on)
+            g_trace.accept += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ta).count();
         si.hist.resize(base + size_t(keep));
         si.drafts_for = -1;
         if (plain[i]) {  // no MTP pass: this token's MTP row is missing

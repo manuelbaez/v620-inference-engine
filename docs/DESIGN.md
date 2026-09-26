@@ -497,7 +497,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] MTP drafting inside one graph (device-side argmax and embedding)
    - [x] MTP off while acceptance stays low, with a catch-up pass on resume
    - [ ] root-cause multi-request speculative batches over 8 rows
-   - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
+   - [x] host sampling: one pass + parallel rows (16 -> 3 ms per 4-request step, +25% aggregate)
+   - [ ] GPU-side sampling (temperature via Gumbel-max per vocab shard; top-k/top-p need more)
    - [x] prefill profiled: collective-bound; flat pushes +4-10%
    - [x] scheduling A: prefill in pieces interleaved with decode (see "Interleaved prefill")
    - [ ] scheduling B: batch several waiting prompts into one prefill (short-prompt bursts)
@@ -669,7 +670,16 @@ launches and collectives, in this order of expected payoff:
 7. **Multi-request speculative batches over 8 rows.** Root-cause the open
    issue above; lifting the 8-row cap lets 3-4 concurrent requests draft 3
    tokens each instead of 1.
-8. **GPU-side sampling.** Top-k/top-p/min-p sampling costs 0.2-0.7 ms per
+8. **Sampling.** Profiled with 4 concurrent requests at temperature 0.7
+   (`QW_TRACE` splits `Session::generate`): of a 48 ms step, 29 ms were the
+   verification batch and 16-18 ms host sampling (~2 ms per row: three passes
+   over the 248k vocabulary with `exp` twice). Now one pass collects the
+   drawable tokens with their weights (same draw for the same random number)
+   and a step's rows are sampled in parallel (8 threads; each row draws from
+   its own generator seeded in order from the session's, still exact):
+   3 ms per step. 4 x 400-token requests: 133-141 -> 171-176 tok/s
+   aggregate; bursts of 8 x 300-token prompts: 92 -> 114 tok/s. GPU-side
+   sampling (below) would remove the rest. Original note on GPU sampling: Top-k/top-p/min-p sampling costs 0.2-0.7 ms per
    token on the host at temperature > 0; doing it per vocab shard on the GPUs
    (like the log-sum-exp) saves most of that.
 9. **Prefill.** Profiled (`bench/prefill_bench` under rocprofv3): 300 tokens
