@@ -130,10 +130,15 @@ class Scheduler:
         return True
 
     def _admit(self):
-        while self.waiting:
-            r = self.waiting[0]
+        """Gives waiting requests slots in arrival order. One that no free slot fits keeps
+        waiting while the ones after it may take the slots that are free (a request waiting for
+        the big slot does not hold up short ones). It is not starved: every pass offers free
+        slots in arrival order, so it gets the first one it fits."""
+        i = 0
+        while i < len(self.waiting):
+            r = self.waiting[i]
             if r.cancelled.is_set():
-                self.waiting.pop(0)
+                self.waiting.pop(i)
                 r.emit("end", "abort")
                 continue
             n = len(r.prompt)
@@ -141,8 +146,9 @@ class Scheduler:
             need = max(1, min(need, self.e.max_tokens - n))
             slot = self.e.acquire(r.prompt, need, r.media)
             if slot < 0:
-                return  # FIFO: wait for a slot to free up
-            self.waiting.pop(0)
+                i += 1  # keeps waiting; later ones may fit the free slots
+                continue
+            self.waiting.pop(i)
             r.slot = slot
             try:
                 room = self.e.capacity[slot] - n
