@@ -451,6 +451,24 @@ dispatch watchdog logs the stuck job and each rank's phase every 60 s.
 
 ## Open issue: multi-request speculative batches (2026-09-25)
 
+**Likely cause found (2026-09-26): the GPUs' -75 mV undervolt.** A detector
+(`test_speculative --gen 256 --k 5 --repeat 6`: 18 greedy runs per prompt set,
+plain vs speculative vs the engine's greedy reference, with the top-2 margin at
+any divergence) found wrong tokens at -75 mV in plain *and* speculative paths,
+including plain decoding differing from its own earlier run (impossible for
+this deterministic engine on correct hardware) and flips of clear picks (top-2
+margin 0.94). At 0 mV and -50 mV (same 160 W cap) the same test found none, and
+every output stayed bit-identical before and after ~40 min of load:
+
+| offset | detector | prefill | decode M=1/4/8 (ms) | power under load | sclk |
+|---|---|---|---|---|---|
+| 0 mV | 0 wrong | 2,101 tok/s | 14.70 / 21.79 / 26.89 | 550 W | 2,390 MHz |
+| -50 mV | 0 wrong | 2,137 tok/s | 14.93 / 21.84 / 26.94 | 507 W | 2,391 MHz |
+| -75 mV | 2 wrong (+3 in an earlier run) | 2,185 tok/s | 14.87 / 21.90 / 27.12 | 497 W | 2,392 MHz |
+
+The undervolt buys no speed (decode is memory-bound, prefill collective-bound,
+clocks equal), only power. The notes below predate this finding.
+
 Speculative decoding of 3-4 requests at once (verification batches of 11-16
 rows) intermittently goes wrong: tokens that differ from plain decoding, GPU
 page faults (a data read past an allocation on one rank, or instruction

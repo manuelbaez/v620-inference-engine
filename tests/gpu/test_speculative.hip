@@ -6,6 +6,7 @@
 // Usage: qw_spec_test --p 1,2,3 [--p 4,5,6 ...] [--gen 128] [--k 3]
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -30,6 +31,14 @@ static std::vector<int32_t> parse_ids(const std::string &s) {
 
 static int32_t argmax(const float *l) {
     return int32_t(std::max_element(l, l + cfg::VOCAB) - l);
+}
+// top-1 minus top-2 logit: how close a greedy pick was to a tie
+static float margin(const float *l) {
+    const int32_t a = argmax(l);
+    float b = -INFINITY;
+    for (int i = 0; i < cfg::VOCAB; ++i)
+        if (i != a) b = std::max(b, l[i]);
+    return l[a] - b;
 }
 static double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -113,7 +122,7 @@ static void run_spec(Engine &e, std::vector<Seq> &seqs, int gen, int K) {
 
 int main(int argc, char **argv) {
     std::vector<std::vector<int32_t>> prompts;
-    int gen = 128, K = 3;
+    int gen = 128, K = 3, repeat = 1;  // repeat: the single-prompt comparisons, that many times
     bool session_only = false;
     EngineOptions opt;
     opt.slot_tokens = {32768, 32768, 32768, 32768};
@@ -126,6 +135,8 @@ int main(int argc, char **argv) {
             gen = std::stoi(next());
         else if (a == "--k")
             K = std::stoi(next());
+        else if (a == "--repeat")
+            repeat = std::stoi(next());
         else if (a == "--session-only")
             session_only = true;
         else if (a == "--no-warmup")
@@ -138,14 +149,31 @@ int main(int argc, char **argv) {
         int fails = 0;
 
         std::vector<std::vector<int32_t>> ref;
+        std::vector<std::vector<float>> ref_marg;  // top-2 margin of each plain pick
         if (!session_only) {
-            for (size_t p = 0; p < prompts.size(); ++p) {
+            for (size_t pr = 0; pr < prompts.size() * size_t(repeat); ++pr) {
+                const size_t p = pr % prompts.size();
                 e.slot_reset(0);
                 std::vector<int32_t> out{argmax(e.prefill(0, prompts[p]).data())};
+                std::vector<float> marg{0.f};  // margin of each plain pick
                 const double t0 = now();
-                while (int(out.size()) < gen) out.push_back(argmax(e.decode({{0, out.back()}}).data()));
+                while (int(out.size()) < gen) {
+                    const auto &l = e.decode({{0, out.back()}});
+                    out.push_back(argmax(l.data()));
+                    marg.push_back(margin(l.data()));
+                }
                 const double t_plain = now() - t0;
-                ref.push_back(out);
+                if (pr < prompts.size()) {
+                    ref.push_back(out);
+                    ref_marg.push_back(marg);
+                }
+                else if (out != ref[p]) {
+                    size_t k = 0;
+                    while (out[k] == ref[p][k]) ++k;
+                    std::printf("prompt %zu: PLAIN decoding differs from its first run at %zu (margin %.4f)\n", p, k,
+                                marg[k]);
+                    ++fails;
+                }
 
                 e.slot_reset(0);
                 std::vector<Seq> one{{0, {argmax(e.prefill(0, prompts[p]).data())}}};
@@ -164,7 +192,8 @@ int main(int argc, char **argv) {
                 if (!same) {
                     size_t k = 0;
                     while (k < out.size() && out[k] == one[0].out[k]) ++k;
-                    std::printf("  first difference at %zu: plain %d, spec %d\n", k, out[k], one[0].out[k]);
+                    std::printf("  first difference at %zu: plain %d, spec %d; plain's top-2 margin there %.4f\n", k,
+                                out[k], one[0].out[k], marg[k]);
                 }
             }
             if (prompts.size() > 1) {
@@ -174,7 +203,7 @@ int main(int argc, char **argv) {
                     seqs.push_back({int(p), {argmax(e.prefill(int(p), prompts[p]).data())}});
                 }
                 const double t0 = now();
-                run_spec(e, seqs, gen, K);
+                run_spec(e, seqs, gen, std::min(K, Engine::MAX_BATCH_ROWS / int(seqs.size()) - 1));  // <= 16 rows
                 const double dt = now() - t0;
                 bool same = true;
                 for (size_t p = 0; p < prompts.size(); ++p) same = same && seqs[p].out == ref[p];
@@ -240,7 +269,8 @@ int main(int argc, char **argv) {
             std::printf("session generate, %zu prompts at once: plain == spec == engine greedy: %s\n", prompts.size(),
                         same ? "SAME" : "DIFFERENT");
             // one prompt at a time through Session::generate (adaptive drafts, MTP off when it does not pay)
-            for (size_t p = 0; p < prompts.size(); ++p) {
+            for (size_t pr = 0; pr < prompts.size() * size_t(repeat); ++pr) {
+                const size_t p = pr % prompts.size();
                 auto one = [&](int k, double &tps) {
                     for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
                     Session s1(e);
@@ -264,6 +294,13 @@ int main(int argc, char **argv) {
                 fails += a != b;
                 std::printf("session, prompt %zu alone: plain %.1f tok/s, adaptive spec %.1f tok/s, %s\n", p, tp, ts,
                             a == b ? "SAME tokens" : "DIFFERENT");
+                if (a != b) {
+                    size_t k = 0;
+                    while (a[k] == b[k]) ++k;
+                    std::printf("  first difference at %zu: plain %d, spec %d%s; engine greedy %d, its top-2 margin %.4f\n",
+                                k, a[k], b[k], ref.empty() ? "" : "", ref.empty() ? -1 : ref[p][k],
+                                ref_marg.empty() ? NAN : double(ref_marg[p][k]));
+                }
             }
         }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
