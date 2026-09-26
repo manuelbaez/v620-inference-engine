@@ -60,6 +60,8 @@ struct PrefillBuf {
     float *lm_logits;  // [C][VOCAB_L] fp32 (all-logits mode)
     // MTP pass over the chunk: its rows' hidden [C][XW], norm/fc work rows [5][C]
     float *Xm = nullptr, *m_out = nullptr, *m_send = nullptr, *m_red = nullptr;
+    float *m_emb = nullptr;  // [C][SH]: the MTP rows' next-token embeddings, gathered (batched prefill)
+    float *xg = nullptr;     // [MAX_SEGMENTS][XW]: segments' last rows, gathered for lm_head
     uint16_t *m_xn = nullptr;
     float *h_emb = nullptr;     // pinned [C][SH]
     uint16_t *h_ple = nullptr;  // pinned [C][H]

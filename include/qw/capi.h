@@ -80,7 +80,10 @@ int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64
  * and returns 1 once the whole prompt is in, 0 while some is left. */
 int64_t qw_begin_prompt(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media, int n_media);
 int qw_prefill_some(qw_handle *h, int slot, int64_t max_tokens);
-/* Samples the token after the prompt of the last qw_set_prompt. */
+/* qw_prefill_some for n slots in one pass when their pieces fit one prefill
+ * chunk (else one after the other); done[i] = 1 once slots[i]'s prompt is in. */
+int qw_prefill_batch(qw_handle *h, int n, const int32_t *slots, const int64_t *max_tokens, int32_t *done);
+/* Samples the token after the slot's prompt. */
 int32_t qw_sample_prompt(qw_handle *h, int slot, const qw_sampling *p, float *lp);
 
 /* One batched step: row i appends tokens[i] to slots[i] (rows of a slot
@@ -114,6 +117,8 @@ int qw_generate(qw_handle *h, int n, const qw_step_req *reqs, int k, int32_t *to
 /* Top-k (id, logprob) of the raw distribution after the prompt (row < 0) or
  * of a decode row. Returns k. */
 int qw_top_logprobs(qw_handle *h, int row, int k, int32_t *ids, float *lps);
+/* The same after a slot's prompt. */
+int qw_top_logprobs_prompt(qw_handle *h, int slot, int k, int32_t *ids, float *lps);
 
 #ifdef __cplusplus
 }

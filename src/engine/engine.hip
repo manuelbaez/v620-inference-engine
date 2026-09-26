@@ -168,8 +168,9 @@ void Engine::dispatch() {
     static const bool trace = std::getenv("QW_TRACE") != nullptr;
     if (trace) {
         if (job_ == Job::Prefill)
-            log("trace: prefill slot %d [%lld, +%d)%s", pjob_.slot, (long long)pjob_.start, pjob_.T,
-                pjob_.mtp_pend ? " mtp_pend" : "");
+            for (const PrefillSeg &sg : pjob_.segs)
+                log("trace: prefill slot %d [%lld, +%d)%s%s", sg.slot, (long long)sg.start, sg.T,
+                    sg.mtp_pend ? " mtp_pend" : "", pjob_.segs.size() > 1 ? " (batched)" : "");
         else
             log("trace: %s M=%d%s", job_ == Job::Mtp ? "mtp" : "decode", djob_.M, djob_.save ? " save" : "");
     }

@@ -145,6 +145,19 @@ int qw_prefill_some(qw_handle *h, int slot, int64_t max_tokens) {
     return guarded(h, [&] { return h->session->prefill_some(slot, max_tokens) ? 1 : 0; }, -1);
 }
 
+int qw_prefill_batch(qw_handle *h, int n, const int32_t *slots, const int64_t *max_tokens, int32_t *done) {
+    return guarded(
+        h,
+        [&] {
+            std::vector<std::pair<int, int64_t>> reqs;
+            for (int i = 0; i < n; ++i) reqs.push_back({slots[i], max_tokens[i]});
+            const auto d = h->session->prefill_batch(reqs);
+            for (int i = 0; i < n; ++i) done[i] = d[size_t(i)] ? 1 : 0;
+            return 0;
+        },
+        -1);
+}
+
 int qw_acquire_media(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new, const qw_media *media,
                      int n_media) {
     return guarded(
@@ -246,6 +259,20 @@ int qw_top_logprobs(qw_handle *h, int row, int k, int32_t *ids, float *lps) {
                 h->session->top_logprobs_prompt(k, i, l);
             else
                 h->session->top_logprobs_row(row, k, i, l);
+            std::memcpy(ids, i.data(), i.size() * 4);
+            std::memcpy(lps, l.data(), l.size() * 4);
+            return int(i.size());
+        },
+        -1);
+}
+
+int qw_top_logprobs_prompt(qw_handle *h, int slot, int k, int32_t *ids, float *lps) {
+    return guarded(
+        h,
+        [&] {
+            std::vector<int32_t> i;
+            std::vector<float> l;
+            h->session->top_logprobs_prompt(slot, k, i, l);
             std::memcpy(ids, i.data(), i.size() * 4);
             std::memcpy(lps, l.data(), l.size() * 4);
             return int(i.size());

@@ -26,11 +26,12 @@ bool Session::restore_from_store(int slot, const std::vector<int32_t> &prompt, s
     }
     hist.assign(prompt.begin(), prompt.begin() + ptrdiff_t(hit.n));
     common = hist.size();
-    if (common == prompt.size()) e_.set_logits(logits);
+    if (common == prompt.size()) set_prompt_logits(slot, logits);
     return true;
 }
 
-std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to) {
+std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
+                                                    int max_caps, bool append) {
     std::vector<Engine::Capture> caps;
     if (!store_ || boundary_ < 0) return caps;
     const int64_t chunk = e_.prefill_chunk(), n = to;
@@ -43,13 +44,14 @@ std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &
     }
     size_t most = 0;
     for (auto &c : per_chunk) {
-        if (c.size() > size_t(Engine::MAX_CAPTURES))  // keep the first (e.g. the system prompt's end) and the last ones
-            c.erase(c.begin() + 1, c.end() - (Engine::MAX_CAPTURES - 1));
+        if (c.size() > size_t(max_caps))  // keep the first (e.g. the system prompt's end) and the last ones
+            c.erase(c.begin() + 1, c.end() - (max_caps - 1));
         most = std::max(most, c.size());
     }
     // VRAM snapshots to capture into, reused by every chunk (each chunk's are saved before the next runs)
-    reserved_.clear();
-    while (reserved_.size() < most) {
+    if (!append) reserved_.clear();
+    const size_t base = reserved_.size();
+    while (reserved_.size() < base + most) {
         int idx = -1;
         for (int i = 0; i < int(snaps_.size()); ++i) {
             if (std::find(reserved_.begin(), reserved_.end(), i) != reserved_.end()) continue;
@@ -62,7 +64,7 @@ std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &
         reserved_.push_back(idx);
     }
     for (const auto &c : per_chunk)
-        for (size_t j = 0; j < c.size(); ++j) caps.push_back({c[j], reserved_[j]});
+        for (size_t j = 0; j < c.size(); ++j) caps.push_back({c[j], reserved_[base + j]});
     return caps;
 }
 
@@ -94,6 +96,77 @@ void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_
         },
         caps, embeds);
     reserved_.clear();
+}
+
+std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_t>> &reqs) {
+    struct Piece {
+        int slot;
+        int64_t from, to;
+    };
+    std::vector<Piece> pieces;
+    int64_t total = 0;
+    bool batchable = true;
+    for (const auto &[slot, max_tokens] : reqs) {
+        const SlotInfo &si = slots_[size_t(slot)];
+        if (si.pending.empty()) continue;
+        const int64_t from = int64_t(si.hist.size()), n = int64_t(si.pending.size());
+        const int64_t to = max_tokens >= n - from ? n : from + std::max<int64_t>(1, max_tokens);
+        pieces.push_back({slot, from, to});
+        total += to - from;
+        batchable = batchable && si.pending_media.empty();
+    }
+    std::vector<bool> done;
+    if (pieces.size() < 2 || !batchable || total > e_.prefill_chunk() ||
+        pieces.size() > size_t(Engine::MAX_SEGMENTS)) {
+        for (const auto &[slot, max_tokens] : reqs) done.push_back(prefill_some(slot, max_tokens));
+        return done;
+    }
+    // snapshots to capture into: at most half the VRAM pool over all segments, the rest for their ends
+    const int caps_each = std::max(1, Engine::SNAPSHOTS / 2 / int(pieces.size()));
+    std::vector<Engine::Segment> segs;
+    size_t blocks = 0, snaps = 0;
+    reserved_.clear();
+    for (const Piece &pc : pieces) {
+        const auto &prompt = slots_[size_t(pc.slot)].pending;
+        drop_snapshots_after(pc.slot, pc.from);
+        auto caps = plan_captures(prompt, pc.from, pc.to, caps_each, true);
+        blocks += size_t(pc.to - pc.from) / BlockStore::BLOCK + 2 * (caps.size() + 1);
+        snaps += caps.size() + 1;
+        segs.push_back({pc.slot, std::vector<int32_t>(prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to)),
+                        std::move(caps)});
+    }
+    if (store_) store_->reserve(blocks, snaps);  // pin the saves' memory while the GPUs prefill
+    const auto &logits = e_.prefill_batch(segs);
+    for (size_t i = 0; i < pieces.size(); ++i) {  // what prefill_range does after a chunk, per segment
+        const Piece &pc = pieces[i];
+        SlotInfo &si = slots_[size_t(pc.slot)];
+        const auto &prompt = si.pending;
+        for (const Engine::Capture &c : segs[i].captures)
+            store_->save(pc.slot, c.snap, std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(c.pos)),
+                         nullptr);
+        si.hist.insert(si.hist.end(), prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to));
+        const int idx = save_snapshot(pc.slot, &logits[i]);
+        const bool keep = pc.to == int64_t(prompt.size()) || pc.to % e_.prefill_chunk() == 0;
+        if (store_ && keep && pc.to >= min_gap_) store_->save(pc.slot, idx, si.hist, &snaps_[size_t(idx)].logits);
+    }
+    reserved_.clear();
+    std::vector<bool> finished(pieces.size());
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        SlotInfo &si = slots_[size_t(pieces[i].slot)];
+        finished[i] = int64_t(si.hist.size()) == int64_t(si.pending.size());
+        if (!finished[i]) continue;
+        si.logits = logits[i];
+        si.prompt_end = int64_t(si.pending.size());
+        si.pending.clear();
+    }
+    single_ = false;
+    for (const auto &[slot, max_tokens] : reqs) {
+        bool d = slots_[size_t(slot)].pending.empty();
+        for (size_t i = 0; i < pieces.size(); ++i)
+            if (pieces[i].slot == slot) d = finished[i];
+        done.push_back(d);
+    }
+    return done;
 }
 
 void Session::count_reuse(const std::vector<int32_t> &prompt, int64_t reused) {

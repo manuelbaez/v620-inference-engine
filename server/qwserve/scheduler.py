@@ -35,6 +35,7 @@ class Request:
         self.generated = 0
         self.next = None    # sampled token not yet fed to the engine
         self.cached = 0     # prompt tokens reused from the prefix cache
+        self.left = 0       # prompt tokens still to prefill
         self.keep = None    # buffers the engine reads while the prompt is prefilled
         self.t_admit = self.t_first = None  # prefill start, first token (time.time())
 
@@ -65,11 +66,15 @@ class Scheduler:
     piece (QW_PREFILL_PIECE tokens, default 2048) at a time, and between pieces
     the running requests decode for QW_DECODE_SHARE (default 0.25) of the
     piece's time (at least one step): a long prompt never stalls the others for
-    more than one piece, and they keep a share of the GPUs while it goes in."""
+    more than one piece, and they keep a share of the GPUs while it goes in.
+    Prompts waiting together go into one prefill pass while they fit a piece
+    (a prefill chunk when nothing decodes), so a burst of short prompts pays
+    the pass's fixed cost once (QW_PREFILL_BATCH=0 turns that off)."""
 
     DEFAULT_RESERVE = 2048  # room reserved when the request sets no max_tokens
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
+    BATCH_PREFILL = os.environ.get("QW_PREFILL_BATCH", "1") != "0"  # several prompts per prefill pass
 
     def __init__(self, engine, mtp_drafts=3):
         self.e = engine
@@ -145,6 +150,7 @@ class Scheduler:
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
                 r.t_admit = time.time()
                 r.cached, r.keep = self.e.begin_prompt(slot, r.prompt, r.media)
+                r.left = len(r.prompt) - r.cached
                 self.cache_stats = self.e.cache_stats()
                 r.emit("start", r.cached)
             except Exception as ex:  # noqa: BLE001
@@ -153,35 +159,64 @@ class Scheduler:
                 continue
             self.prefilling.append(r)
 
+    def _batch(self):
+        """The prefills to advance in one engine pass: the oldest one, plus the next ones while
+        their whole prompts fit (QW_PREFILL_PIECE tokens while others decode, else one prefill
+        chunk); only the first may go in partly. [(request, tokens)]."""
+        room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if self.active else self.e.prefill_chunk
+        batch = []
+        for r in self.prefilling:
+            if r.media or room <= 0 or (batch and (r.left > room or not self.BATCH_PREFILL)):
+                break  # media prompts go alone (their vision tokens are encoded per slot)
+            take = min(r.left, room)
+            batch.append((r, take))
+            room -= take
+        if not batch:
+            batch = [(self.prefilling[0], self.PREFILL_PIECE)]
+        if len(batch) == 1 and not self.active:
+            batch = [(batch[0][0], 1 << 40)]  # nothing decoding: the whole prompt now
+        return batch
+
     def _prefill(self):
-        """Advances the oldest prefill: by one piece while others decode (then
-        returns so they get steps), to the end when nothing is decoding.
-        Returns the seconds spent."""
+        """Advances the oldest prefills: by one piece (several short prompts batched into one
+        pass) while others decode, then returns so they get steps; to the end when nothing is
+        decoding. Returns the seconds spent."""
         t0 = time.time()
         while self.prefilling:
-            r = self.prefilling[0]
-            if r.cancelled.is_set():
-                self.prefilling.pop(0)
+            for r in [r for r in self.prefilling if r.cancelled.is_set()]:
+                self.prefilling.remove(r)
                 self._finish(r, "abort")
-                continue
+            if not self.prefilling:
+                break
+            batch = self._batch()
             try:
-                done = self.e.prefill_some(r.slot, self.PREFILL_PIECE if self.active else 1 << 40)
-                if not done:
-                    return time.time() - t0
-                self.prefilling.pop(0)
-                self.cache_stats = self.e.cache_stats()
-                top = self.e.top_logprobs(-1, r.want_top) if r.want_top else None
-                tid, lp = self.e.sample_prompt(r.slot, r.sampling)
-                r.t_first = time.time()
-                r.keep = None
+                if len(batch) == 1:
+                    done = [self.e.prefill_some(batch[0][0].slot, batch[0][1])]
+                else:
+                    done = self.e.prefill_batch([(r.slot, n) for r, n in batch])
             except Exception as ex:  # noqa: BLE001
-                if self.prefilling and self.prefilling[0] is r:
-                    self.prefilling.pop(0)
-                r.emit("error", str(ex))
-                self._finish(r, "abort")
+                for r, _ in batch:
+                    self.prefilling.remove(r)
+                    r.emit("error", str(ex))
+                    self._finish(r, "abort")
                 continue
-            if self._took(r, tid, lp, top):
-                self.active.append(r)
+            self.cache_stats = self.e.cache_stats()
+            for (r, n), d in zip(batch, done):
+                if not d:
+                    r.left -= n
+                    continue
+                self.prefilling.remove(r)
+                try:
+                    top = self.e.top_logprobs_prompt(r.slot, r.want_top) if r.want_top else None
+                    tid, lp = self.e.sample_prompt(r.slot, r.sampling)
+                    r.t_first = time.time()
+                    r.keep = None
+                except Exception as ex:  # noqa: BLE001
+                    r.emit("error", str(ex))
+                    self._finish(r, "abort")
+                    continue
+                if self._took(r, tid, lp, top):
+                    self.active.append(r)
             if self.active:
                 return time.time() - t0  # let the running requests take steps before the next prefill
         return time.time() - t0

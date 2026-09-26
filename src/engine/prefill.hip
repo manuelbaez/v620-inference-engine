@@ -30,27 +30,34 @@ namespace qw {
 
 static_assert(Engine::MAX_CAPTURES == gpu::MAX_CAPTURES);
 
-// One prefill chunk (pjob_) on rank rk, as two micro-batches (A = first
-// half, B = second half) on two streams with separate collective channels, so
-// one half's collectives overlap the other half's compute. B depends on A only
-// through sequential state, per layer: the GDN conv tail and recurrent state,
-// the QSA K/V and compressed keys, and the PLE conv tail. The host enqueues
-// layer l of A before layer l of B, so every event wait follows its record.
-// Short chunks run as a single micro-batch.
+// One prefill chunk (pjob_) on rank rk: the rows of one or more segments
+// (distinct slots) concatenated. Row-wise work (projections, mixers, MoE,
+// collectives) runs once over all rows; the sequence kernels (GDN conv and
+// scan, QSA K/V and attention, PLE conv, MTP shift) run per segment on its
+// rows. The chunk runs as two micro-batches (A = first half of the rows, B =
+// second half) on two streams with separate collective channels, so one
+// half's collectives overlap the other half's compute. A segment can
+// straddle the halves; B then depends on A through that segment's
+// sequential state, per layer: the GDN conv tail and recurrent state, the QSA
+// K/V and compressed keys, and the PLE conv tail. The host enqueues layer l
+// of A before layer l of B, so every event wait follows its record. Short
+// chunks run as a single micro-batch.
 void Engine::run_prefill_rank(Rank &rk) {
     static const bool profile = std::getenv("QW_PROFILE") != nullptr;
     static const bool no_split = std::getenv("QW_NO_SPLIT") != nullptr;
     const auto t_start = std::chrono::steady_clock::now();
     const int r = rk.r;
-    const int64_t start = pjob_.start;
+    const auto &segs = pjob_.segs;
     const int T = pjob_.T;
-    Rank::Slot &sl = rk.slots[size_t(pjob_.slot)];
-    if (pjob_.reset) {
-        CK(hipMemsetAsync(sl.S, 0, SLOT_S * 4, rk.s));
-        CK(hipMemsetAsync(sl.ring, 0, SLOT_RING * 4, rk.s));
-        CK(hipMemsetAsync(sl.ple, 0, SLOT_PLE * 4, rk.s));
-    }
-    int32_t *rope3 = nullptr;  // this chunk's (t, h, w) positions on the device
+    for (const PrefillSeg &sg : segs)
+        if (sg.reset) {
+            Rank::Slot &sl = rk.slots[size_t(sg.slot)];
+            CK(hipMemsetAsync(sl.S, 0, SLOT_S * 4, rk.s));
+            CK(hipMemsetAsync(sl.ring, 0, SLOT_RING * 4, rk.s));
+            CK(hipMemsetAsync(sl.ple, 0, SLOT_PLE * 4, rk.s));
+        }
+    const int64_t start0 = segs[0].start;  // (rope3 and the GDN transfer: one segment)
+    int32_t *rope3 = nullptr;              // this chunk's (t, h, w) positions on the device
     if (pjob_.rope3) {
         if (!rk.rope3 || rk.rope3_cap < T) {
             if (rk.rope3) CK(hipFree(rk.rope3));
@@ -64,6 +71,16 @@ void Engine::run_prefill_rank(Rank &rk) {
     const int TA = split ? T / 2 : T;
     QW_CHECK(TA <= rk.pb[0].C && T - TA <= rk.pb[1].C, "prefill chunk larger than its buffers");
 
+    // A segment's rows inside one micro-batch.
+    struct Sub {
+        int seg;
+        Rank::Slot *sl;
+        int64_t start;  // slot position of its first row
+        int T;
+        int row;    // first row in the micro-batch
+        bool cont;  // continues the segment's rows of the other micro-batch
+        bool last;  // holds the segment's last row
+    };
     struct MB {
         PrefillBuf *b;
         hipStream_t s;
@@ -71,16 +88,24 @@ void Engine::run_prefill_rank(Rank &rk) {
         Comm *comm;
         uint32_t *seq_base;
         uint32_t k;
-        int64_t start;
         int T;
         int row0;  // offset of this micro-batch in the chunk
         const float *pend;
+        std::vector<Sub> subs;
     };
     std::vector<MB> mbs;
-    mbs.push_back({&rk.pb[0], rk.s, rk.blas, comm_.get(), &rk.seq_base, 0, start, TA, 0, nullptr});
+    mbs.push_back({&rk.pb[0], rk.s, rk.blas, comm_.get(), &rk.seq_base, 0, TA, 0, nullptr, {}});
     if (split)
         mbs.push_back({&rk.pb[1], no_split ? rk.s : rk.s2, no_split ? rk.blas : rk.blas2, comm2_.get(), &rk.seq_base2,
-                       0, start + TA, T - TA, TA, nullptr});
+                       0, T - TA, TA, nullptr, {}});
+    for (MB &m : mbs)
+        for (int i = 0; i < int(segs.size()); ++i) {
+            const PrefillSeg &sg = segs[size_t(i)];
+            const int a = std::max(m.row0, sg.row0), e = std::min(m.row0 + m.T, sg.row0 + sg.T);
+            if (a < e)
+                m.subs.push_back({i, &rk.slots[size_t(sg.slot)], sg.start + (a - sg.row0), e - a, a - m.row0,
+                                  a > sg.row0, e == sg.row0 + sg.T});
+        }
     // B's stream starts after A's (resets, previous chunk's state)
     if (split) {
         CK(hipEventRecord(rk.ev[0], rk.s));
@@ -132,11 +157,10 @@ void Engine::run_prefill_rank(Rank &rk) {
         gpu::hc_mix_T(b.g, b.xn, rows, b.bin_local, m.s);
         allgather(m, b.bin_local, b.bin, SH * 2, rows);
     };
-    // Snapshot captures of this chunk, as the per-layer destinations of one kind of state.
-    const auto &caps = pjob_.captures;
-    auto captures = [&](auto dst_of) {
+    // Snapshot captures of a sub's segment, as the per-layer destinations of one kind of state.
+    auto captures = [&](const Sub &sb, auto dst_of) {
         gpu::Captures c;
-        for (const Capture &cp : caps) {
+        for (const Capture &cp : segs[size_t(sb.seg)].captures) {
             c.pos[c.n] = cp.pos;
             c.dst[c.n++] = dst_of(rk.snaps[size_t(cp.snap)]);
         }
@@ -149,10 +173,10 @@ void Engine::run_prefill_rank(Rank &rk) {
         if (split && &m == &mbs[1]) CK(hipStreamWaitEvent(m.s, rk.ev[size_t(l * 4 + what)], 0));
     };
 
-    // One decoder layer over rows [0, T) of X at positions start.. (after the
+    // One decoder layer over rows [0, T) of X, the rows of `subs` (after the
     // PLE step, if any); l indexes the micro-batch events. Leaves the MoE
     // output pending in m.pend.
-    auto layer = [&](MB &m, LayerW &w, int l, bool qsa, int idx, float *X, int64_t start, int T) {
+    auto layer = [&](MB &m, LayerW &w, int l, bool qsa, int idx, float *X, const std::vector<Sub> &subs, int T) {
         PrefillBuf &b = *m.b;
         hipStream_t s = m.s;
         const bool calib = l < N_LAYERS && calibrating(l);  // (l == N_LAYERS: the MTP layer)
@@ -162,48 +186,64 @@ void Engine::run_prefill_rank(Rank &rk) {
         mix(m, w.attn_hc, X, T, m.pend, b.inj_mlp, b.inj_attn, calib ? ln + ".attn_hc" : std::string());
         if (calib) cal(m, ln + (qsa ? ".qsa_proj" : ".gdn_proj"), b.bin, H, T, H);
         if (qsa) {
-            const int qi = idx;
+            const size_t qi = size_t(idx);
+            constexpr size_t QW = size_t(QH_L) * HEAD_DIM, IW = size_t(IDX_HEADS) * IDX_DIM;
             gemm(m, w.qsa_proj, QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
-            const int32_t *r3 = rope3 && l < N_LAYERS ? rope3 + size_t(start - pjob_.start) * 3 : nullptr;
-            gpu::qsa_prep_T(b.P, w.qn, w.kn, w.iqn, start, T, b.q16, b.qgate, b.iq16, sl.K[size_t(qi)],
-                            sl.V[size_t(qi)], sl.raw_k[size_t(qi)], s, r3);
-            wait(m, l, 2);  // A's K/V and raw keys (a group can straddle the halves)
-            gpu::qsa_compress_T(sl.raw_k[size_t(qi)], w.ikn, start, T, sl.ck[size_t(qi)], s,
-                                l < N_LAYERS ? rope3 : nullptr, pjob_.start);
-            record(m, l, 2);
-            for (int q0 = 0; q0 < T; q0 += b.Qb) {
-                const int Q = std::min(b.Qb, T - q0);
-                const int64_t p0 = start + q0;
-                const int nb_max = int((p0 + Q) / IDX_RATIO);
-                if (nb_max > IDX_TOPK_BLOCKS) {
-                    const int ld = (nb_max + 7) / 8 * 8;
-                    gemm(m, sl.ck[size_t(qi)], nb_max, IDX_DIM, b.iq16 + size_t(q0) * IDX_HEADS * IDX_DIM, IDX_DIM,
-                         Q * IDX_HEADS, b.sc16, ld, true);
-                    gpu::qsa_score_reduce_T(b.sc16, ld, p0, Q, b.scores, s);
-                    gpu::qsa_select_T(b.scores, ld, p0, Q, b.lists, b.lcounts, s);
-                } else {
-                    gpu::qsa_select_T(b.scores, 0, p0, Q, b.lists, b.lcounts, s);
-                }
-                gpu::qsa_attend_T(b.q16 + size_t(q0) * QH_L * HEAD_DIM, b.qgate + size_t(q0) * QH_L * HEAD_DIM,
-                                  sl.K[size_t(qi)], sl.V[size_t(qi)], b.lists, b.lcounts, Q, b.att_partial,
-                                  b.act + size_t(q0) * QH_L * HEAD_DIM, s);
+            for (const Sub &sb : subs) {
+                const int32_t *r3 = rope3 && l < N_LAYERS ? rope3 + size_t(sb.start - start0) * 3 : nullptr;
+                gpu::qsa_prep_T(b.P + size_t(sb.row) * QSA_PROJ_L, w.qn, w.kn, w.iqn, sb.start, sb.T,
+                                b.q16 + sb.row * QW, b.qgate + sb.row * QW, b.iq16 + sb.row * IW, sb.sl->K[qi],
+                                sb.sl->V[qi], sb.sl->raw_k[qi], s, r3);
             }
+            wait(m, l, 2);  // A's K/V and raw keys (a group can straddle the halves)
+            for (const Sub &sb : subs)
+                gpu::qsa_compress_T(sb.sl->raw_k[qi], w.ikn, sb.start, sb.T, sb.sl->ck[qi], s,
+                                    l < N_LAYERS ? rope3 : nullptr, start0);
+            record(m, l, 2);
+            for (const Sub &sb : subs)
+                for (int q0 = 0; q0 < sb.T; q0 += b.Qb) {
+                    const int Q = std::min(b.Qb, sb.T - q0);
+                    const int64_t p0 = sb.start + q0;
+                    const size_t row = size_t(sb.row + q0);
+                    const int nb_max = int((p0 + Q) / IDX_RATIO);
+                    if (nb_max > IDX_TOPK_BLOCKS) {
+                        const int ld = (nb_max + 7) / 8 * 8;
+                        gemm(m, sb.sl->ck[qi], nb_max, IDX_DIM, b.iq16 + row * IW, IDX_DIM, Q * IDX_HEADS, b.sc16, ld,
+                             true);
+                        gpu::qsa_score_reduce_T(b.sc16, ld, p0, Q, b.scores, s);
+                        gpu::qsa_select_T(b.scores, ld, p0, Q, b.lists, b.lcounts, s);
+                    } else {
+                        gpu::qsa_select_T(b.scores, 0, p0, Q, b.lists, b.lcounts, s);
+                    }
+                    gpu::qsa_attend_T(b.q16 + row * QW, b.qgate + row * QW, sb.sl->K[qi], sb.sl->V[qi], b.lists,
+                                      b.lcounts, Q, b.att_partial, b.act + row * QW, s);
+                }
             if (calib) cal(m, ln + ".qsa_o", b.act, QH_L * HEAD_DIM, T, QH_L * HEAD_DIM);
             gemm(m, w.qsa_o, H, QH_L * HEAD_DIM, b.act, QH_L * HEAD_DIM, T, b.part16, H, true);
         } else {
-            const int gi = idx;
-            float *ring = sl.ring + size_t(gi) * GDN_RING * GDN_QKV_L;
+            const size_t gi = size_t(idx);
+            constexpr size_t OW = size_t(GDN_VL) * GDN_DIM, GW = size_t(GDN_VL) * 2;
             gemm(m, w.gdn_proj, GDN_PROJ_L, H, b.bin, H, T, b.P, GDN_PROJ_L, true);
             wait(m, l, 0);
-            gpu::gdn_conv_T(b.P, ring, w.gdn_conv, w.gdn_A, w.gdn_dt, start, T, b.qkv, b.gb, s);
-            gpu::gdn_ring_update_T(b.P, ring, start, T, s, captures([&](const Rank::Snap &sn) {
-                                       return sn.ring + size_t(gi) * GDN_RING * GDN_QKV_L;
-                                   }));
+            for (const Sub &sb : subs) {
+                float *ring = sb.sl->ring + gi * GDN_RING * GDN_QKV_L;
+                const uint16_t *P = b.P + size_t(sb.row) * GDN_PROJ_L;
+                gpu::gdn_conv_T(P, ring, w.gdn_conv, w.gdn_A, w.gdn_dt, sb.start, sb.T,
+                                b.qkv + size_t(sb.row) * GDN_QKV_L, b.gb + sb.row * GW, s);
+                gpu::gdn_ring_update_T(P, ring, sb.start, sb.T, s, captures(sb, [&](const Rank::Snap &sn) {
+                                           return sn.ring + gi * GDN_RING * GDN_QKV_L;
+                                       }));
+            }
             record(m, l, 0);
             wait(m, l, 1);
-            gpu::gdn_scan_T(b.qkv, b.gb, sl.S + size_t(gi) * GDN_STATE, T, b.o_raw, s, start,
-                            captures([&](const Rank::Snap &sn) { return sn.S + size_t(gi) * GDN_STATE; }));
-            if (pjob_.transfer) gpu::gdn_transfer_T(b.qkv, b.gb, rk.transfer + size_t(gi) * GDN_STATE, T, s);
+            for (const Sub &sb : subs) {
+                gpu::gdn_scan_T(b.qkv + size_t(sb.row) * GDN_QKV_L, b.gb + sb.row * GW, sb.sl->S + gi * GDN_STATE,
+                                sb.T, b.o_raw + sb.row * OW, s, sb.start,
+                                captures(sb, [&](const Rank::Snap &sn) { return sn.S + gi * GDN_STATE; }));
+                if (pjob_.transfer)
+                    gpu::gdn_transfer_T(b.qkv + size_t(sb.row) * GDN_QKV_L, b.gb + sb.row * GW,
+                                        rk.transfer + gi * GDN_STATE, sb.T, s);
+            }
             record(m, l, 1);
             gpu::gdn_norm_T(b.o_raw, b.P, w.gdn_norm, T, b.act, s);
             if (calib) cal(m, ln + ".gdn_out", b.act, GDN_VL * GDN_DIM, T, GDN_VL * GDN_DIM);
@@ -245,36 +285,57 @@ void Engine::run_prefill_rank(Rank &rk) {
                 gpu::ple_stats_T(b.kv, b.X, rk.ple_nk, rk.ple_nq, m.T, b.ple_send, s);
                 allreduce(m, b.ple_send, b.ple_red, 16, m.T);
                 wait(m, l, 3);
-                gpu::ple_apply_T(b.kv, b.ple_red, rk.ple_nc, rk.ple_conv, sl.ple, m.start, m.T, b.ncbuf, b.X, s,
-                                 captures([](const Rank::Snap &sn) { return sn.ple; }));
+                for (const Sub &sb : m.subs)
+                    gpu::ple_apply_T(b.kv + size_t(sb.row) * PLE_KV, b.ple_red + size_t(sb.row) * 16, rk.ple_nc,
+                                     rk.ple_conv, sb.sl->ple, sb.start, sb.T, b.ncbuf + size_t(sb.row) * XW,
+                                     b.X + size_t(sb.row) * XW, s,
+                                     captures(sb, [](const Rank::Snap &sn) { return sn.ple; }));
                 record(m, l, 3);
             }
             const bool qsa = is_qsa(l);
-            layer(m, w, l, qsa, qsa ? qsa_index(l) : gdn_index(l), b.X, m.start, m.T);
+            layer(m, w, l, qsa, qsa ? qsa_index(l) : gdn_index(l), b.X, m.subs, m.T);
         }
     }
     for (auto &m : mbs) {  // complete X: the pre-final-mixer hidden (lm_head and MTP input)
         gpu::hc_combine_T(m.b->X, m.pend, m.b->inj_mlp, m.T, m.s);
         m.pend = nullptr;
-        for (const Capture &cp : caps)  // a capture's MTP input: the hidden of its last token
-            if (cp.pos > m.start && cp.pos <= m.start + m.T)
-                CK(hipMemcpyAsync(rk.snaps[size_t(cp.snap)].pend, m.b->X + size_t(cp.pos - 1 - m.start) * XW, XW * 4,
-                                  hipMemcpyDeviceToDevice, m.s));
+        for (const Sub &sb : m.subs)
+            for (const Capture &cp : segs[size_t(sb.seg)].captures)  // a capture's MTP input: its last token's hidden
+                if (cp.pos > sb.start && cp.pos <= sb.start + sb.T)
+                    CK(hipMemcpyAsync(rk.snaps[size_t(cp.snap)].pend,
+                                      m.b->X + size_t(sb.row + cp.pos - 1 - sb.start) * XW, XW * 4,
+                                      hipMemcpyDeviceToDevice, m.s));
     }
-    // MTP layer over the rows whose next token is known: row t of a
-    // micro-batch pairs X[t] with token t + 1. The rows start one early, from
-    // the slot's MTP input store (the previous chunk's or micro-batch's last
-    // hidden), and the micro-batch's last hidden goes into the store.
+    // MTP layer over the rows whose next token is known: row t of a segment
+    // pairs X[t] with token t + 1. A segment's rows start one early, from the
+    // slot's MTP input store (the previous chunk's or micro-batch's last
+    // hidden), and its last hidden goes into the store.
     if (mtp_)
         for (auto &m : mbs) {
             PrefillBuf &b = *m.b;
             hipStream_t s = m.s;
-            const int o = (m.row0 > 0 || pjob_.mtp_pend) ? 1 : 0;
-            const int rows = m.T - 1 + o;
+            std::vector<Sub> msubs;  // the MTP rows of each sub, packed from row 0 of Xm
+            std::vector<int> first;  // row of b.emb with the next token of each one's first MTP row
+            int rows = 0;
             wait(m, N_LAYERS, 3);  // A's store write and MTP K/V
+            for (const Sub &sb : m.subs) {
+                const int o = (sb.cont || segs[size_t(sb.seg)].mtp_pend) ? 1 : 0;
+                const int n = sb.T - 1 + o;
+                if (n <= 0) continue;
+                gpu::mtp_shift(sb.sl->pend, b.X + size_t(sb.row) * XW, o, n, b.Xm + size_t(rows) * XW, s);
+                msubs.push_back({sb.seg, sb.sl, sb.start - o, n, rows, false, false});
+                first.push_back(sb.row + 1 - o);
+                rows += n;
+            }
             if (rows > 0) {
-                gpu::mtp_shift(sl.pend, b.X, o, rows, b.Xm, s);
-                const float *emb = b.emb + size_t(1 - o) * SH;  // next tokens' embeddings (rank slice)
+                // next tokens' embeddings (rank slice): a sub's MTP row j pairs with its row j + 1 - o
+                const float *emb = b.emb + size_t(first[0]) * SH;
+                if (msubs.size() > 1) {
+                    emb = b.m_emb;
+                    for (size_t j = 0; j < msubs.size(); ++j)
+                        CK(hipMemcpyAsync(b.m_emb + size_t(msubs[j].row) * SH, b.emb + size_t(first[j]) * SH,
+                                          size_t(msubs[j].T) * SH * 4, hipMemcpyDeviceToDevice, s));
+                }
                 gpu::mtp_ssq(b.Xm, emb, rows, b.m_send, s);
                 allreduce(m, b.m_send, b.m_red, 4, rows);
                 gpu::mtp_norm(b.Xm, emb, b.m_red, rk.mtp_nh, rk.mtp_ne, rows, b.m_xn, s);
@@ -284,41 +345,104 @@ void Engine::run_prefill_rank(Rank &rk) {
                     reduce_scatter16(m, b.part16, b.m_out + size_t(st) * rows * SH, rows);
                 }
                 gpu::mtp_add(b.m_out, rows, b.Xm, s);
-                layer(m, rk.mtp, N_LAYERS, true, N_QSA, b.Xm, m.start - o, rows);
+                layer(m, rk.mtp, N_LAYERS, true, N_QSA, b.Xm, msubs, rows);
                 m.pend = nullptr;  // the MTP output is not needed here
             }
-            CK(hipMemcpyAsync(sl.pend, b.X + size_t(m.T - 1) * XW, XW * 4, hipMemcpyDeviceToDevice, s));
+            for (const Sub &sb : m.subs)
+                CK(hipMemcpyAsync(sb.sl->pend, b.X + size_t(sb.row + sb.T - 1) * XW, XW * 4, hipMemcpyDeviceToDevice,
+                                  s));
             record(m, N_LAYERS, 3);
         }
-    // final mixer + lm_head: every row in all-logits mode, else the chunk's last one
-    std::vector<std::pair<MB *, int>> outs;  // (micro-batch, first row)
+    // final mixer + lm_head: every row in all-logits mode, else each segment's last one
+    struct Out {
+        MB *m;
+        int rows;
+        std::vector<float *> dst;  // host destination (rank slice) of each row
+    };
+    std::vector<Out> outs;
     for (auto &m : mbs) {
-        const bool last = &m == &mbs.back();
-        if (!pjob_.all_logits && !last) continue;
-        const int r0 = pjob_.all_logits ? 0 : m.T - 1, rows = m.T - r0;
+        PrefillBuf &b = *m.b;
         const bool calib_final = calibrating(N_LAYERS);
-        mix(m, rk.final_hc, m.b->X + size_t(r0) * HC * SH, rows, nullptr, nullptr, nullptr,
-            calib_final ? std::string("final_hc") : std::string());
-        if (calib_final) cal(m, "lm_head", m.b->bin, H, rows, H);
-        gemm(m, rk.lm_head, VOCAB_L, H, m.b->bin, H, rows, m.b->lm_logits, VOCAB_L, false);
-        outs.push_back({&m, r0});
+        Out o{&m, 0, {}};
+        float *X = nullptr;
+        if (pjob_.all_logits) {
+            X = b.X;
+            o.rows = m.T;
+            for (int i = 0; i < m.T; ++i) o.dst.push_back(plogits_.data() + size_t(m.row0 + i) * VOCAB + size_t(r) * VOCAB_L);
+        } else {
+            std::vector<const Sub *> ends;
+            for (const Sub &sb : m.subs)
+                if (sb.last) ends.push_back(&sb);
+            if (ends.empty()) continue;
+            if (ends.size() == 1) {
+                X = b.X + size_t(ends[0]->row + ends[0]->T - 1) * XW;
+            } else {
+                X = b.xg;
+                for (size_t i = 0; i < ends.size(); ++i)
+                    CK(hipMemcpyAsync(b.xg + i * XW, b.X + size_t(ends[i]->row + ends[i]->T - 1) * XW, XW * 4,
+                                      hipMemcpyDeviceToDevice, m.s));
+            }
+            o.rows = int(ends.size());
+            for (const Sub *sb : ends) o.dst.push_back(seg_logits_[size_t(sb->seg)].data() + size_t(r) * VOCAB_L);
+        }
+        mix(m, rk.final_hc, X, o.rows, nullptr, nullptr, nullptr, calib_final ? std::string("final_hc") : std::string());
+        if (calib_final) cal(m, "lm_head", b.bin, H, o.rows, H);
+        gemm(m, rk.lm_head, VOCAB_L, H, b.bin, H, o.rows, b.lm_logits, VOCAB_L, false);
+        outs.push_back(std::move(o));
     }
     for (auto &m : mbs) {
         *m.seq_base += m.k;
         phase_[size_t(r)] = 2;
         CK(hipStreamSynchronize(m.s));
     }
-    for (auto &[m, r0] : outs)
-        for (int i = 0; i < m->T - r0; ++i) {
-            float *dst = (pjob_.all_logits ? plogits_.data() + size_t(m->row0 + r0 + i) * VOCAB : logits_.data()) +
-                         size_t(r) * VOCAB_L;
-            CK(hipMemcpy(dst, m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4, hipMemcpyDeviceToHost));
-        }
+    for (const Out &o : outs)
+        for (int i = 0; i < o.rows; ++i)
+            CK(hipMemcpy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,
+                         hipMemcpyDeviceToHost));
     if (profile) {
         const auto t_end = std::chrono::steady_clock::now();
-        log("rank %d prefill [%lld, +%d)%s: %.1f ms", r, (long long)start, T, split ? " split" : "",
-            std::chrono::duration<double, std::milli>(t_end - t_start).count());
+        log("rank %d prefill [%lld, +%d) %zu segment(s)%s: %.1f ms", r, (long long)start0, T, segs.size(),
+            split ? " split" : "", std::chrono::duration<double, std::milli>(t_end - t_start).count());
     }
+}
+
+void Engine::prefill_inputs(int slot, const std::vector<int32_t> &chunk, int row0,
+                            const std::vector<EmbedSpan> &embeds) {
+    const SlotHost &sh = slots_[size_t(slot)];
+    const int T = int(chunk.size());
+    for (int t = 0; t < T; ++t) {
+        const int32_t tok = chunk[size_t(t)];
+        QW_CHECK(tok < VOCAB, "token out of range");
+        if (tok < 0) continue;  // a vision token: its row comes from `embeds`
+        for (int j = 0; j < H; ++j) pemb_[size_t(row0 + t) * H + j] = bf16_to_f32(embed_[size_t(tok) * H + j]);
+    }
+    int64_t covered = 0;
+    const int64_t c_start = sh.len;
+    for (const EmbedSpan &sp : embeds) {
+        const int64_t a = std::max(sp.pos, c_start), b = std::min(sp.pos + sp.n, c_start + T);
+        for (int64_t p = a; p < b; ++p)
+            std::memcpy(&pemb_[size_t(row0 + p - c_start) * H], sp.rows + size_t(p - sp.pos) * H, H * 4);
+        covered += std::max<int64_t>(0, b - a);
+    }
+    QW_CHECK(covered == std::count_if(chunk.begin(), chunk.end(), [](int32_t t) { return t < 0; }),
+             "prefill: vision tokens without embeddings (or embeddings over text tokens)");
+    auto ids = hasher_.ids_for(sh.hist, chunk);
+    std::vector<float> e(H);
+    for (int t = 0; t < T; ++t) {
+        ple_->gather(ids[size_t(t)], e.data());
+        for (int j = 0; j < H; ++j) pple_[size_t(row0 + t) * H + j] = f32_to_f16(e[size_t(j)]);
+    }
+}
+
+void Engine::prefill_commit(int slot, const std::vector<int32_t> &chunk) {
+    SlotHost &sh = slots_[size_t(slot)];
+    const ptrdiff_t T = ptrdiff_t(chunk.size());
+    sh.reset = false;
+    sh.hist.insert(sh.hist.end(), chunk.end() - std::min<ptrdiff_t>(T, 32), chunk.end());
+    if (sh.hist.size() > 32) sh.hist.erase(sh.hist.begin(), sh.hist.end() - 32);
+    sh.len += T;
+    sh.pend_valid = mtp_;
+    sh.run_first = -1;
 }
 
 const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &tokens, std::vector<float> *all_logits,
@@ -339,56 +463,72 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
             CK(hipSetDevice(rkp->dev));
             for (auto &b : rkp->pb) {
                 CK(hipFree(b.lm_logits));
-                b.lm_logits = zeros<float>(size_t(b.C) * VOCAB_L);
+                b.lm_logits = zeros<float>(size_t(std::max(b.C, MAX_SEGMENTS)) * VOCAB_L);
             }
         }
     }
+    seg_logits_.resize(1);
     for (size_t c0 = 0; c0 < tokens.size(); c0 += size_t(opt_.prefill_chunk)) {
         const int T = int(std::min<size_t>(size_t(opt_.prefill_chunk), tokens.size() - c0));
         std::vector<int32_t> chunk(tokens.begin() + ptrdiff_t(c0), tokens.begin() + ptrdiff_t(c0) + T);
         pemb_.resize(size_t(T) * H);
         pple_.resize(size_t(T) * H);
-        for (int t = 0; t < T; ++t) {
-            const int32_t tok = chunk[size_t(t)];
-            QW_CHECK(tok < VOCAB, "token out of range");
-            if (tok < 0) continue;  // a vision token: its row comes from `embeds`
-            for (int j = 0; j < H; ++j) pemb_[size_t(t) * H + j] = bf16_to_f32(embed_[size_t(tok) * H + j]);
-        }
-        int64_t covered = 0;
-        const int64_t c_start = sh.len;
-        for (const EmbedSpan &sp : embeds) {
-            const int64_t a = std::max(sp.pos, c_start), b = std::min(sp.pos + sp.n, c_start + T);
-            for (int64_t p = a; p < b; ++p)
-                std::memcpy(&pemb_[size_t(p - c_start) * H], sp.rows + size_t(p - sp.pos) * H, H * 4);
-            covered += std::max<int64_t>(0, b - a);
-        }
-        QW_CHECK(covered == std::count_if(chunk.begin(), chunk.end(), [](int32_t t) { return t < 0; }),
-                 "prefill: vision tokens without embeddings (or embeddings over text tokens)");
-        auto ids = hasher_.ids_for(sh.hist, chunk);
-        std::vector<float> e(H);
-        for (int t = 0; t < T; ++t) {
-            ple_->gather(ids[size_t(t)], e.data());
-            for (int j = 0; j < H; ++j) pple_[size_t(t) * H + j] = f32_to_f16(e[size_t(j)]);
-        }
-        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}, blend_transfer_,
-                 rope3 ? rope3->data() + c0 * 3 : nullptr};
+        prefill_inputs(slot, chunk, 0, embeds);
+        PrefillSeg sg{slot, sh.len, T, 0, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}};
         for (const Capture &c : captures)
-            if (c.pos > sh.len && c.pos <= sh.len + T) pjob_.captures.push_back(c);
-        QW_CHECK(int(pjob_.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
+            if (c.pos > sh.len && c.pos <= sh.len + T) sg.captures.push_back(c);
+        QW_CHECK(int(sg.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
+        pjob_ = {{std::move(sg)}, T, all, blend_transfer_, rope3 ? rope3->data() + c0 * 3 : nullptr};
         if (all) plogits_.assign(size_t(T) * VOCAB, 0.f);
+        seg_logits_[0].resize(VOCAB);
         job_ = Job::Prefill;
         dispatch();
-        sh.reset = false;
+        if (!all) std::swap(logits_, seg_logits_[0]);
+        prefill_commit(slot, chunk);
         if (all) all_logits->insert(all_logits->end(), plogits_.begin(), plogits_.end());
-        sh.hist.insert(sh.hist.end(), chunk.end() - std::min<ptrdiff_t>(T, 32), chunk.end());
-        if (sh.hist.size() > 32) sh.hist.erase(sh.hist.begin(), sh.hist.end() - 32);
-        sh.len += T;
-        sh.pend_valid = mtp_;
-        sh.run_first = -1;
         if (after_chunk) after_chunk(sh.len);
     }
     if (all) std::copy(all_logits->end() - VOCAB, all_logits->end(), logits_.begin());
     return logits_;
+}
+
+const std::vector<std::vector<float>> &Engine::prefill_batch(const std::vector<Segment> &segs) {
+    QW_CHECK(!segs.empty() && int(segs.size()) <= MAX_SEGMENTS, "prefill_batch: 1.." + std::to_string(MAX_SEGMENTS) +
+                                                                     " segments");
+    int T = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const Segment &g = segs[i];
+        QW_CHECK(g.slot >= 0 && g.slot < num_slots(), "prefill_batch: bad slot");
+        for (size_t j = 0; j < i; ++j) QW_CHECK(segs[j].slot != g.slot, "prefill_batch: slots must be distinct");
+        QW_CHECK(!g.tokens.empty(), "prefill_batch: empty segment");
+        const SlotHost &sh = slots_[size_t(g.slot)];
+        QW_CHECK(sh.len + int64_t(g.tokens.size()) <= slot_capacity(g.slot), "prefill exceeds the slot's capacity");
+        QW_CHECK(int(g.captures.size()) <= MAX_CAPTURES, "prefill_batch: too many captures in one segment");
+        for (const Capture &c : g.captures)
+            QW_CHECK(c.pos > sh.len && c.pos <= sh.len + int64_t(g.tokens.size()) && c.snap >= 0 && c.snap < SNAPSHOTS,
+                     "prefill: capture outside the new tokens");
+        T += int(g.tokens.size());
+    }
+    QW_CHECK(T <= opt_.prefill_chunk, "prefill_batch: more tokens than one prefill chunk");
+    pemb_.resize(size_t(T) * H);
+    pple_.resize(size_t(T) * H);
+    PrefillJob job;
+    job.T = T;
+    int row = 0;
+    for (const Segment &g : segs) {
+        prefill_inputs(g.slot, g.tokens, row, {});
+        const SlotHost &sh = slots_[size_t(g.slot)];
+        job.segs.push_back(
+            {g.slot, sh.len, int(g.tokens.size()), row, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, g.captures});
+        row += int(g.tokens.size());
+    }
+    pjob_ = std::move(job);
+    seg_logits_.resize(segs.size());
+    for (auto &l : seg_logits_) l.resize(VOCAB);
+    job_ = Job::Prefill;
+    dispatch();
+    for (const Segment &g : segs) prefill_commit(g.slot, g.tokens);
+    return seg_logits_;
 }
 
 }  // namespace qw

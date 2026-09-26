@@ -67,10 +67,15 @@ public:
     // whole prompt is in (logits for sample_prompt ready).
     int64_t begin_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media = {});
     bool prefill_some(int slot, int64_t max_tokens);
+    // prefill_some for several slots (slot, max_tokens) in one engine pass
+    // (Engine::prefill_batch) when their pieces fit one prefill chunk and none
+    // has media; otherwise one after the other. Returns, per slot, whether its
+    // whole prompt is in.
+    std::vector<bool> prefill_batch(const std::vector<std::pair<int, int64_t>> &reqs);
     int acquire(const std::vector<int32_t> &prompt, int64_t max_new, const std::vector<Media> &media) {
         return acquire(media.empty() ? prompt : media_keys(prompt, media), max_new);
     }
-    // Samples the first token after set_prompt (before any other prefill).
+    // Samples the first token after the slot's prompt is in.
     int32_t sample_prompt(int slot, const SamplingParams &p, float *logprob = nullptr);
 
     // One batched step; rows of a slot must be consecutive.
@@ -78,7 +83,8 @@ public:
     // Samples from row `row` of the last decode.
     int32_t sample_row(int row, const SamplingParams &p, float *logprob = nullptr);
     void top_logprobs_row(int row, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const;
-    void top_logprobs_prompt(int k, std::vector<int32_t> &ids, std::vector<float> &lps) const;
+    void top_logprobs_prompt(int k, std::vector<int32_t> &ids, std::vector<float> &lps) const;  // the last prompt
+    void top_logprobs_prompt(int slot, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const;
 
     // ---- generation with MTP speculative decoding
     // Tokens that end a request in `slot` (EOS, stop ids): verification stops there.
@@ -147,15 +153,21 @@ private:
         int plain_left = 0, plain_len = 32, mtp_lag = 0;
         std::vector<int32_t> pending;  // prompt being prefilled (begin_prompt .. prefill_some)
         std::vector<Media> pending_media;
+        std::vector<float> logits;  // after the prompt's last token (sample_prompt)
     };
     // prefix cache (prefix_cache.cpp)
     bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
     // Snapshot points inside the prefill of prompt[from..): message boundaries
     // at least min_gap_ apart, at most Engine::MAX_CAPTURES per prefill chunk.
-    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to);
+    // At most max_caps per chunk; append: keep the VRAM snapshots already
+    // reserved (for another slot's captures in the same batched pass).
+    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
+                                               int max_caps = Engine::MAX_CAPTURES, bool append = false);
     void prefill_range(int slot, const std::vector<int32_t> &prompt, int64_t to);  // [hist.size(), to)
     int64_t begin_keys(int slot, const std::vector<int32_t> &prompt);
-    int save_snapshot(int slot);  // returns the VRAM snapshot index
+    // Returns the VRAM snapshot index; logits: after the slot's last token (default: the engine's)
+    int save_snapshot(int slot, const std::vector<float> *logits = nullptr);
+    void set_prompt_logits(int slot, const std::vector<float> &l);  // the prompt's logits come from a cache
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     // vision (vision_cache.cpp): the prompt with its media tokens as content-derived ids, and the
     // embeddings of the media tokens at positions >= from (encoding what the cache lacks)

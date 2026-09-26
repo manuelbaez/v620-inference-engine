@@ -82,6 +82,19 @@ public:
                                       const std::vector<int32_t> *rope3 = nullptr);  // [tokens][3], experiment
     static constexpr int MAX_CAPTURES = 4;
 
+    // Batched prefill: appends tokens to several slots in one pass (one
+    // chunk), so the per-pass cost of the layers' collectives and launches is
+    // paid once. Slots must be distinct, the tokens together at most
+    // prefill_chunk(), each segment's captures at most MAX_CAPTURES. No
+    // vision tokens. Returns the logits after each segment's last token.
+    struct Segment {
+        int slot;
+        std::vector<int32_t> tokens;
+        std::vector<Capture> captures;
+    };
+    static constexpr int MAX_SEGMENTS = MAX_SLOTS;
+    const std::vector<std::vector<float>> &prefill_batch(const std::vector<Segment> &segs);
+
     struct Row {
         int slot;
         int32_t token;
@@ -247,20 +260,30 @@ private:
     enum class Job { Prefill, Decode, Mtp, Vision } job_ = Job::Decode;
     bool vision_ = false;
     std::vector<std::vector<VisionSlice>> vjob_;  // per rank
-    struct PrefillJob {
-        int64_t start = 0;
-        int T = 0;
-        bool all_logits = false;
+    // One prefill chunk: segments of distinct slots, their rows concatenated.
+    struct PrefillSeg {
         int slot = 0;
+        int64_t start = 0;  // slot position of the segment's first row
+        int T = 0;
+        int row0 = 0;  // first row in the chunk
         bool reset = false;
-        bool mtp_pend = false;  // the MTP pass may start one row early, from the slot's MTP input store
+        bool mtp_pend = false;          // the MTP pass may start one row early, from the slot's MTP input store
         std::vector<Capture> captures;  // in (start, start + T]
-        bool transfer = false;          // accumulate the GDN transfer (CacheBlend experiment)
-        const int32_t *rope3 = nullptr;  // (t, h, w) rotary positions [T][3] of the chunk (multimodal RoPE)
+    };
+    struct PrefillJob {
+        std::vector<PrefillSeg> segs;
+        int T = 0;  // rows over all segments
+        bool all_logits = false;         // (one segment)
+        bool transfer = false;           // accumulate the GDN transfer (CacheBlend experiment; one segment)
+        const int32_t *rope3 = nullptr;  // (t, h, w) rotary positions [T][3] of the chunk (multimodal RoPE; one segment)
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16
     std::vector<float> plogits_;  // [T][VOCAB] when all_logits
+    std::vector<std::vector<float>> seg_logits_;  // [segments][VOCAB]: after each segment's last row
+    // prefill host side: embeddings and PLE rows of `chunk` (positions from the slot's length) at row0
+    void prefill_inputs(int slot, const std::vector<int32_t> &chunk, int row0, const std::vector<EmbedSpan> &embeds);
+    void prefill_commit(int slot, const std::vector<int32_t> &chunk);  // the slot's host state after its rows
     struct DecodeJob {
         int M = 0;
         std::vector<int32_t> i32;  // [5][MAX_ROWS]: row_slot, row_first, run_start, run_len, run_slot

@@ -66,6 +66,8 @@ class Engine:
             "qw_begin_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
                                                  ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_prefill_some": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int64]),
+            "qw_prefill_batch": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.POINTER(ctypes.c_int64), I32P]),
+            "qw_top_logprobs_prompt": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int, I32P, FP]),
             "qw_acquire_media": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64,
                                                  ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_sample_prompt": (ctypes.c_int32, [P, ctypes.c_int, ctypes.POINTER(Sampling), FP]),
@@ -90,6 +92,7 @@ class Engine:
         self.lib = lib
         self.capacity = [lib.qw_slot_capacity(self.h, i) for i in range(lib.qw_num_slots(self.h))]
         self.max_tokens = max(self.capacity)
+        self.prefill_chunk = int(options.get("prefill_chunk", 8192))  # most tokens of one prefill_batch
         self.has_mtp = bool(lib.qw_has_mtp(self.h))
         self.has_vision = bool(lib.qw_has_vision(self.h))
 
@@ -150,6 +153,15 @@ class Engine:
         """Prefills up to max_tokens more of the slot's prompt; True once it is all in."""
         return bool(self._check(self.lib.qw_prefill_some(self.h, slot, max_tokens)))
 
+    def prefill_batch(self, pieces):
+        """prefill_some for several (slot, max_tokens) in one engine pass (when they fit one
+        prefill chunk); returns, per piece, True once that slot's prompt is all in."""
+        n = len(pieces)
+        done = (ctypes.c_int32 * n)()
+        self._check(self.lib.qw_prefill_batch(self.h, n, (ctypes.c_int32 * n)(*[p[0] for p in pieces]),
+                                              (ctypes.c_int64 * n)(*[p[1] for p in pieces]), done))
+        return [bool(d) for d in done]
+
     def sample_prompt(self, slot, s):
         lp = ctypes.c_float()
         return self._check(self.lib.qw_sample_prompt(self.h, slot, ctypes.byref(s), ctypes.byref(lp))), lp.value
@@ -161,6 +173,13 @@ class Engine:
     def sample_row(self, row, s):
         lp = ctypes.c_float()
         return self._check(self.lib.qw_sample_row(self.h, row, ctypes.byref(s), ctypes.byref(lp))), lp.value
+
+    def top_logprobs_prompt(self, slot, k):
+        """The distribution after the slot's prompt."""
+        ids = (ctypes.c_int32 * k)()
+        lps = (ctypes.c_float * k)()
+        n = self._check(self.lib.qw_top_logprobs_prompt(self.h, slot, k, ids, lps))
+        return list(zip(ids[:n], lps[:n]))
 
     def top_logprobs(self, row, k):
         """row < 0: the distribution after the last set_prompt."""

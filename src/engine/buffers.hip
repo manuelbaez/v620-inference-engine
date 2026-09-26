@@ -6,6 +6,7 @@
 
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
+#include "engine/engine.hpp"
 #include "engine/rank.hpp"
 
 namespace qw {
@@ -66,9 +67,11 @@ void alloc_prefill(PrefillBuf &b, int C, int max_slot_tokens, bool mtp) {
     b.att_partial = zeros<float>(size_t(b.Qb) * 33 * QH_L * (HEAD_DIM + 2));
     b.lists = zeros<int32_t>(size_t(b.Qb) * gpu::LIST_W);
     b.lcounts = zeros<int32_t>(b.Qb);
-    b.lm_logits = zeros<float>(VOCAB_L);  // grown on demand for all-logits
+    b.lm_logits = zeros<float>(size_t(Engine::MAX_SEGMENTS) * VOCAB_L);  // grown on demand for all-logits
+    b.xg = zeros<float>(size_t(Engine::MAX_SEGMENTS) * XW);
     if (mtp) {
         b.Xm = zeros<float>(size_t(C) * XW);
+        b.m_emb = zeros<float>(size_t(C) * SH);
         b.m_out = zeros<float>(size_t(C) * 5 * SH);
         b.m_send = zeros<float>(size_t(C) * 4);
         b.m_red = zeros<float>(size_t(C) * 4);

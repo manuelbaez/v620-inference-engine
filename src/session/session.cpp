@@ -31,7 +31,7 @@ void Session::drop_snapshots_after(int slot, int64_t n) {
         if (s.valid && s.slot == slot && int64_t(s.tokens.size()) > n) s.valid = false;
 }
 
-int Session::save_snapshot(int slot) {
+int Session::save_snapshot(int slot, const std::vector<float> *logits) {
     const auto &hist = slots_[size_t(slot)].hist;
     const int64_t n = int64_t(hist.size());
     auto reserved = [&](int i) { return std::find(reserved_.begin(), reserved_.end(), i) != reserved_.end(); };
@@ -53,9 +53,14 @@ int Session::save_snapshot(int slot) {
     s.valid = true;
     s.slot = slot;
     s.tokens = hist;
-    s.logits = e_.logits();
+    s.logits = logits ? *logits : e_.logits();
     s.used = ++clock_;
     return idx;
+}
+
+void Session::set_prompt_logits(int slot, const std::vector<float> &l) {
+    e_.set_logits(l);
+    slots_[size_t(slot)].logits = l;
 }
 
 // Tokens of `prompt` a slot could reuse (in place or from one of its snapshots).
@@ -120,6 +125,7 @@ bool Session::prefill_some(int slot, int64_t max_tokens) {
     }
     media_ = nullptr;
     if (int64_t(si.hist.size()) < n) return false;
+    si.logits = e_.logits();
     si.prompt_end = n;
     si.pending.clear();
     si.pending_media.clear();
@@ -166,7 +172,7 @@ int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
             bool found = false;
             for (auto &s : snaps_)
                 if (s.valid && s.slot == slot && s.tokens.size() == common) {
-                    e_.set_logits(s.logits);
+                    set_prompt_logits(slot, s.logits);
                     s.used = ++clock_;
                     found = true;
                 }
@@ -206,7 +212,7 @@ int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
             hist = s.tokens;
             drop_snapshots_after(slot, n);
             reused = n;
-            if (n == int64_t(prompt.size())) e_.set_logits(s.logits);
+            if (n == int64_t(prompt.size())) set_prompt_logits(slot, s.logits);
         } else {
             e_.slot_reset(slot);
             hist.clear();
@@ -236,7 +242,8 @@ void Session::decode(const std::vector<Engine::Row> &rows) {
 }
 
 int32_t Session::sample_prompt(int slot, const SamplingParams &p, float *logprob) {
-    return sample_logits(e_.logits().data(), slot, p, logprob);
+    const auto &l = slots_[size_t(slot)].logits;
+    return sample_logits(l.empty() ? e_.logits().data() : l.data(), slot, p, logprob);
 }
 
 int32_t Session::sample_row(int row, const SamplingParams &p, float *logprob) {
@@ -266,6 +273,11 @@ void Session::top_logprobs_row(int row, int k, std::vector<int32_t> &ids, std::v
 
 void Session::top_logprobs_prompt(int k, std::vector<int32_t> &ids, std::vector<float> &lps) const {
     top_logprobs(e_.logits().data(), k, ids, lps);
+}
+
+void Session::top_logprobs_prompt(int slot, int k, std::vector<int32_t> &ids, std::vector<float> &lps) const {
+    const auto &l = slots_[size_t(slot)].logits;
+    top_logprobs(l.empty() ? e_.logits().data() : l.data(), k, ids, lps);
 }
 
 }  // namespace qw
