@@ -7,6 +7,8 @@
 #include <rocblas/rocblas.h>
 
 #include <array>
+#include <map>
+#include <string>
 #include <cstdint>
 #include <vector>
 
@@ -125,6 +127,12 @@ struct Rank {
     // transfer [N_GDN][12][128][128] and a scratch copy of a slot's state
     float *transfer = nullptr, *blend_tmp = nullptr;
     int32_t *rope3 = nullptr;  // multimodal RoPE experiment: a chunk's (t, h, w) positions
+    struct CalibH {
+        float *H = nullptr;  // fp32 [K][K], sum over rows of x x^T
+        int K = 0;
+        double rows = 0;
+    };
+    std::map<std::string, CalibH> calib;  // GPTQ calibration (Engine::calib_begin)
     int rope3_cap = 0;
     // batched decode scratch, MAX_ROWS rows
     struct Batch {

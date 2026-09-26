@@ -109,12 +109,21 @@ void Engine::run_prefill_rank(Rank &rk) {
     auto allgather = [&](MB &m, const void *src, void *dst, size_t bytes, int rows) {
         m.comm->allgather(r, src, dst, bytes, ++m.k, m.s, rows);
     };
+    // GPTQ calibration: X^T X of a matrix's input (Engine::calib_begin)
+    auto cal = [&](MB &m, const std::string &name, const uint16_t *X, int ldx, int rows, int K) {
+        calib_acc(rk, name, X, ldx, rows, K, m.blas);
+    };
     // HC mix of X rows [0, rows) (after an optional pending combine) into b.bin.
-    auto mix = [&](MB &m, const HcW &w, float *X, int rows, const float *pend, const float *pend_inj, float *inj_out) {
+    // cname: calibrate its down projection's inputs (one per stream) under this name.
+    auto mix = [&](MB &m, const HcW &w, float *X, int rows, const float *pend, const float *pend_inj, float *inj_out,
+                   const std::string &cname = std::string()) {
         PrefillBuf &b = *m.b;
         gpu::hc_pre_T(X, pend, pend_inj, rows, b.ssq, m.s);
         allreduce(m, b.ssq, b.ssq_red, HC, rows);
         gpu::hc_norm_T(X, b.ssq_red, w.w1, rows, b.xn, m.s);
+        if (!cname.empty())
+            for (int st = 0; st < HC; ++st)
+                cal(m, cname + ".down.s" + std::to_string(st), b.xn + size_t(st) * SH, HC * SH, rows, SH);
         // fp16 partials (and a fp16 all-reduce): measured accuracy-neutral.
         gemm(m, w.down_flat, gpu::D_PAD, HC * SH, b.xn, HC * SH, rows, b.d, gpu::D_PAD, true);
         allreduce(m, b.d, b.d_red, gpu::D_PAD, rows, true);
@@ -146,7 +155,12 @@ void Engine::run_prefill_rank(Rank &rk) {
     auto layer = [&](MB &m, LayerW &w, int l, bool qsa, int idx, float *X, int64_t start, int T) {
         PrefillBuf &b = *m.b;
         hipStream_t s = m.s;
-        mix(m, w.attn_hc, X, T, m.pend, b.inj_mlp, b.inj_attn);
+        const bool calib = l < N_LAYERS && calibrating(l);  // (l == N_LAYERS: the MTP layer)
+        char lbuf[8];
+        std::snprintf(lbuf, sizeof lbuf, "L%02d", l);
+        const std::string ln = calib ? std::string(lbuf) : std::string();
+        mix(m, w.attn_hc, X, T, m.pend, b.inj_mlp, b.inj_attn, calib ? ln + ".attn_hc" : std::string());
+        if (calib) cal(m, ln + (qsa ? ".qsa_proj" : ".gdn_proj"), b.bin, H, T, H);
         if (qsa) {
             const int qi = idx;
             gemm(m, w.qsa_proj, QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
@@ -174,6 +188,7 @@ void Engine::run_prefill_rank(Rank &rk) {
                                   sl.K[size_t(qi)], sl.V[size_t(qi)], b.lists, b.lcounts, Q, b.att_partial,
                                   b.act + size_t(q0) * QH_L * HEAD_DIM, s);
             }
+            if (calib) cal(m, ln + ".qsa_o", b.act, QH_L * HEAD_DIM, T, QH_L * HEAD_DIM);
             gemm(m, w.qsa_o, H, QH_L * HEAD_DIM, b.act, QH_L * HEAD_DIM, T, b.part16, H, true);
         } else {
             const int gi = idx;
@@ -191,11 +206,13 @@ void Engine::run_prefill_rank(Rank &rk) {
             if (pjob_.transfer) gpu::gdn_transfer_T(b.qkv, b.gb, rk.transfer + size_t(gi) * GDN_STATE, T, s);
             record(m, l, 1);
             gpu::gdn_norm_T(b.o_raw, b.P, w.gdn_norm, T, b.act, s);
+            if (calib) cal(m, ln + ".gdn_out", b.act, GDN_VL * GDN_DIM, T, GDN_VL * GDN_DIM);
             gemm(m, w.gdn_out, H, GDN_VL * GDN_DIM, b.act, GDN_VL * GDN_DIM, T, b.part16, H, true);
         }
         reduce_scatter16(m, b.part16, b.out_attn, T);
 
-        mix(m, w.mlp_hc, X, T, b.out_attn, b.inj_attn, b.inj_mlp);
+        mix(m, w.mlp_hc, X, T, b.out_attn, b.inj_attn, b.inj_mlp, calib ? ln + ".mlp_hc" : std::string());
+        if (calib) cal(m, ln + ".sh_gu", b.bin, H, T, H);
         // Router logits stay fp32: fp16 output flips near-tie expert choices
         // (measured: mean |dlogprob| vs the fp32 reference 0.074 -> 0.088).
         gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.logits, N_EXPERTS, false);
@@ -208,6 +225,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         gemm(m, w.sh_gu, 2 * SFFN_L + 1, H, b.bin, H, T, b.part16, 2 * SFFN_L + 1, true);  // fp16 out: neutral
         gpu::f16_to_f32_T(b.part16, b.shp, size_t(T) * (2 * SFFN_L + 1), s);
         gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, T, b.sh_h, s);
+        if (calib) cal(m, ln + ".sh_down", b.sh_h, SFFN_L, T, SFFN_L);
         gemm(m, w.sh_down, H, SFFN_L, b.sh_h, SFFN_L, T, b.sh_out, H, true);
         gpu::moe_combine_T(b.yp, b.tok_slot, b.tok_w, b.sh_out, T, b.part16, s);
         reduce_scatter16(m, b.part16, b.out_moe, T);
@@ -222,6 +240,7 @@ void Engine::run_prefill_rank(Rank &rk) {
             if (l == PLE_LAYER) {
                 if (m.pend) gpu::hc_combine_T(b.X, m.pend, b.inj_mlp, m.T, s);
                 m.pend = nullptr;
+                if (calibrating(PLE_LAYER)) cal(m, "ple_kv", b.ple_e, H, m.T, H);
                 gemm(m, rk.ple_kv, PLE_KV, H, b.ple_e, H, m.T, b.kv, PLE_KV, true);
                 gpu::ple_stats_T(b.kv, b.X, rk.ple_nk, rk.ple_nq, m.T, b.ple_send, s);
                 allreduce(m, b.ple_send, b.ple_red, 16, m.T);
@@ -277,7 +296,10 @@ void Engine::run_prefill_rank(Rank &rk) {
         const bool last = &m == &mbs.back();
         if (!pjob_.all_logits && !last) continue;
         const int r0 = pjob_.all_logits ? 0 : m.T - 1, rows = m.T - r0;
-        mix(m, rk.final_hc, m.b->X + size_t(r0) * HC * SH, rows, nullptr, nullptr, nullptr);
+        const bool calib_final = calibrating(N_LAYERS);
+        mix(m, rk.final_hc, m.b->X + size_t(r0) * HC * SH, rows, nullptr, nullptr, nullptr,
+            calib_final ? std::string("final_hc") : std::string());
+        if (calib_final) cal(m, "lm_head", m.b->bin, H, rows, H);
         gemm(m, rk.lm_head, VOCAB_L, H, m.b->bin, H, rows, m.b->lm_logits, VOCAB_L, false);
         outs.push_back({&m, r0});
     }

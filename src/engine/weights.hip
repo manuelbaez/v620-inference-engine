@@ -1,6 +1,8 @@
 // Weight loading: converts one rank's shard of the checkpoint into device
 // layouts (fp16 dense matrices, repacked int4 experts, fp32 norms).
 #include <algorithm>
+#include <filesystem>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -17,18 +19,57 @@ namespace {
 
 // The int8 copy of an fp16 [N][K] matrix for decode (QW_INT8_DENSE=1), else none.
 // QW_INT8_SKIP: comma-separated groups kept fp16 (hc, qsa, gdn, shared, lm_head, ple, mtp).
-Q8 q8(const std::vector<uint16_t> &m, int64_t N, int64_t K, const char *group) {
-    static const bool on = std::getenv("QW_INT8_DENSE") && std::string(std::getenv("QW_INT8_DENSE")) != "0";
-    static const std::string skip = std::string(",") + (std::getenv("QW_INT8_SKIP") ? std::getenv("QW_INT8_SKIP") : "") + ",";
+// QW_INT8_DIR: GPTQ-quantized copies (tools/gptq_int8.py), r<rank>/<name>.q8, used when
+// present (else round-to-nearest). QW_INT8_DUMP: writes the fp16 matrices, r<rank>/<name>.f16,
+// as the GPTQ tool's input.
+Q8 q8(const std::vector<uint16_t> &m, int64_t N, int64_t K, const char *group, int r, const std::string &name) {
+    auto env = [](const char *v) { return std::getenv(v) ? std::string(std::getenv(v)) : std::string(); };
+    static const std::string dump = env("QW_INT8_DUMP"), dir = env("QW_INT8_DIR");
+    const std::string sub = "/r" + std::to_string(r) + "/";
+    if (!dump.empty()) {
+        std::filesystem::create_directories(dump + sub);
+        std::FILE *f = std::fopen((dump + sub + name + ".f16").c_str(), "wb");
+        QW_CHECK(f, "cannot write " + dump + sub + name + ".f16");
+        const int64_t hdr[2] = {N, K};
+        std::fwrite(hdr, sizeof hdr, 1, f);
+        std::fwrite(m.data(), 2, m.size(), f);
+        std::fclose(f);
+    }
+    static const bool on = env("QW_INT8_DENSE") != "" && env("QW_INT8_DENSE") != "0";
+    static const std::string skip = "," + env("QW_INT8_SKIP") + ",";
     if (!on || skip.find(std::string(",") + group + ",") != std::string::npos) return {};
     std::vector<int8_t> q;
-    std::vector<float> s;
-    quantize_rows_i8(m, N, K, q, s, gpu::I8_GROUP);
-    return {upload(q), upload(s)};
+    std::vector<float> sc;
+    if (!dir.empty())
+        if (std::FILE *f = std::fopen((dir + sub + name + ".q8").c_str(), "rb")) {
+            int64_t hdr[3] = {};
+            bool ok = std::fread(hdr, sizeof hdr, 1, f) == 1 && hdr[0] == N && hdr[1] == K && hdr[2] == gpu::I8_GROUP;
+            if (ok) {
+                q.resize(size_t(N * K));
+                sc.resize(size_t(N * K / gpu::I8_GROUP));
+                ok = std::fread(q.data(), 1, q.size(), f) == q.size() &&
+                     std::fread(sc.data(), 4, sc.size(), f) == sc.size();
+            }
+            std::fclose(f);
+            QW_CHECK(ok, "bad GPTQ file " + dir + sub + name + ".q8");
+            return {upload(q), upload(sc)};
+        }
+    if (!dir.empty()) log("int8: no GPTQ copy of %s (rank %d), rounding to nearest", name.c_str(), r);
+    quantize_rows_i8(m, N, K, q, sc, gpu::I8_GROUP);
+    return {upload(q), upload(sc)};
+}
+
+// Short name of a layer's matrices: L05, mtp.
+std::string layer_name(const std::string &prefix) {
+    if (prefix.rfind("mtp.", 0) == 0) return "mtp";
+    const auto d = prefix.find_first_of("0123456789");
+    char buf[16];
+    std::snprintf(buf, sizeof buf, "L%02d", std::atoi(prefix.c_str() + d));
+    return buf;
 }
 
 // Hyper-connection mixer weights; inject: the block-inject rows (not in final mixers).
-HcW load_hc(const SafeTensors &st, int r, const std::string &p, bool inject) {
+HcW load_hc(const SafeTensors &st, int r, const std::string &p, bool inject, const std::string &name) {
     HcW w;
     w.w1 = upload(shard_w1(st.get(p + "hc_norm.weight"), r));
     const TensorView &down = st.get(p + "input_mix_weight_down.weight", DType::BF16, {HC_RANK, HC * H});
@@ -42,7 +83,7 @@ HcW load_hc(const SafeTensors &st, int r, const std::string &p, bool inject) {
             d.resize(d.size() + size_t(HC) * SH, 0);
     }
     w.down = upload(d);
-    w.down8 = q8(d, int64_t(HC) * HC_DOWN, SH, "hc");
+    w.down8 = q8(d, int64_t(HC) * HC_DOWN, SH, "hc", r, name + ".down");
     std::vector<uint16_t> df(size_t(gpu::D_PAD) * HC * SH, 0);
     for (int s2 = 0; s2 < HC; ++s2)
         for (int o = 0; o < HC_DOWN; ++o)
@@ -63,8 +104,9 @@ HcW load_hc(const SafeTensors &st, int r, const std::string &p, bool inject) {
 // draft tokens, which the full model verifies).
 void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const std::string &p, bool qsa,
                 bool bf16_experts) {
-    w.attn_hc = load_hc(st, r, p + "attn_hyper_connection.", true);
-    w.mlp_hc = load_hc(st, r, p + "mlp_hyper_connection.", true);
+    const std::string ln = layer_name(p);
+    w.attn_hc = load_hc(st, r, p + "attn_hyper_connection.", true, ln + ".attn_hc");
+    w.mlp_hc = load_hc(st, r, p + "mlp_hyper_connection.", true, ln + ".mlp_hc");
     if (qsa) {
         const std::string a = p + "self_attn.";
         std::vector<uint16_t> m;
@@ -76,7 +118,7 @@ void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const
         add_rows(m, st.get(a + "indexer.index_qk_proj.weight"), 0, (IDX_HEADS + 1) * IDX_DIM);
         QW_CHECK(m.size() == size_t(QSA_PROJ_L) * H, "qsa proj size");
         w.qsa_proj = upload(m);
-        w.qsa_proj8 = q8(m, QSA_PROJ_L, H, "qsa");
+        w.qsa_proj8 = q8(m, QSA_PROJ_L, H, "qsa", r, ln + ".qsa_proj");
         w.qn = upload(plus_one(f32_of(st.get(a + "q_norm.weight"))));
         w.kn = upload(plus_one(f32_of(st.get(a + "k_norm.weight"))));
         w.iqn = upload(plus_one(f32_of(st.get(a + "indexer.q_layernorm.weight"))));
@@ -85,7 +127,7 @@ void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const
         add_rows(o, st.get(a + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), 0, H,
                  int64_t(r) * QH_L * HEAD_DIM, QH_L * HEAD_DIM);
         w.qsa_o = upload(o);
-        w.qsa_o8 = q8(o, H, int64_t(QH_L) * HEAD_DIM, "qsa");
+        w.qsa_o8 = q8(o, H, int64_t(QH_L) * HEAD_DIM, "qsa", r, ln + ".qsa_o");
     } else {
         const std::string a = p + "linear_attn.";
         const TensorView &qkv = st.get(a + "in_proj_qkv.weight", DType::BF16, {GDN_QKV, H});
@@ -98,7 +140,7 @@ void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const
         add_rows(m, st.get(a + "in_proj_a.weight"), int64_t(r) * GDN_VL, GDN_VL);
         QW_CHECK(m.size() == size_t(GDN_PROJ_L) * H, "gdn proj size");
         w.gdn_proj = upload(m);
-        w.gdn_proj8 = q8(m, GDN_PROJ_L, H, "gdn");
+        w.gdn_proj8 = q8(m, GDN_PROJ_L, H, "gdn", r, ln + ".gdn_proj");
         auto cw = f32_of(st.get(a + "conv1d.weight", DType::BF16, {GDN_QKV, 1, GDN_CONV}));
         std::vector<float> lc;
         auto take = [&](int64_t c0, int64_t n) {
@@ -116,7 +158,7 @@ void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const
         add_rows(o, st.get(a + "out_proj.weight", DType::BF16, {H, GDN_VAL}), 0, H, int64_t(r) * GDN_VL * GDN_DIM,
                  GDN_VL * GDN_DIM);
         w.gdn_out = upload(o);
-        w.gdn_out8 = q8(o, H, int64_t(GDN_VL) * GDN_DIM, "gdn");
+        w.gdn_out8 = q8(o, H, int64_t(GDN_VL) * GDN_DIM, "gdn", r, ln + ".gdn_out");
     }
     // MoE
     const std::string mp = p + "mlp.";
@@ -171,12 +213,12 @@ void load_layer(LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const
     add_rows(gu, st.get(mp + "shared_expert.up_proj.weight"), int64_t(r) * SFFN_L, SFFN_L);
     add_rows(gu, st.get(mp + "shared_expert_gate.weight"), 0, 1);
     w.sh_gu = upload(gu);
-    w.sh_gu8 = q8(gu, 2 * SFFN_L + 1, H, "shared");
+    w.sh_gu8 = q8(gu, 2 * SFFN_L + 1, H, "shared", r, ln + ".sh_gu");
     std::vector<uint16_t> sd;
     add_rows(sd, st.get(mp + "shared_expert.down_proj.weight", DType::BF16, {H, FFN}), 0, H, int64_t(r) * SFFN_L,
              SFFN_L);
     w.sh_down = upload(sd);
-    w.sh_down8 = q8(sd, H, SFFN_L, "shared");
+    w.sh_down8 = q8(sd, H, SFFN_L, "shared", r, ln + ".sh_down");
 }
 
 }  // namespace
@@ -187,23 +229,23 @@ void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool m
     for (int l = 0; l < N_LAYERS; ++l) load_layer(rk.L[size_t(l)], st, pool, r, layer_prefix(l), is_qsa(l), false);
     if (mtp) {
         load_layer(rk.mtp, st, pool, r, "mtp.layers.0.", true, true);
-        rk.mtp_final = load_hc(st, r, "mtp.hyper_connection_mixer.", false);
+        rk.mtp_final = load_hc(st, r, "mtp.hyper_connection_mixer.", false, "mtp.final_hc");
         std::vector<uint16_t> fh, fe;
         add_rows(fh, st.get("mtp.fc_hidden.weight", DType::BF16, {H, H}), 0, H, int64_t(r) * SH, SH);
         add_rows(fe, st.get("mtp.fc_embedding.weight", DType::BF16, {H, H}), 0, H, int64_t(r) * SH, SH);
         rk.mtp_fc_h = upload(fh);
         rk.mtp_fc_e = upload(fe);
-        rk.mtp_fc_h8 = q8(fh, H, SH, "mtp");
-        rk.mtp_fc_e8 = q8(fe, H, SH, "mtp");
+        rk.mtp_fc_h8 = q8(fh, H, SH, "mtp", r, "mtp.fc_h");
+        rk.mtp_fc_e8 = q8(fe, H, SH, "mtp", r, "mtp.fc_e");
         rk.mtp_nh = upload(shard_w1(st.get("mtp.pre_fc_norm_hidden.weight"), r));
         auto ne = plus_one(f32_of(st.get("mtp.pre_fc_norm_embedding.weight")));
         rk.mtp_ne = upload(std::vector<float>(ne.begin() + r * SH, ne.begin() + (r + 1) * SH));
     }
-    rk.final_hc = load_hc(st, r, "model.language_model.hyper_connection_mixer.", false);
+    rk.final_hc = load_hc(st, r, "model.language_model.hyper_connection_mixer.", false, "final_hc");
     std::vector<uint16_t> head;
     add_rows(head, st.get("lm_head.weight", DType::BF16, {VOCAB, H}), int64_t(r) * VOCAB_L, VOCAB_L);
     rk.lm_head = upload(head);
-    rk.lm_head8 = q8(head, VOCAB_L, H, "lm_head");
+    rk.lm_head8 = q8(head, VOCAB_L, H, "lm_head", r, "lm_head");
 
     // PLE
     const std::string pp = layer_prefix(PLE_LAYER) + "ple.";
@@ -212,7 +254,7 @@ void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool m
     for (int s = 0; s < HC; ++s) add_rows(kv, kp, s * H + r * SH, SH);
     add_rows(kv, st.get(pp + "value_proj.weight", DType::BF16, {H, H}), r * SH, SH);
     rk.ple_kv = upload(kv);
-    rk.ple_kv8 = q8(kv, PLE_KV, H, "ple");
+    rk.ple_kv8 = q8(kv, PLE_KV, H, "ple", r, "ple_kv");
     rk.ple_nk = upload(shard_w1(st.get(pp + "norm_key.weight"), r));
     rk.ple_nq = upload(shard_w1(st.get(pp + "norm_query.weight"), r));
     rk.ple_nc = upload(shard_w1(st.get(pp + "norm_conv.weight"), r));

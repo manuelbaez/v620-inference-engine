@@ -19,6 +19,8 @@
 #include <thread>
 #include <vector>
 
+#include <rocblas/rocblas.h>
+
 #include "comm/comm.hpp"
 #include "core/ple.hpp"
 #include "core/safetensors.hpp"
@@ -187,6 +189,14 @@ public:
     };
     void encode_vision(const std::vector<VisionSlice> &slices);
 
+    // ---- GPTQ calibration (calibrate.hip): while on, prefills accumulate the
+    // Hessian X^T X of the input of every int8-able matrix of layers [lo, hi)
+    // (N_LAYERS: the final mixer and lm_head; the PLE projection with its
+    // layer). calib_dump writes them, r<rank>/<name>.h, and frees them.
+    // Run with QW_NO_SPLIT=1 (one stream per rank).
+    void calib_begin(int lo, int hi);
+    void calib_dump(const std::string &dir);
+
     // Single-sequence convenience API on slot 0 (tools, tests).
     void reset();
     const std::vector<float> &prefill(const std::vector<int32_t> &tokens, std::vector<float> *all_logits = nullptr,
@@ -204,6 +214,9 @@ private:
     void run_decode_rank(Rank &rk);
     void run_mtp_rank(Rank &rk);
     void run_vision_rank(Rank &rk);
+    bool calibrating(int layer) const { return layer >= calib_lo_ && layer < calib_hi_; }
+    void calib_acc(Rank &rk, const std::string &name, const uint16_t *X, int ldx, int rows, int K, rocblas_handle blas);
+    int calib_lo_ = -1, calib_hi_ = -1;
     uint32_t record_batch(Rank &rk, int M, int kind);
     void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos);
     void dispatch();  // run the current job on every rank and wait
