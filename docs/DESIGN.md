@@ -501,9 +501,14 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] GPU-side sampling (temperature via Gumbel-max per vocab shard; top-k/top-p need more)
    - [x] prefill profiled: collective-bound; flat pushes +4-10%
    - [x] scheduling A: prefill in pieces interleaved with decode (see "Interleaved prefill")
-   - [ ] batched prefill: several waiting prompts in one prefill pass (pays the ~90 ms fixed cost
-         once; measured upside on 16 x 300-token bursts ~109 -> ~123 tok/s, +13%; multi-sequence
-         prefill kernels needed)
+   - [x] batched prefill: several waiting prompts in one prefill pass (`Engine::prefill_batch`:
+         segments of distinct slots as one chunk, row-wise work once, sequence kernels per
+         segment; the scheduler packs prompts up to a piece, `QW_PREFILL_BATCH=0` off). 4 prompts
+         (3,800 tokens) 2.05 -> 1.62 s; server bursts (2 x 8 concurrent ~300-token prompts, 4
+         slots) 112 -> 116-119 tok/s, 4 x 400-token streams 185-195 -> 198-204 tok/s. Less than
+         the +13% estimate: with 4 slots, later requests get slots one at a time, so most prefills
+         still go alone. Numerically like a different chunking (GEMM row counts and a row's place
+         in the GEMM change rounding, ~1e-3 after one layer; `tests/gpu/test_batch_prefill`)
    - [x] more drafts per request with 4 concurrent (QW_SPEC_MAX_ROWS=16): no gain at temperature
          0.7 (1.83 -> 2.35 tokens per request-step but 33.6 -> 41.7 ms per step), so the 8-row cap
          stays and its bug is not worth chasing for throughput
