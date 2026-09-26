@@ -60,12 +60,13 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         allgather(b.bin_local, b.bin, SH * 2);
     };
     // fp16 weights, or their int8 copy when loaded (QW_INT8_DENSE=1)
-    auto gemv = [&](const uint16_t *W, const Q8 &W8, int N, int K, const uint16_t *x, float *y, bool acc = false) {
+    auto gemv = [&](const uint16_t *W, const Q8 &W8, int N, int K, const uint16_t *x, float *y) {
         if (W8.w)
-            gpu::gemv_rows_i8(W8.w, W8.s, x, K, y, N, N, K, M, 0, acc, s);
+            gpu::gemv_rows_i8(W8.w, W8.s, x, K, y, N, N, K, M, 0, false, s);
         else
-            gpu::gemv_rows(W, x, K, y, N, N, K, M, 0, acc, s);
+            gpu::gemv_rows(W, x, K, y, N, N, K, M, 0, false, s);
     };
+
     // One decoder layer (after the PLE step, if any) on b.X; returns the
     // pending MoE output, combined into X by the next mix.
     auto layer = [&](LayerW &w, bool qsa, int idx, const float *pend, float *save) -> const float * {
@@ -88,6 +89,11 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         reduce_scatter(b.partial, b.out_attn);
 
         mix(w.mlp_hc, b.out_attn, b.inj_attn, b.inj_mlp);
+        // (A fork/join of the shared expert onto a second stream inside the graph
+        // was measured 12% slower: cross-stream graph edges cost more than they hide.)
+        gemv(w.sh_gu, w.sh_gu8, 2 * SFFN_L + 1, H, b.bin, b.shp);
+        gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, M, b.sh_h, s);
+        gemv(w.sh_down, w.sh_down8, H, SFFN_L, b.sh_h, b.sh_out);
         gemv(w.router, Q8{}, N_EXPERTS, H, b.bin, b.router);
         gpu::moe_route_B(b.router, M, r * EXP_L, b.ecounts, b.offsets, b.tok_w, b.tok_slot, b.pair_tok, s);
         if (M <= moe_pair_max)
@@ -96,9 +102,6 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         else
             gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.ecounts, b.offsets, b.pair_tok, b.bin, M,
                                b.tiles, b.moe_h, b.yp, s);
-        gemv(w.sh_gu, w.sh_gu8, 2 * SFFN_L + 1, H, b.bin, b.shp);
-        gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, M, b.sh_h, s);
-        gemv(w.sh_down, w.sh_down8, H, SFFN_L, b.sh_h, b.sh_out);
         gpu::moe_combine_B(b.yp, b.tok_slot, b.tok_w, b.sh_out, M, b.partial, s);
         reduce_scatter(b.partial, b.out_moe);
         return b.out_moe;

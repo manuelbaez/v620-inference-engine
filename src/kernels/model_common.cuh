@@ -13,6 +13,27 @@ using namespace cfg;
 // NeoX rotation of the first ROPE_DIM dims of buf (shared, n >= ROPE_DIM) in
 // place, block-cooperative. The angle is reduced in double: pos * inv_freq is
 // up to ~2.6e5 rad, far outside fast sin/cos's accurate range.
+// Interleaved multimodal RoPE (the HF Qwen4Exp scheme for vision tokens):
+// frequency i uses the height position if i % 3 == 1 and i < 33, the width
+// position if i % 3 == 2 and i < 30 (sections 11 / 11 / 10), else the
+// temporal one. Equal positions reduce to rope_shared.
+__device__ inline void rope3_shared(float *buf, int64_t pt, int64_t ph, int64_t pw) {
+    constexpr int half = ROPE_DIM / 2;
+    __syncthreads();
+    if (threadIdx.x < half) {
+        const int i = threadIdx.x;
+        const int64_t pos = (i % 3 == 1 && i < 33) ? ph : (i % 3 == 2 && i < 30) ? pw : pt;
+        const double inv = pow(ROPE_THETA, -2.0 * i / ROPE_DIM);
+        const double a = fmod(double(pos) * inv, 6.283185307179586);
+        float sn, cs;
+        sincosf(float(a), &sn, &cs);
+        const float x1 = buf[i], x2 = buf[i + half];
+        buf[i] = x1 * cs - x2 * sn;
+        buf[i + half] = x2 * cs + x1 * sn;
+    }
+    __syncthreads();
+}
+
 __device__ inline void rope_shared(float *buf, int64_t pos) {
     constexpr int half = ROPE_DIM / 2;
     __syncthreads();

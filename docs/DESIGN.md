@@ -500,7 +500,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] GPU-side sampling (top-k / top-p / min-p per vocab shard)
    - [ ] prefill: profile, then chunked GDN / router GEMM / QSA attention
    - [ ] vision attention kernel at ~20% of peak: tile/occupancy work
-   - [ ] vision: HF 3D M-RoPE positions experiment (vs the vLLM fork's plain indices)
+   - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
 ## Vision: images and video (2026-09-25)
 
@@ -537,8 +537,25 @@ more time in all-reduces than in compute).
   cache of its outputs (`QW_VISION_CACHE_GB`, default 2). A resent screenshot
   costs nothing once its prefix is cached.
 - Positions: the vLLM fork gives vision tokens plain token indices (what
-  production vLLM served); HF transformers gives them 3D M-RoPE positions.
-  The engine follows the vLLM fork; the HF scheme is an open experiment.
+  production vLLM served); HF transformers gives them 3D M-RoPE positions
+  (interleaved sections 11/11/10; text after an image resumes at the image's
+  start + max(rows, cols); compressed indexer keys at their first token's
+  position). Measured with prefill support for per-token 3D positions
+  (`Engine::prefill`'s rope3, experiment only) on 100 generated image QA
+  cases with known answers (`tools/vision_pos_cases.py`,
+  `tools/qw_vision_pos_eval`, teacher-forced answer log-probability and
+  exact greedy match):
+
+  | task (20 each) | plain positions | HF 3D positions |
+  |---|---|---|
+  | count objects | -0.135, 19/20 | -0.217, 19/20 |
+  | grid cell color | -0.042, 20/20 | -0.070, 20/20 |
+  | read a text line | -0.184, 19/20 | -0.369, 17/20 |
+  | table lookup | -0.004, 20/20 | -0.005, 20/20 |
+  | where is the shape | -0.114, 20/20 | -0.052, 20/20 |
+
+  Plain positions are as good or better on four of five tasks (OCR most
+  clearly), so the engine keeps them.
 
 Measured through the server: OCR of rendered text, shapes/colors/layout, and
 a question about one line of a 1080p code screenshot all answered correctly;
@@ -574,6 +591,10 @@ launches and collectives, in this order of expected payoff:
    step, ~66 -> ~80 tok/s plain, MTP scales with it). Gate: mean |dlogprob|
    against the fp32 reference (`qw_gpu --logprobs`) must stay near today's
    0.074 (fp16), and greedy output should match on the test prompts.
+   Parallel graph branches do not help either: forking the shared expert
+   onto a second stream inside the decode graph (it is independent of the
+   routed experts) made the step 14.6 -> 16.4 ms; cross-stream graph edges
+   cost more on ROCm than the launch latency they hide.
 2. **Fuse the collectives into their producers and consumers.** Measured
    first (`bench/graph_launch_bench`): a dependent kernel in a graph costs
    ~3.3 µs on this card. Step one, done: a small collective is one kernel

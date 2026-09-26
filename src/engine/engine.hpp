@@ -76,7 +76,8 @@ public:
                                       std::vector<float> *all_logits = nullptr,
                                       const std::function<void(int64_t)> &after_chunk = nullptr,
                                       const std::vector<Capture> &captures = {},
-                                      const std::vector<EmbedSpan> &embeds = {});
+                                      const std::vector<EmbedSpan> &embeds = {},
+                                      const std::vector<int32_t> *rope3 = nullptr);  // [tokens][3], experiment
     static constexpr int MAX_CAPTURES = 4;
 
     struct Row {
@@ -242,6 +243,7 @@ private:
         bool mtp_pend = false;  // the MTP pass may start one row early, from the slot's MTP input store
         std::vector<Capture> captures;  // in (start, start + T]
         bool transfer = false;          // accumulate the GDN transfer (CacheBlend experiment)
+        const int32_t *rope3 = nullptr;  // (t, h, w) rotary positions [T][3] of the chunk (multimodal RoPE)
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16

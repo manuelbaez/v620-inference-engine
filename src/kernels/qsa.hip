@@ -8,10 +8,13 @@ namespace qw::gpu {
 // One block per token.
 __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const float *qn, const float *kn,
                                                          const float *iqn, int64_t start, __half *q16, __half *gate,
-                                                         __half *iq16, __half *K, __half *V, float *raw_k) {
+                                                         __half *iq16, __half *K, __half *V, float *raw_k,
+                                                         const int32_t *rope3) {
     __shared__ float src[HEAD_DIM], buf[HEAD_DIM], red[8];
     const int t = blockIdx.x, th = threadIdx.x;
     const int64_t pos = start + t;
+    const int64_t pt = rope3 ? rope3[t * 3] : pos, ph = rope3 ? rope3[t * 3 + 1] : pos,
+                  pw = rope3 ? rope3[t * 3 + 2] : pos;
     const __half *row = P + size_t(t) * QSA_PROJ_L;
     for (int h = 0; h < QSA_LOCAL_HEADS; ++h) {
         __syncthreads();
@@ -19,7 +22,7 @@ __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const 
         gate[size_t(t) * QSA_LOCAL_HEADS * HEAD_DIM + h * HEAD_DIM + th] = row[h * 2 * HEAD_DIM + HEAD_DIM + th];
         __syncthreads();
         norm_shared(src, qn, buf, HEAD_DIM, red);
-        rope_shared(buf, pos);
+        rope3_shared(buf, pt, ph, pw);
         q16[size_t(t) * QSA_LOCAL_HEADS * HEAD_DIM + h * HEAD_DIM + th] = __float2half(buf[th]);
     }
     const __half *kp = row + QSA_LOCAL_HEADS * 2 * HEAD_DIM, *vp = kp + HEAD_DIM, *ip = vp + HEAD_DIM;
@@ -27,7 +30,7 @@ __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const 
     src[th] = __half2float(kp[th]);
     __syncthreads();
     norm_shared(src, kn, buf, HEAD_DIM, red);
-    rope_shared(buf, pos);
+    rope3_shared(buf, pt, ph, pw);
     K[pos * HEAD_DIM + th] = __float2half(buf[th]);
     V[pos * HEAD_DIM + th] = vp[th];
     for (int h = 0; h < IDX_HEADS; ++h) {
@@ -35,23 +38,24 @@ __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const 
         if (th < IDX_DIM) src[th] = __half2float(ip[h * IDX_DIM + th]);
         __syncthreads();
         norm_shared(src, iqn, buf, IDX_DIM, red);
-        rope_shared(buf, pos);
+        rope3_shared(buf, pt, ph, pw);
         if (th < IDX_DIM) iq16[(size_t(t) * IDX_HEADS + h) * IDX_DIM + th] = __float2half(buf[th]);
     }
     if (th < IDX_DIM) raw_k[pos * IDX_DIM + th] = __half2float(ip[IDX_HEADS * IDX_DIM + th]);
 }
 
 void qsa_prep_T(const uint16_t *P, const float *qn, const float *kn, const float *iqn, int64_t start, int T,
-                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s) {
+                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s,
+                const int32_t *rope3) {
     qsa_prep_T_kernel<<<T, 256, 0, s>>>(reinterpret_cast<const __half *>(P), qn, kn, iqn, start,
                                         reinterpret_cast<__half *>(q16), reinterpret_cast<__half *>(gate),
                                         reinterpret_cast<__half *>(iq16), reinterpret_cast<__half *>(K),
-                                        reinterpret_cast<__half *>(V), raw_k);
+                                        reinterpret_cast<__half *>(V), raw_k, rope3);
 }
 
 // One 128-thread block per group completed in the chunk.
 __global__ __launch_bounds__(128) void qsa_compress_T_kernel(const float *raw_k, const float *ikn, int64_t c0,
-                                                             __half *ck) {
+                                                             __half *ck, int64_t start, const int32_t *rope3) {
     __shared__ float mean[IDX_DIM], buf[IDX_DIM], red[4];
     const int64_t c = c0 + blockIdx.x;
     const int th = threadIdx.x;
@@ -61,16 +65,21 @@ __global__ __launch_bounds__(128) void qsa_compress_T_kernel(const float *raw_k,
     __syncthreads();
     float ss = block_sum<4>(mean[th] * mean[th], red);
     buf[th] = mean[th] * rsqrtf(ss / IDX_DIM + EPS) * ikn[th];
-    rope_shared(buf, c * IDX_RATIO);
+    const int64_t first = c * IDX_RATIO, r = first - start;  // the group's first token, within the chunk?
+    if (rope3 && r >= 0)
+        rope3_shared(buf, rope3[r * 3], rope3[r * 3 + 1], rope3[r * 3 + 2]);
+    else
+        rope_shared(buf, first);
     ck[c * IDX_DIM + th] = __float2half(buf[th]);
 }
 
-void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s) {
+void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
+                    const int32_t *rope3, int64_t rope_start) {
     const int64_t c_first = start / IDX_RATIO;                   // first group whose last token is >= start
     const int64_t c_last = (start + T - IDX_RATIO) / IDX_RATIO;  // last group completed by the chunk
     if (start + T < IDX_RATIO || c_last < c_first) return;
     qsa_compress_T_kernel<<<int(c_last - c_first + 1), 128, 0, s>>>(raw_k, ikn, c_first,
-                                                                    reinterpret_cast<__half *>(ck));
+                                                                    reinterpret_cast<__half *>(ck), rope_start, rope3);
 }
 
 __global__ void qsa_score_reduce_kernel(const __half *sc16, int ldsc, int64_t q0, float *scores) {

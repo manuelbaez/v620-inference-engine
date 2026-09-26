@@ -13,10 +13,16 @@ namespace qw::gpu {
 // ---- prefill, one sequence
 // P fp16 [T][4224]. Writes q16 [T][6][256], gate fp16 [T][1536], iq16
 // [T][4][128] (normed, roped, fp16 for the score GEMM), K/V/raw_k caches.
+// rope3: optional per-token (t, h, w) rotary positions [T][3] (multimodal
+// RoPE); null: token positions.
 void qsa_prep_T(const uint16_t *P, const float *qn, const float *kn, const float *iqn, int64_t start, int T,
-                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s);
-// Compressed keys for every group completed inside the chunk.
-void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s);
+                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s,
+                const int32_t *rope3 = nullptr);
+// Compressed keys for every group completed inside the chunk (a group's key is
+// rotated by its first token's position; rope3 as in qsa_prep_T, for groups
+// starting inside the chunk).
+void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
+                    const int32_t *rope3 = nullptr, int64_t rope_start = 0);
 // From per-head raw scores sc16 [Q][4][ldsc] (fp16, = iq_h . ck[c]) to
 // scores [Q][ldsc] = sum_h relu / sqrt(128); queries are positions q0..q0+Q-1.
 void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float *scores, hipStream_t s);

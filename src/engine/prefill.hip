@@ -50,6 +50,16 @@ void Engine::run_prefill_rank(Rank &rk) {
         CK(hipMemsetAsync(sl.ring, 0, SLOT_RING * 4, rk.s));
         CK(hipMemsetAsync(sl.ple, 0, SLOT_PLE * 4, rk.s));
     }
+    int32_t *rope3 = nullptr;  // this chunk's (t, h, w) positions on the device
+    if (pjob_.rope3) {
+        if (!rk.rope3 || rk.rope3_cap < T) {
+            if (rk.rope3) CK(hipFree(rk.rope3));
+            rk.rope3 = zeros<int32_t>(size_t(opt_.prefill_chunk) * 3);
+            rk.rope3_cap = opt_.prefill_chunk;
+        }
+        CK(hipMemcpyAsync(rk.rope3, pjob_.rope3, size_t(T) * 12, hipMemcpyHostToDevice, rk.s));
+        rope3 = rk.rope3;
+    }
     const bool split = T >= 256;  // two micro-batches; QW_NO_SPLIT runs them serially on one stream
     const int TA = split ? T / 2 : T;
     QW_CHECK(TA <= rk.pb[0].C && T - TA <= rk.pb[1].C, "prefill chunk larger than its buffers");
@@ -140,10 +150,12 @@ void Engine::run_prefill_rank(Rank &rk) {
         if (qsa) {
             const int qi = idx;
             gemm(m, w.qsa_proj, QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
+            const int32_t *r3 = rope3 && l < N_LAYERS ? rope3 + size_t(start - pjob_.start) * 3 : nullptr;
             gpu::qsa_prep_T(b.P, w.qn, w.kn, w.iqn, start, T, b.q16, b.qgate, b.iq16, sl.K[size_t(qi)],
-                            sl.V[size_t(qi)], sl.raw_k[size_t(qi)], s);
+                            sl.V[size_t(qi)], sl.raw_k[size_t(qi)], s, r3);
             wait(m, l, 2);  // A's K/V and raw keys (a group can straddle the halves)
-            gpu::qsa_compress_T(sl.raw_k[size_t(qi)], w.ikn, start, T, sl.ck[size_t(qi)], s);
+            gpu::qsa_compress_T(sl.raw_k[size_t(qi)], w.ikn, start, T, sl.ck[size_t(qi)], s,
+                                l < N_LAYERS ? rope3 : nullptr, pjob_.start);
             record(m, l, 2);
             for (int q0 = 0; q0 < T; q0 += b.Qb) {
                 const int Q = std::min(b.Qb, T - q0);
@@ -290,7 +302,7 @@ void Engine::run_prefill_rank(Rank &rk) {
 const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &tokens, std::vector<float> *all_logits,
                                           const std::function<void(int64_t)> &after_chunk,
                                           const std::vector<Capture> &captures,
-                                          const std::vector<EmbedSpan> &embeds) {
+                                          const std::vector<EmbedSpan> &embeds, const std::vector<int32_t> *rope3) {
     QW_CHECK(!tokens.empty(), "empty prefill");
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];
@@ -336,7 +348,8 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
             ple_->gather(ids[size_t(t)], e.data());
             for (int j = 0; j < H; ++j) pple_[size_t(t) * H + j] = f32_to_f16(e[size_t(j)]);
         }
-        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}, blend_transfer_};
+        pjob_ = {sh.len, T, all, slot, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}, blend_transfer_,
+                 rope3 ? rope3->data() + c0 * 3 : nullptr};
         for (const Capture &c : captures)
             if (c.pos > sh.len && c.pos <= sh.len + T) pjob_.captures.push_back(c);
         QW_CHECK(int(pjob_.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
