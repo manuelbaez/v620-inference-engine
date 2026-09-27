@@ -44,10 +44,13 @@ compose environment, container limits in home-infra) in ENGINE_GUIDE's
 - Build and test on `hermes@llm-experiments.local.net` (`scripts/deploy.sh`
   syncs and builds). The 4 GPUs are shared with production.
 - Unloading production for GPU tests is allowed, but only once it is idle:
-  `ssh main-srv.local.net 'incus exec llm-backend-amd --project llms -- bash
-  /tmp/idle_unload.sh'` (waits for 60 s without requests). Production reloads on
-  the next request. Do not rebuild the dev box's `build/` while a benchmark
-  there is using it.
+  `ssh main-srv.local.net 'incus exec llm-backend-amd --project llms --
+  /home/server/qw-tools/prod-idle-unload.sh'` (waits for 60 s without requests;
+  source in `scripts/`). Production reloads on the next request;
+  `/home/server/qw-tools/prod-smoke.sh` sends test requests. Never restart
+  llama-swap or unload without that idle check, and check the helper exists
+  first (a container reboot once wiped copies kept in /tmp). Do not rebuild the
+  dev box's `build/` while a benchmark there is using it.
 - GPU tests need arguments (prompts); see README "Build and run".
 - Deploy: `scripts/build-image.sh` builds `qw-engine:<sha>` and `:latest`;
   unload production so the next request starts the new image, then send a test
