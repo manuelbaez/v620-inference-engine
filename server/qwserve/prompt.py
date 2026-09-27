@@ -79,12 +79,55 @@ class ChatPrompt:
             messages.append(m)
         kw = dict(body.get("chat_template_kwargs") or {})
         tools = body.get("tools") if body.get("tool_choice") != "none" else None
-        if "reasoning_effort" in body and "reasoning_effort" not in kw:
-            kw["reasoning_effort"] = body["reasoning_effort"]
+        enable, effort, budget = resolve_thinking(body, self.default_effort, self.default_budget)
+        kw["enable_thinking"] = enable
+        if enable:
+            kw["reasoning_effort"] = effort
+        else:
+            kw.pop("reasoning_effort", None)
         text = self.template.render(messages=messages, tools=tools, add_generation_prompt=body.get("add_generation_prompt", True), **kw)
-        thinking = kw.get("enable_thinking", True) is not False
-        return text, thinking, tools
+        return text, enable, tools, (budget if enable else None)
+
+    default_effort = "xhigh"  # set by the server (--reasoning-effort)
+    default_budget = -1       # thinking tokens, -1 unlimited (--thinking-budget)
 
     def encode(self, text):
         return self.tok.encode(text, add_special_tokens=False).ids
+
+
+# reasoning_effort values of the OpenAI / vLLM APIs onto this template's levels (low, medium, xhigh)
+EFFORT_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
+
+
+def resolve_thinking(body, default_effort="xhigh", default_budget=-1):
+    """Whether to think, at which template effort level, and the thinking-token budget (None:
+    unlimited) of a chat request. Accepts what clients send: chat_template_kwargs.enable_thinking /
+    .reasoning_effort (these win, as in vLLM), reasoning_effort (OpenAI / vLLM: none, minimal,
+    low, medium, high, xhigh, max), thinking_token_budget (vLLM, -1 unlimited),
+    thinking_budget_tokens (opencode provider option) and Anthropic's
+    thinking: {type: enabled|disabled, budget_tokens}. A budget of 0 means no thinking."""
+    kw = body.get("chat_template_kwargs") or {}
+    anth = body.get("thinking") if isinstance(body.get("thinking"), dict) else {}
+    effort = kw.get("reasoning_effort", body.get("reasoning_effort"))
+    if "enable_thinking" in kw:
+        enable = kw["enable_thinking"] is not False
+    elif anth.get("type") == "disabled" or effort == "none":
+        enable = False
+    elif effort is not None or anth.get("type") == "enabled":
+        enable = True  # asked for explicitly, whatever the server default
+    else:
+        enable = default_effort != "none"
+    if effort in (None, "none"):
+        effort = default_effort if default_effort != "none" else "xhigh"
+    if effort not in EFFORT_LEVELS:
+        raise ValueError(f"unsupported reasoning_effort {effort!r} (none, minimal, low, medium, high, xhigh, max)")
+    budget = default_budget
+    for v in (anth.get("budget_tokens"), body.get("thinking_budget_tokens"), body.get("thinking_token_budget")):
+        if v is not None:
+            budget = v
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < -1:
+        raise ValueError("thinking budget must be a non-negative integer, or -1 for unlimited")
+    if budget == 0:
+        enable = False
+    return enable, EFFORT_LEVELS[effort], (None if budget < 0 or not enable else budget)
 

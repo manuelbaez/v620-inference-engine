@@ -35,6 +35,13 @@ class Server:
             self.engine.set_boundary_token(im_start)
         self.vision = vision.VisionPreprocessor(args.model_dir) if self.engine.has_vision else None
         self.sched = Scheduler(self.engine, args.mtp)
+        # thinking: server defaults, and what ends a thinking section cut short by its budget
+        # (Qwen's recommended wording, then the closing tag)
+        self.prompt.default_effort = args.reasoning_effort
+        self.prompt.default_budget = args.thinking_budget
+        self.think_close = (self.tok.token_to_id("</think>"), self.prompt.encode(
+            "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking "
+            "directly now.\n</think>\n\n"))
 
     def render(self, body):
         return self.prompt.render(body)
@@ -55,7 +62,7 @@ class Server:
         media = await loop.run_in_executor(None, lambda: [vision.media_of_part(self.vision, p) for p in parts])
         return vision.expand(prompt_ids, media, self.tok), media
 
-    async def run(self, prompt_ids, body, media=None):
+    async def run(self, prompt_ids, body, media=None, think_budget=None):
         """Async generator of (kind, payload) events of one request: 'start'
         (cached prompt tokens), 'token' (id, logprob, top), 'eos', then 'end'
         (finish reason) or 'error'."""
@@ -66,6 +73,9 @@ class Server:
             loop.call_soon_threadsafe(q.put_nowait, (kind, payload))
 
         req = Request(prompt_ids, body, emit, self.eos_ids, media)
+        if think_budget is not None:  # the prompt ends inside <think>: cap the thinking
+            req.think_left = think_budget
+            req.think_close = self.think_close
         self.sched.submit(req)
         try:
             while True:
@@ -100,7 +110,7 @@ class Server:
     async def tokenize(self, request):
         body = await request.json()
         if "messages" in body:
-            text, _, _ = self.render(body)
+            text, _, _, _ = self.render(body)
         else:
             text = body.get("prompt", "")
         ids = self.encode(text)
@@ -117,8 +127,8 @@ class Server:
         if int(body.get("n") or 1) != 1:
             return web.json_response({"error": {"message": "n > 1 is not supported", "type": "invalid_request_error"}}, status=400)
         try:
-            text, thinking, tools = self.render(body)
-        except jinja2.exceptions.TemplateError as e:
+            text, thinking, tools, think_budget = self.render(body)
+        except (jinja2.exceptions.TemplateError, ValueError) as e:
             return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
         prompt_ids = self.encode(text)
         try:
@@ -165,7 +175,7 @@ class Server:
         timings = None  # llama.cpp-style per-request timings (llama-swap's activity log reads them)
         reasoning_tokens = 0
         try:
-            async for kind, payload in self.run(prompt_ids, body, media):
+            async for kind, payload in self.run(prompt_ids, body, media, think_budget):
                 if kind == "error":
                     raise RuntimeError(payload)
                 if kind == "start":

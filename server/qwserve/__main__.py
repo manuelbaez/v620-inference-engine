@@ -23,6 +23,13 @@ def main():
                          "request (env QW_SLOTS)")
     ap.add_argument("--prefill-chunk", type=int, default=int(os.environ.get("QW_PREFILL_CHUNK", "8192")),
                     help="tokens per prefill pass; its buffers take VRAM in proportion (env QW_PREFILL_CHUNK)")
+    ap.add_argument("--reasoning-effort", default=os.environ.get("QW_REASONING_EFFORT", "xhigh"),
+                    choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                    help="default thinking effort when a request sets none (env QW_REASONING_EFFORT); none: "
+                         "no thinking. Requests override it with reasoning_effort / chat_template_kwargs")
+    ap.add_argument("--thinking-budget", type=int, default=int(os.environ.get("QW_THINKING_BUDGET", "-1")),
+                    help="default cap on thinking tokens, -1 unlimited (env QW_THINKING_BUDGET); requests "
+                         "override it with thinking_token_budget / thinking_budget_tokens / thinking.budget_tokens")
     ap.add_argument("--mtp", type=int, default=5,
                     help="most MTP draft tokens per step (0: no speculative decoding); each request drafts "
                          "adaptively up to it (5 measured best single-stream, docs/DESIGN.md)")

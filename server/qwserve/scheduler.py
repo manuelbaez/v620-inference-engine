@@ -36,6 +36,9 @@ class Request:
         self.next = None    # sampled token not yet fed to the engine
         self.cached = 0     # prompt tokens reused from the prefix cache
         self.left = 0       # prompt tokens still to prefill
+        self.think_left = None   # thinking tokens still allowed (None: no cap / not thinking)
+        self.think_close = None  # (</think> id, forced closing ids) when capped
+        self.forced = []         # tokens to emit next instead of sampling (closing a capped thinking section)
         self.keep = None    # buffers the engine reads while the prompt is prefilled
         self.t_admit = self.t_first = None  # prefill start, first token (time.time())
 
@@ -127,6 +130,15 @@ class Scheduler:
             self._finish(r, "length")
             return False
         r.next = tid
+        if r.think_left is not None and not r.forced:
+            end_id, close = r.think_close
+            if tid == end_id:
+                r.think_left = None  # the model closed its thinking itself
+            else:
+                r.think_left -= 1
+                if r.think_left <= 0:  # budget spent: close the thinking section for it
+                    r.forced = list(close)
+                    r.think_left = None
         return True
 
     def _admit(self):
@@ -235,15 +247,23 @@ class Scheduler:
             return
         batch = self.active[:16]
         self.active = self.active[16:] + batch  # round-robin past 16 requests (at most num_slots anyway)
+        def budget(r):  # tokens the engine may emit for r this step
+            if r.forced:
+                return 1  # no drafts: its sampled token is replaced by the forced one
+            b = r.limit - r.generated
+            return max(1, min(b, r.think_left)) if r.think_left is not None else b
         t0 = time.time()
-        res = self.e.generate([(r.slot, r.next, r.limit - r.generated, r.sampling, r.want_top > 0) for r in batch],
-                              self.k)
+        res = self.e.generate([(r.slot, r.next, budget(r), r.sampling, r.want_top > 0) for r in batch], self.k)
         st = self.stats
         st["time"] += time.time() - t0
         st["steps"] += 1
         st["rows"] += len(batch)
         st["tokens"] += sum(len(t) for t, _, _, _ in res)
         for r, (toks, lps, first, _) in zip(batch, res):
+            if r.forced:  # emit the next forced token; the engine's sample for this row is dropped
+                if not self._took(r, r.forced.pop(0), 0.0, None):
+                    self.active.remove(r)
+                continue
             for j, (tid, lp) in enumerate(zip(toks, lps)):
                 top = self.e.top_logprobs(first + j, r.want_top) if r.want_top else None
                 if not self._took(r, tid, lp, top):  # the engine stopped at the same token

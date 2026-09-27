@@ -57,7 +57,7 @@ def main():
 
     fails = 0
     for i, conv in enumerate(CONVERSATIONS):
-        text, _, _ = srv.render(dict(conv))
+        text, _, _, _ = srv.render(dict(conv))
         ours = srv.encode(text)
         body = dict(conv)
         body["model"] = "vllm/qwen3.8-flash-next-rdna2"
