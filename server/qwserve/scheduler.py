@@ -7,6 +7,7 @@ import time
 import traceback
 
 from .engine import Sampling
+from .metrics import Metrics
 
 
 class Request:
@@ -41,6 +42,7 @@ class Request:
         self.think_close = None  # (</think> id, forced closing ids) when capped
         self.forced = []         # tokens to emit next instead of sampling (closing a capped thinking section)
         self.rid = "-"           # request id for the logs (set by the API)
+        self.t_arrive = time.time()
         self.keep = None    # buffers the engine reads while the prompt is prefilled
         self.t_admit = self.t_first = None  # prefill start, first token (time.time())
 
@@ -97,6 +99,7 @@ class Scheduler:
         # admitted and how many of those came from the prefix cache
         self.win = {"t": time.time(), "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0,
                     "rows": 0}
+        self.metrics = Metrics()  # for the dashboard
         self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
         self.thread.start()
 
@@ -146,6 +149,8 @@ class Scheduler:
     def _finish(self, r, reason):
         if r.t_admit is not None:
             self._log_request(r, reason)
+        self.metrics.add_request(r.rid, reason, len(r.prompt), r.cached, r.generated, r.t_arrive, r.t_admit,
+                                 r.t_first, time.time(), r.slot)
         if r.t_first is not None:
             r.emit("timings", r.timings())
         r.emit("end", reason)
@@ -157,6 +162,7 @@ class Scheduler:
         """Handles a sampled token; returns False when the request is done."""
         r.generated += 1
         self.win["gen"] += 1
+        self.metrics.add_generated()
         if tid in r.end_ids:
             r.emit("eos", tid)  # counted in completion_tokens, like vLLM
             self._finish(r, "stop")
@@ -207,6 +213,7 @@ class Scheduler:
                 r.left = len(r.prompt) - r.cached
                 self.win["prompt"] += len(r.prompt)
                 self.win["cached"] += r.cached
+                self.metrics.add_admitted(len(r.prompt), r.cached)
                 self.cache_stats = self.e.cache_stats()
                 r.emit("start", r.cached)
             except Exception as ex:  # noqa: BLE001
@@ -245,7 +252,9 @@ class Scheduler:
             if not self.prefilling:
                 break
             batch = self._batch()
-            self.win["prefill"] += sum(min(n, r.left) for r, n in batch)
+            computed = sum(min(n, r.left) for r, n in batch)
+            self.win["prefill"] += computed
+            self.metrics.add_prefill(computed)
             try:
                 if len(batch) == 1:
                     done = [self.e.prefill_some(batch[0][0].slot, batch[0][1])]
@@ -320,7 +329,11 @@ class Scheduler:
                 while (not self.queue and not self.waiting and not self.prefilling and not self.active
                        and not self.stopping):
                     self._stats(force=True)  # the last window before going idle
+                    self.metrics.idle()
                     self.cv.wait()
+                    now = time.time()  # windows restart on wake: idle time is not averaged in
+                    self.win["t"] = now
+                    self.metrics.wake()
                 if self.stopping:
                     return
                 self.waiting += self.queue  # the queue is shared; waiting is this thread's
@@ -333,6 +346,9 @@ class Scheduler:
                 while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
                     self._step()
                 self._stats()
+                self.metrics.sample(len(self.active), len(self.prefilling), len(self.waiting) + len(self.queue),
+                                    sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),
+                                    sum(self.e.capacity))
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
                 print(f"scheduler error ({len(self.prefilling) + len(self.active)} requests failed): {ex}\n"
                       f"{traceback.format_exc()}", file=sys.stderr, flush=True)
