@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 from .engine import Sampling
 
@@ -39,6 +40,7 @@ class Request:
         self.think_left = None   # thinking tokens still allowed (None: no cap / not thinking)
         self.think_close = None  # (</think> id, forced closing ids) when capped
         self.forced = []         # tokens to emit next instead of sampling (closing a capped thinking section)
+        self.rid = "-"           # request id for the logs (set by the API)
         self.keep = None    # buffers the engine reads while the prompt is prefilled
         self.t_admit = self.t_first = None  # prefill start, first token (time.time())
 
@@ -75,6 +77,7 @@ class Scheduler:
     the pass's fixed cost once (QW_PREFILL_BATCH=0 turns that off)."""
 
     DEFAULT_RESERVE = 2048  # room reserved when the request sets no max_tokens
+    LOG_INTERVAL = float(os.environ.get("QW_LOG_INTERVAL", "10"))  # seconds between stats lines (0: off)
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
     BATCH_PREFILL = os.environ.get("QW_PREFILL_BATCH", "1") != "0"  # several prompts per prefill pass
@@ -90,6 +93,10 @@ class Scheduler:
         self.prefilling = []  # in a slot, prompt partly prefilled
         self.active = []
         self.stopping = False
+        # stats since the last log line: prompt tokens computed, generated tokens, prompt tokens
+        # admitted and how many of those came from the prefix cache
+        self.win = {"t": time.time(), "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0,
+                    "rows": 0}
         self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
         self.thread.start()
 
@@ -110,7 +117,35 @@ class Scheduler:
             self.queue.append(req)
             self.cv.notify()
 
+    def _log_request(self, r, reason):
+        now = time.time()
+        ttft = f"{r.t_first - r.t_admit:.2f} s" if r.t_first and r.t_admit else "-"
+        decode = (f"{(r.generated - 1) / (now - r.t_first):.1f} tok/s"
+                  if r.t_first and r.generated > 1 and now > r.t_first else "-")
+        print(f"request {r.rid}: {reason}, prompt {len(r.prompt)} ({r.cached} cached), generated {r.generated}, "
+              f"ttft {ttft}, decode {decode}, slot {r.slot}", flush=True)
+
+    def _stats(self, force=False):
+        """The periodic stats line (like vLLM's): throughput since the last line and the queue."""
+        w, now = self.win, time.time()
+        dt = now - w["t"]
+        if self.LOG_INTERVAL <= 0 or (dt < self.LOG_INTERVAL and not force):
+            return
+        busy = self.active or self.prefilling or self.waiting or self.queue
+        if w["prefill"] or w["gen"] or busy:
+            cap = sum(self.e.capacity)
+            used = sum(len(r.prompt) + r.generated for r in self.active + self.prefilling)
+            reuse = f"{100 * w['cached'] / w['prompt']:.0f}%" if w["prompt"] else "-"
+            step = f", {1e3 * w['step_time'] / w['steps']:.1f} ms/step, {w['gen'] / w['rows']:.2f} tok/row" if w["steps"] else ""
+            print(f"stats: prompt {w['prefill'] / dt:.0f} tok/s, generation {w['gen'] / dt:.1f} tok/s{step} | "
+                  f"running {len(self.active)}, prefilling {len(self.prefilling)}, waiting "
+                  f"{len(self.waiting) + len(self.queue)} | slots {len(self.active) + len(self.prefilling)}/"
+                  f"{len(self.e.capacity)}, KV {100 * used / cap:.1f}% | prompt tokens from cache {reuse}", flush=True)
+        self.win = {"t": now, "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0, "rows": 0}
+
     def _finish(self, r, reason):
+        if r.t_admit is not None:
+            self._log_request(r, reason)
         if r.t_first is not None:
             r.emit("timings", r.timings())
         r.emit("end", reason)
@@ -121,6 +156,7 @@ class Scheduler:
     def _took(self, r, tid, lp, top):
         """Handles a sampled token; returns False when the request is done."""
         r.generated += 1
+        self.win["gen"] += 1
         if tid in r.end_ids:
             r.emit("eos", tid)  # counted in completion_tokens, like vLLM
             self._finish(r, "stop")
@@ -169,6 +205,8 @@ class Scheduler:
                 r.t_admit = time.time()
                 r.cached, r.keep = self.e.begin_prompt(slot, r.prompt, r.media)
                 r.left = len(r.prompt) - r.cached
+                self.win["prompt"] += len(r.prompt)
+                self.win["cached"] += r.cached
                 self.cache_stats = self.e.cache_stats()
                 r.emit("start", r.cached)
             except Exception as ex:  # noqa: BLE001
@@ -207,12 +245,15 @@ class Scheduler:
             if not self.prefilling:
                 break
             batch = self._batch()
+            self.win["prefill"] += sum(min(n, r.left) for r, n in batch)
             try:
                 if len(batch) == 1:
                     done = [self.e.prefill_some(batch[0][0].slot, batch[0][1])]
                 else:
                     done = self.e.prefill_batch([(r.slot, n) for r, n in batch])
             except Exception as ex:  # noqa: BLE001
+                print(f"prefill error ({', '.join(r.rid for r, _ in batch)}): {ex}\n{traceback.format_exc()}",
+                      file=sys.stderr, flush=True)
                 for r, _ in batch:
                     self.prefilling.remove(r)
                     r.emit("error", str(ex))
@@ -256,6 +297,9 @@ class Scheduler:
         res = self.e.generate([(r.slot, r.next, budget(r), r.sampling, r.want_top > 0) for r in batch], self.k)
         st = self.stats
         st["time"] += time.time() - t0
+        self.win["steps"] += 1
+        self.win["step_time"] += time.time() - t0
+        self.win["rows"] += len(batch)
         st["steps"] += 1
         st["rows"] += len(batch)
         st["tokens"] += sum(len(t) for t, _, _, _ in res)
@@ -275,6 +319,7 @@ class Scheduler:
             with self.cv:
                 while (not self.queue and not self.waiting and not self.prefilling and not self.active
                        and not self.stopping):
+                    self._stats(force=True)  # the last window before going idle
                     self.cv.wait()
                 if self.stopping:
                     return
@@ -287,8 +332,10 @@ class Scheduler:
                 self._step()
                 while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
                     self._step()
+                self._stats()
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
-                print(f"scheduler error: {ex}", file=sys.stderr, flush=True)
+                print(f"scheduler error ({len(self.prefilling) + len(self.active)} requests failed): {ex}\n"
+                      f"{traceback.format_exc()}", file=sys.stderr, flush=True)
                 for r in self.prefilling + self.active:
                     r.emit("error", str(ex))
                     try:

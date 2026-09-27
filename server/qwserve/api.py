@@ -3,7 +3,9 @@
 
 import asyncio
 import json
+import sys
 import time
+import traceback
 import uuid
 
 import jinja2
@@ -62,7 +64,7 @@ class Server:
         media = await loop.run_in_executor(None, lambda: [vision.media_of_part(self.vision, p) for p in parts])
         return vision.expand(prompt_ids, media, self.tok), media
 
-    async def run(self, prompt_ids, body, media=None, think_budget=None):
+    async def run(self, prompt_ids, body, media=None, think_budget=None, rid="-"):
         """Async generator of (kind, payload) events of one request: 'start'
         (cached prompt tokens), 'token' (id, logprob, top), 'eos', then 'end'
         (finish reason) or 'error'."""
@@ -73,6 +75,7 @@ class Server:
             loop.call_soon_threadsafe(q.put_nowait, (kind, payload))
 
         req = Request(prompt_ids, body, emit, self.eos_ids, media)
+        req.rid = rid
         if think_budget is not None:  # the prompt ends inside <think>: cap the thinking
             req.think_left = think_budget
             req.think_close = self.think_close
@@ -175,7 +178,7 @@ class Server:
         timings = None  # llama.cpp-style per-request timings (llama-swap's activity log reads them)
         reasoning_tokens = 0
         try:
-            async for kind, payload in self.run(prompt_ids, body, media, think_budget):
+            async for kind, payload in self.run(prompt_ids, body, media, think_budget, rid[-12:]):
                 if kind == "error":
                     raise RuntimeError(payload)
                 if kind == "start":
@@ -217,10 +220,12 @@ class Server:
             if stream and tail:
                 await resp.write(b"data: " + json.dumps(chunk(tail)).encode() + b"\n\n")
         except ConnectionResetError:  # the client went away (e.g. an agent cancelled): nothing to answer
+            print(f"request {rid[-12:]}: client disconnected", flush=True)
             return resp
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
+            print(f"request {rid[-12:]}: error: {e}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
             if stream:
                 await resp.write(b"data: " + json.dumps({"error": {"message": str(e)}}).encode() + b"\n\n")
                 await resp.write(b"data: [DONE]\n\n")
@@ -236,14 +241,17 @@ class Server:
             last = chunk({}, fin=finish)
             if timings:
                 last["timings"] = timings
-            await resp.write(b"data: " + json.dumps(last).encode() + b"\n\n")
-            if include_usage:
-                u = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": self.model_name,
-                     "choices": [], "usage": usage}
-                if timings:
-                    u["timings"] = timings
-                await resp.write(b"data: " + json.dumps(u).encode() + b"\n\n")
-            await resp.write(b"data: [DONE]\n\n")
+            try:
+                await resp.write(b"data: " + json.dumps(last).encode() + b"\n\n")
+                if include_usage:
+                    u = {"id": rid, "object": "chat.completion.chunk", "created": created, "model": self.model_name,
+                         "choices": [], "usage": usage}
+                    if timings:
+                        u["timings"] = timings
+                    await resp.write(b"data: " + json.dumps(u).encode() + b"\n\n")
+                await resp.write(b"data: [DONE]\n\n")
+            except ConnectionResetError:  # the client left before the last chunks: the answer was complete
+                print(f"request {rid[-12:]}: client disconnected before the end of the stream", flush=True)
             return resp
         msg = {"role": "assistant", "content": parser.content if (parser.content or not parser.tool_calls) else None,
                "reasoning": parser.reasoning or None, "reasoning_content": parser.reasoning or None}
@@ -276,7 +284,7 @@ class Server:
         if stream:
             resp = web.StreamResponse(headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
             await resp.prepare(request)
-        async for kind, payload in self.run(prompt_ids, body):
+        async for kind, payload in self.run(prompt_ids, body, rid=rid[-12:]):
             if kind == "error":
                 return web.json_response({"error": {"message": payload}}, status=500)
             if kind == "start":
