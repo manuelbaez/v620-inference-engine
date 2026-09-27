@@ -39,9 +39,14 @@ function renderCards(d) {
 
 function renderCharts(d) {
   const win = +$("win").value, h = d.history;
-  lineChart($("chart-throughput"), h, [{key: "prompt_tps", color: "--accent"}, {key: "gen_tps", color: "--accent2"}], win, 10);
-  lineChart($("chart-queue"), h, [{key: "running", color: "--accent"}, {key: "waiting", color: "--accent2"}], win, 4);
-  lineChart($("chart-kv"), h, [{key: "kv_pct", color: "--accent"}], win, 10);
+  const tps = v => v.toFixed(1) + " tok/s", n = v => String(Math.round(v));
+  lineChart($("chart-prompt"), h, [{key: "prompt_tps", color: "--accent", label: "prompt processing", fmt: tps}], win, 10);
+  lineChart($("chart-gen"), h, [{key: "gen_tps", color: "--accent2", label: "generation", fmt: tps}], win, 10);
+  lineChart($("chart-queue"), h, [
+    {key: "running", color: "--accent", label: "running", fmt: n},
+    {key: "waiting", color: "--accent2", label: "waiting / prefilling / loading", fmt: n}], win, 4);
+  lineChart($("chart-kv"), h, [
+    {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
 }
 
 function renderMemory(m) {

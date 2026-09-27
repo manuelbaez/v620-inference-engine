@@ -26,9 +26,14 @@
 
   <section class="panels">
     <div class="card">
-      <h2>Throughput (tokens/s)</h2>
-      <canvas id="chart-throughput"></canvas>
-      <div class="legend"><span style="--c:var(--accent)">prompt processing</span><span style="--c:var(--accent2)">generation</span></div>
+      <h2>Prompt processing (tokens/s)</h2>
+      <canvas id="chart-prompt"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">prompt processing</span></div>
+    </div>
+    <div class="card">
+      <h2>Token generation (tokens/s)</h2>
+      <canvas id="chart-gen"></canvas>
+      <div class="legend"><span style="--c:var(--accent2)">generation</span></div>
     </div>
     <div class="card">
       <h2>Requests</h2>
