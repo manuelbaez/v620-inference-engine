@@ -611,18 +611,26 @@ slots and prefill chunk as in production; GSM8K test set, MMLU 25 questions
 per subject, ARC-Challenge test set; `tools/bench_compare.py` pairs the runs,
 McNemar's exact test):
 
-| task | int4 table | int8 table |
-|---|---|---|
-| GSM8K (1,319) | 94.8% | (running) |
-| MMLU (1,425) | 86.6% | |
-| ARC-Challenge (1,172) | 97.2% | |
+| task | int4 table | int8 table | right only with int4 / int8 | McNemar p |
+|---|---|---|---|---|
+| GSM8K (1,319) | 94.8% | 94.6% | 10 / 8 | 0.82 |
+| MMLU (1,425) | 86.6% | 86.0% | 14 / 6 | 0.12 |
+| ARC-Challenge (1,172) | 97.2% | 97.2% | 2 / 2 | 1.00 |
+| all (3,916) | 92.5% | 92.3% | 26 / 16 | 0.16 |
+| bf16 table | (to run) | | | |
 
 With ~1,200-1,400 questions per task, only accuracy differences of about 1-2
-points can show; smaller real gains read as noise.
+points can show. The int8 table changed 42 of 3,916 outcomes, split 26/16:
+no measurable task effect. The distribution result and the task result measure
+different things: int8 brings the next-token probabilities measurably closer
+to the original model's, but greedy final answers on these tasks almost never
+depend on that difference.
 
-**Decision:** pending the int8 task results. Production switched to the int8
-table on 2026-09-27 on the strength of the distribution results (+24 GB of
-host RAM; the container's limit was raised to 236 GiB for it).
+**Decision:** pending the bf16 task run (2026-09-28). Production runs the int8
+table since 2026-09-27 (+24 GB of host RAM; the container's limit was raised
+to 236 GiB for it): closer to the trained model at no GPU or speed cost, with
+no task gain shown. If bf16 also shows no task effect, the choice is between
+fidelity (int8) and 24 GB of RAM (int4).
 
 ## Vision: images and video (2026-09-25)
 

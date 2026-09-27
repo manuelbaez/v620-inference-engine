@@ -446,7 +446,7 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 | prefill | ~2,050-2,200 tok/s |
 | startup (warm) | ~60 s (33 s for the weights) |
 | accuracy vs fp32 reference with the original PLE table | 0.048 mean \|Δlogprob\| (int8 table) |
-| tasks (int4 table) | GSM8K 94.8%, MMLU 86.6%, ARC-Challenge 97.2% |
+| tasks (int4 / int8 table) | GSM8K 94.8 / 94.6%, MMLU 86.6 / 86.0%, ARC-Challenge 97.2 / 97.2% (no significant difference) |
 | the previous production engine (vLLM fork) | ~56-65 tok/s, ~1,060 tok/s prefill |
 
 Where the remaining time goes (decode step, one card): ~4.9 ms dense GEMVs at
