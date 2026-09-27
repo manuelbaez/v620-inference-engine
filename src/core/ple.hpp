@@ -1,6 +1,7 @@
-// PLE n-gram hashing and the int4 host-RAM embedding table (docs/MODEL.md, "PLE").
-// The table stays in host memory in every engine configuration: it is ~30 GB
-// and only 16 rows are touched per token.
+// PLE n-gram hashing and the host-RAM embedding table (docs/MODEL.md, "PLE").
+// The table stays in host memory in every engine configuration: 320M rows of
+// 160 values (int4: ~30 GB, int8: ~58 GB, bf16: ~102 GB), and only 16 rows
+// are touched per token.
 #pragma once
 
 #include <array>
@@ -59,10 +60,14 @@ public:
     ~PleTable();
 
 private:
+    // META.json "layout": group16_int4_fp16scale_lownibblefirst (weight_i4 u8 [rows][80],
+    // low nibble first, stored + 8), group16_int8_fp16scale (weight_i8 i8 [rows][160]),
+    // both with weight_scale f16 [rows][10]; or bf16 (weight bf16 [rows][160]).
+    enum class Layout { Int4, Int8, Bf16 } layout_ = Layout::Int4;
     int64_t rows_ = 0, rows_per_shard_ = 0;
     std::vector<std::unique_ptr<SafeTensors>> shards_;
-    std::vector<const uint8_t *> q_;       // [rows_per_shard, 80]
-    std::vector<const uint16_t *> scale_;  // [rows_per_shard, 10] fp16
+    std::vector<const uint8_t *> q_;       // per shard: the values (layout above)
+    std::vector<const uint16_t *> scale_;  // per shard: [rows_per_shard][10] fp16 (int4, int8)
     std::thread pin_thread_;
     std::atomic<bool> stop_pin_{false};
 };

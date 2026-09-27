@@ -126,8 +126,15 @@ std::vector<NgramIds> NgramHasher::ids_for(const std::vector<int32_t> &history,
 
 PleTable::PleTable(const std::string &dir) {
     Json meta = Json::parse(read_file(dir + "/META.json"));
-    QW_CHECK(meta["layout"].as_str() == "group16_int4_fp16scale_lownibblefirst",
-             "PLE sidecar: unsupported layout " + meta["layout"].as_str());
+    const std::string layout = meta["layout"].as_str();
+    if (layout == "group16_int4_fp16scale_lownibblefirst")
+        layout_ = Layout::Int4;
+    else if (layout == "group16_int8_fp16scale")
+        layout_ = Layout::Int8;
+    else if (layout == "bf16")
+        layout_ = Layout::Bf16;
+    else
+        fail("PLE sidecar: unsupported layout " + layout);
     QW_CHECK(meta["width"].as_int() == cfg::NGRAM_DIM, "PLE sidecar: width");
     rows_ = meta["rows"].as_int();
     int64_t n_shards = meta["shards"].as_int();
@@ -135,13 +142,18 @@ PleTable::PleTable(const std::string &dir) {
     for (int64_t s = 0; s < n_shards; ++s) {
         auto st = std::make_unique<SafeTensors>();
         st->add_file(dir + "/shard_" + std::to_string(s) + ".safetensors");
-        const TensorView &q = st->get("weight_i4");
-        const TensorView &sc = st->get("weight_scale");
-        QW_CHECK(q.dtype == DType::U8 && q.dim(1) == cfg::NGRAM_DIM / 2, "PLE shard layout");
-        QW_CHECK(sc.dtype == DType::F16 && sc.dim(1) == cfg::NGRAM_DIM / 16, "PLE scale layout");
+        const char *name = layout_ == Layout::Int4 ? "weight_i4" : layout_ == Layout::Int8 ? "weight_i8" : "weight";
+        const TensorView &q = st->get(name);
+        const DType want = layout_ == Layout::Int4 ? DType::U8 : layout_ == Layout::Int8 ? DType::I8 : DType::BF16;
+        const int64_t width = layout_ == Layout::Int4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
+        QW_CHECK(q.dtype == want && q.dim(1) == width, "PLE shard layout");
         QW_CHECK(q.dim(0) == rows_per_shard_ || s == n_shards - 1, "PLE shard row count");
         q_.push_back(q.u8());
-        scale_.push_back(sc.u16());
+        if (layout_ != Layout::Bf16) {
+            const TensorView &sc = st->get("weight_scale");
+            QW_CHECK(sc.dtype == DType::F16 && sc.dim(1) == cfg::NGRAM_DIM / 16, "PLE scale layout");
+            scale_.push_back(sc.u16());
+        }
         shards_.push_back(std::move(st));
     }
     NgramHasher h;
@@ -153,8 +165,21 @@ PleTable::PleTable(const std::string &dir) {
 void PleTable::row(int64_t id, float *out) const {
     QW_CHECK(id >= 0 && id < rows_, "PLE row out of range");
     int64_t s = id / rows_per_shard_, r = id % rows_per_shard_;
-    const uint8_t *q = q_[size_t(s)] + r * (cfg::NGRAM_DIM / 2);
+    if (layout_ == Layout::Bf16) {
+        const uint16_t *v = reinterpret_cast<const uint16_t *>(q_[size_t(s)]) + r * cfg::NGRAM_DIM;
+        for (int j = 0; j < cfg::NGRAM_DIM; ++j) out[j] = bf16_to_f32(v[j]);
+        return;
+    }
     const uint16_t *sc = scale_[size_t(s)] + r * (cfg::NGRAM_DIM / 16);
+    if (layout_ == Layout::Int8) {
+        const int8_t *q = reinterpret_cast<const int8_t *>(q_[size_t(s)]) + r * cfg::NGRAM_DIM;
+        for (int g = 0; g < cfg::NGRAM_DIM / 16; ++g) {
+            const float scale = f16_to_f32(sc[g]);
+            for (int j = 0; j < 16; ++j) out[g * 16 + j] = float(q[g * 16 + j]) * scale;
+        }
+        return;
+    }
+    const uint8_t *q = q_[size_t(s)] + r * (cfg::NGRAM_DIM / 2);
     for (int g = 0; g < cfg::NGRAM_DIM / 16; ++g) {
         float scale = f16_to_f32(sc[g]);
         for (int j = 0; j < 8; ++j) {

@@ -525,6 +525,14 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] intermittent: greedy speculative output differing from plain decoding in
          `test_speculative` (different prompt from run to run, 4-12-row verification batches;
          also on the pre-GPU-sampling build), likely the open issue below; to root-cause
+   - [x] PLE n-gram table precision (`core/ple.cpp`: int4, int8 and bf16 layouts, chosen by the
+         sidecar's META.json). Against a new fp32 reference with Qwen's original bf16 table
+         (4,000 tokens): engine with the int4 table 0.065 mean |dlogprob| / 96.8% top-1, int8
+         0.048 / 97.4% (-0.017, 95% CI -0.022..-0.013), bf16 0.044 / 98.0%. The old fp32
+         reference (int4 table) is itself 0.064 from the new one: the int4 table was the largest
+         single error source. int8: 54 GB of host RAM (int4 30, bf16 96)
+   - [x] startup: the four ranks load in parallel, each on its own thread and pool (warm cache
+         105.6 -> 33.4 s; `QW_LOAD_SERIAL=1` for the old order)
    - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
          all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
          a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop

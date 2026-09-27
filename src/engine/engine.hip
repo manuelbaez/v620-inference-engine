@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include "core/common.hpp"
@@ -44,12 +46,13 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
 
-    ThreadPool pool(opt_.load_threads * RANKS);
     for (int r = 0; r < RANKS; ++r) ranks_.push_back(std::make_unique<Rank>());
-    // Ranks load one after another (each already uses the whole pool for its
-    // experts); a rank's uploads overlap the next rank's conversions poorly,
-    // but loading is not the bottleneck yet.
-    for (int r = 0; r < RANKS; ++r) {
+    // The ranks load in parallel, each on its own thread with its own pool
+    // (the checkpoint is a read-only mapping; everything else is per rank):
+    // reading, converting and uploading one rank's shard overlaps the others'.
+    // QW_LOAD_SERIAL=1: one after another, each with every thread.
+    const bool serial = std::getenv("QW_LOAD_SERIAL") && std::string(std::getenv("QW_LOAD_SERIAL")) != "0";
+    auto load = [&](int r, ThreadPool &pool) {
         Rank &rk = *ranks_[size_t(r)];
         rk.r = r;
         rk.dev = opt_.devices[size_t(r)];
@@ -58,6 +61,24 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         load_rank_weights(rk, st_, pool, mtp_);
         alloc_rank_buffers(rk, opt_, max_slot_tokens(), mtp_);
         log("rank %d loaded", r);
+    };
+    if (serial) {
+        ThreadPool pool(opt_.load_threads * RANKS);
+        for (int r = 0; r < RANKS; ++r) load(r, pool);
+    } else {
+        std::vector<std::thread> loaders;
+        std::vector<std::string> errors(RANKS);
+        for (int r = 0; r < RANKS; ++r)
+            loaders.emplace_back([&, r] {
+                try {
+                    ThreadPool pool(opt_.load_threads);
+                    load(r, pool);
+                } catch (const std::exception &e) {
+                    errors[size_t(r)] = e.what();
+                }
+            });
+        for (auto &t : loaders) t.join();
+        for (const auto &e : errors) QW_CHECK(e.empty(), e);
     }
     if (!std::getenv("QW_NO_VISION"))
         if (auto hw = load_vision_weights(st_)) {  // a copy of the vision tower on every card
