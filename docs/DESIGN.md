@@ -531,6 +531,16 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          0.048 / 97.4% (-0.017, 95% CI -0.022..-0.013), bf16 0.044 / 98.0%. The old fp32
          reference (int4 table) is itself 0.064 from the new one: the int4 table was the largest
          single error source. int8: 54 GB of host RAM (int4 30, bf16 96)
+   - [x] readiness: the engine returns from its constructor (and the server starts answering
+         `/health`, which llama-swap polls) only after the PLE table is in RAM; the table reads
+         while the ranks load, and warmup waits for it (a cold start used to serve requests while
+         rows still came from disk, warmup 28-35 s)
+   - [x] admission: a request that fits no free slot waits without holding up later ones that
+         fit the free slots; freed slots are offered in arrival order, so it is not starved
+         (`server/tests/test_admission.py`)
+   - [x] KV slots 256k + 128k + 64k + 32k in production: 4096-token prefill chunks
+         (`QW_PREFILL_CHUNK`) free ~0.9 GB per card of prefill buffers for the 64k slot
+         (prefill -2%); ~1.1 GB per card stays free
    - [x] startup: the four ranks load in parallel, each on its own thread and pool (warm cache
          105.6 -> 33.4 s; `QW_LOAD_SERIAL=1` for the old order)
    - [x] thinking controls (`server/qwserve/prompt.py` `resolve_thinking`, scheduler): this

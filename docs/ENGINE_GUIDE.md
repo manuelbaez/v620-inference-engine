@@ -70,7 +70,7 @@ These practices mattered more than any single kernel. Reuse them.
 **Hardware:** 4x AMD Radeon Pro V620 (gfx1030, RDNA2, 32 GB each, ~506 GB/s,
 no matrix cores, no bf16), PCIe Gen4 x16 each on its own NUMA node, no
 NVLink-style link: GPU-to-GPU traffic is PCIe peer-to-peer (~25 GB/s kernel
-push). Host: 48 threads, 256 GB RAM (containers limited to 236 GiB), ZFS pool
+push). Host: 48 threads, 256 GB RAM (containers limited to 240 GiB), ZFS pool
 for models and the disk cache. Power-capped to 160 W per card with a -50 mV
 undervolt (section 11).
 
@@ -432,8 +432,13 @@ fetches that row's full logits (~1 row in 10,000 in real text).
   uncached flags.
 - **Memory headroom:** keep ~0.5 GB free per card; running within ~0.2 GB caused
   stalls.
-- **Host RAM:** PLE table (int8: 57.6 GB pinned) + block store (128 GB) +
-  model page cache; the container limit was raised to 236 GiB.
+- **Host RAM:** PLE table (bf16: 102.4 GB pinned) + block store (up to 128 GB)
+  + model page cache; the container limit was raised to 240 GiB. With the table
+  pinned, the model files no longer all fit in the page cache, so a warm start
+  reads part of them from disk again (~120 s instead of ~60 s with int8).
+- **Readiness:** the engine reports ready (and the server answers `/health`)
+  only after the table is in RAM; before, a cold start served requests while
+  rows still came from disk (warmup 28-35 s instead of ~5 s).
 
 ---
 
@@ -446,7 +451,7 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 | plain decode (no drafts) | ~67 tok/s (14.7 ms/step) |
 | 4 concurrent requests | ~231 tok/s aggregate |
 | prefill | ~2,050-2,200 tok/s |
-| startup (warm) | ~60 s (33 s for the weights) |
+| startup (warm) | ~120 s with the bf16 table (~60 s with int8; the weights themselves ~33-45 s, loaded in parallel) |
 | accuracy vs fp32 reference with the original PLE table | 0.044 mean \|Δlogprob\| (production's bf16 table) |
 | tasks (int4 / int8 table) | GSM8K 94.8 / 94.6%, MMLU 86.6 / 86.0%, ARC-Challenge 97.2 / 97.2% (no significant difference) |
 | the previous production engine (vLLM fork) | ~56-65 tok/s, ~1,060 tok/s prefill |
