@@ -638,8 +638,11 @@ different things: int8 brings the next-token probabilities measurably closer
 to the original model's, but greedy final answers on these tasks almost never
 depend on that difference.
 
-**Decision:** pending the bf16 task run (2026-09-28). Production runs the int8
-table since 2026-09-27 (+24 GB of host RAM; the container's limit was raised
+**Decision (2026-09-27): production runs the original bf16 table**
+(`ples_bf16`, 102.4 GB pinned in RAM; the container limit went to 240 GiB and
+the host prefix cache stays at 128 GB): at worst it scores like int4 on tasks,
+and its next-token distributions are the model's own. The bf16 task run is
+still to do. Before that, production ran the int8 table on 2026-09-27 (+24 GB of host RAM; the container's limit was raised
 to 236 GiB for it): closer to the trained model at no GPU or speed cost, with
 no task gain shown. If bf16 also shows no task effect, the choice is between
 fidelity (int8) and 24 GB of RAM (int4).

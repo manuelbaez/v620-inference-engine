@@ -181,7 +181,7 @@ Speed figures are single-stream decode unless stated.
 | GPU sampling | penalties + candidates + Gumbel draw on the GPUs | +11-18% under sampling settings | same distribution (different random draws) | on | on | `QW_GPU_SAMPLING=0` |
 | Parallel sampling on host | fallback/host path samples rows in parallel | host sampling 16 -> 3 ms/step | none | on | on | |
 | Parallel weight loading | the 4 ranks load at once | startup 105 -> 33 s (warm) | none | on | on | `QW_LOAD_SERIAL=1` |
-| PLE table | n-gram table precision in RAM | none | int4 0.065, int8 0.048, bf16 0.044 mean \|Δlogprob\| | int4 path in `--ple-dir` default | **int8** | `--ple-dir` |
+| PLE table | n-gram table precision in RAM | none | int4 0.065, int8 0.048, bf16 0.044 mean \|Δlogprob\|; no task difference int4 vs int8 | int4 path in `--ple-dir` default | **bf16** (102 GB RAM) | `--ple-dir` |
 | PLE pinning | table locked in RAM at startup | avoids disk reads per token | none | on | on | `QW_PLE_PIN=0` |
 | Vision | ViT copy on every card, lazy encoding, LRU cache | 1080p image ~1.2 s | as HF | on | on | `QW_NO_VISION`, `QW_VISION_CACHE_GB` (2), `QW_VISION_MAX_PIXELS` (1920x1088) |
 | int8 dense weights | W8A16 copies of dense matrices | +13% at 1 row, 0% at 8 | **worse**: +0.012..0.033 | off | off | `QW_INT8_DENSE=1` (+ `QW_INT8_DIR` GPTQ) |
@@ -445,7 +445,7 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 | 4 concurrent requests | ~231 tok/s aggregate |
 | prefill | ~2,050-2,200 tok/s |
 | startup (warm) | ~60 s (33 s for the weights) |
-| accuracy vs fp32 reference with the original PLE table | 0.048 mean \|Δlogprob\| (int8 table) |
+| accuracy vs fp32 reference with the original PLE table | 0.044 mean \|Δlogprob\| (production's bf16 table) |
 | tasks (int4 / int8 table) | GSM8K 94.8 / 94.6%, MMLU 86.6 / 86.0%, ARC-Challenge 97.2 / 97.2% (no significant difference) |
 | the previous production engine (vLLM fork) | ~56-65 tok/s, ~1,060 tok/s prefill |
 
