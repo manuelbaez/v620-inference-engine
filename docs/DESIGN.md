@@ -568,6 +568,62 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
 
+## PLE n-gram table precision: int4, int8 or bf16 (2026-09-27)
+
+The PLE n-gram table (layer 1, docs/MODEL.md "PLE") is 320,001,536 rows of 160
+values, read from host RAM one row per n-gram head per token: its precision
+costs RAM, not GPU memory or speed. The AWQ checkpoint does not include it; the
+int4 sidecar used until now came separately. Qwen's original bf16 table is in
+`Qwen/Qwen3.8-Flash-Next` (tensors
+`model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0..127`,
+in 33 of its 131 files).
+
+**Options** (all read by `core/ple.cpp`, layout from the sidecar's META.json):
+
+| table | layout | host RAM | error vs the original |
+|---|---|---|---|
+| int4 (the old sidecar) | group of 16 values, fp16 scale, int4 | 30 GB | 9% relative (L2, 100k rows of shard 0) |
+| int8 | group of 16 values, fp16 scale, int8 (max/127) | 54 GB | worst value 0.39% of its row's max |
+| bf16 (original) | as released | 96 GB | exact |
+
+Built with `tools/ple_download.py` (HTTP ranges of just those tensors, ~102 GB)
+and `tools/ple_convert.py` (bf16 and int8 sidecars; checks the rows line up
+with the int4 sidecar). The int8 table lives at
+`/mnt/llms/qwen3.8-flash-next-ple/ples_int8`.
+
+**Next-token distributions** (4,000 held-out tokens: DESIGN.md prose, Python
+code, license text; teacher-forced decode; against a new fp32 CPU reference
+with the original bf16 table; paired bootstrap over tokens):
+
+| engine with | mean \|dlogprob\| | top-1 agreement | vs int4 (95% CI) |
+|---|---|---|---|
+| int4 table | 0.065 | 96.8% | |
+| int8 table | 0.048 | 97.4% | -0.017 (-0.022, -0.013) |
+| bf16 table | 0.044 | 98.0% | -0.021 (-0.026, -0.015) |
+
+The old fp32 reference, built with the int4 table, is itself 0.064 from the
+new one: the int4 table was the largest single source of error, more than all
+of the engine's fp16 arithmetic (0.044 with the full table). int8 recovers
+~85% of it.
+
+**Tasks** (`tools/bench_tasks.py` through the server, greedy, thinking off,
+slots and prefill chunk as in production; GSM8K test set, MMLU 25 questions
+per subject, ARC-Challenge test set; `tools/bench_compare.py` pairs the runs,
+McNemar's exact test):
+
+| task | int4 table | int8 table |
+|---|---|---|
+| GSM8K (1,319) | 94.8% | (running) |
+| MMLU (1,425) | 86.6% | |
+| ARC-Challenge (1,172) | 97.2% | |
+
+With ~1,200-1,400 questions per task, only accuracy differences of about 1-2
+points can show; smaller real gains read as noise.
+
+**Decision:** pending the int8 task results. Production switched to the int8
+table on 2026-09-27 on the strength of the distribution results (+24 GB of
+host RAM; the container's limit was raised to 236 GiB for it).
+
 ## Vision: images and video (2026-09-25)
 
 The checkpoint carries a Qwen3-VL vision tower (`model.visual.*`, 0.41 B
