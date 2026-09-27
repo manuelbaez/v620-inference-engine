@@ -1,6 +1,7 @@
 // A line chart on a canvas: time on x (the last windowS seconds), one line per series.
 // Samples come every 5 s; a gap of more than 3 samples, or a null value (no work of that
-// kind in the sample), breaks the line.
+// kind in the sample), breaks the line, unless the series sets `connect`: then the line
+// joins the measured samples across gaps and each sample is marked with a dot.
 // Hovering (or touching) a chart marks the nearest sample and shows its exact values.
 
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -48,18 +49,30 @@ function draw(canvas) {
     g.beginPath();
     let prev = null;
     for (const p of points) {
-      if (p[s.key] == null) { prev = null; continue; }
+      if (p[s.key] == null) {
+        if (!s.connect) prev = null;
+        continue;
+      }
       const x = X(p.t), y = Y(p[s.key]);
-      if (prev == null || p.t - prev > 16) {
+      if (prev == null || (!s.connect && p.t - prev > 16)) {
         g.moveTo(x, y);
         g.lineTo(x + 0.01, y);  // a lone sample still shows (as a dot, with round caps)
       } else g.lineTo(x, y);
       prev = p.t;
     }
     g.stroke();
+    if (s.connect) {
+      g.fillStyle = cssVar(s.color);
+      for (const p of points)
+        if (p[s.key] != null) { g.beginPath(); g.arc(X(p.t), Y(p[s.key]), 2, 0, 2 * Math.PI); g.fill(); }
+    }
   }
 
-  const p = canvas._hover != null ? nearest(points, t0 + (canvas._hover - L) / pw * windowS) : null;
+  // connected series snap to the nearest measured sample, wherever it is on the line
+  const connected = series.every(s => s.connect);
+  const candidates = connected ? points.filter(p => series.some(s => p[s.key] != null)) : points;
+  const p = canvas._hover != null
+    ? nearest(candidates, t0 + (canvas._hover - L) / pw * windowS, connected ? Infinity : 10) : null;
   if (!p) { canvas._tip.hidden = true; return; }
   const x = X(p.t);
   g.strokeStyle = cssVar("--muted");
@@ -75,11 +88,11 @@ function draw(canvas) {
   showTip(canvas, p, x);
 }
 
-// The sample closest in time to t, or null when none is within 10 s.
-function nearest(points, t) {
+// The sample closest in time to t, or null when none is within maxS seconds.
+function nearest(points, t, maxS) {
   let best = null;
   for (const p of points) if (!best || Math.abs(p.t - t) < Math.abs(best.t - t)) best = p;
-  return best && Math.abs(best.t - t) <= 10 ? best : null;
+  return best && Math.abs(best.t - t) <= maxS ? best : null;
 }
 
 function showTip(canvas, p, x) {

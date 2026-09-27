@@ -48,9 +48,9 @@ function renderCharts(d) {
   const win = +$("win").value, h = d.history;
   const tps = v => v.toFixed(1) + " tok/s", n = v => String(Math.round(v));
   lineChart($("chart-prompt"), h, [{key: "prompt_tps", color: "--accent", label: "prompt processing", fmt: tps,
-                                     none: "no prefill"}], win, 10);
+                                     none: "no prefill", connect: true}], win, 10);
   lineChart($("chart-gen"), h, [{key: "gen_tps", color: "--accent2", label: "generation", fmt: tps,
-                                  none: "no decoding"}], win, 10);
+                                  none: "no decoding", connect: true}], win, 10);
   lineChart($("chart-demand"), h, [
     {key: "prompt_demand_tps", color: "--accent", label: "prompt tokens computed", fmt: tps},
     {key: "gen_demand_tps", color: "--accent2", label: "tokens generated", fmt: tps}], win, 10);
