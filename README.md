@@ -55,7 +55,8 @@ later ones that fit.
 Thinking: `reasoning_effort` (none, minimal, low, medium, high, xhigh, max;
 none turns it off) and a thinking-token budget (`thinking_token_budget`,
 `thinking_budget_tokens` or Anthropic's `thinking.budget_tokens`) per request;
-defaults `--reasoning-effort` (xhigh) and `--thinking-budget` (-1, unlimited).
+defaults `--reasoning-effort` (xhigh; production sets medium) and `--thinking-budget`
+(-1, unlimited).
 All settings and their defaults: docs/ENGINE_GUIDE.md, section 4.
 
 ```sh
