@@ -452,7 +452,9 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 Where the remaining time goes (decode step, one card): ~4.9 ms dense GEMVs at
 ~86% of bandwidth, ~3.5 ms other compute, the rest collective latency and
 launch gaps. Remaining ideas are small: reduced-vocabulary drafts (~5%), a
-chunked GDN prefill kernel, fp8 KV (capacity, not speed; changes output).
+chunked GDN prefill kernel, fp8 KV (capacity, not speed; changes output), and
+NVFP4 experts (possibly closer to the original than AWQ int4; costs ~1.5 GB
+per card and software FP4 decode on RDNA2; see DESIGN.md roadmap).
 
 ---
 

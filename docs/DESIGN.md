@@ -533,6 +533,18 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          single error source. int8: 54 GB of host RAM (int4 30, bf16 96)
    - [x] startup: the four ranks load in parallel, each on its own thread and pool (warm cache
          105.6 -> 33.4 s; `QW_LOAD_SERIAL=1` for the old order)
+   - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
+         checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
+         layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
+         experts closer to the original than AWQ int4 with a bf16 scale per 128, but AWQ's
+         activation-aware scaling narrows that; unmeasured. Costs: no FP4/FP8 units on gfx1030
+         (a 16-entry lookup and a scale per value, in the decode pair kernel and the prefill
+         expert GEMM's LDS dequant; decode experts are ~1 ms of 14.7 ms, so ~+0.1 ms); ~4.5 vs
+         ~4.1 bits per weight, experts 62.3 -> ~68 GB, ~+1.5 GB per card (one KV slot shrinks).
+         Our fp32 reference also uses the AWQ experts, so first step: download the original bf16
+         experts of a few layers and compare AWQ and NVFP4 reconstruction error weighted by
+         typical inputs (hours); only if NVFP4 is clearly closer, build the kernels and measure
+         against a reference with bf16 experts
    - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
          all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
          a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop
