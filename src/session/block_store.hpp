@@ -109,7 +109,7 @@ private:
         struct Item {
             uint64_t key;
             bool snap;
-            std::shared_ptr<Payload> pl;
+            std::shared_ptr<Payload> pl;  // pinned on the load thread
             size_t rank_bytes;
             std::vector<float> logits;
         };

@@ -571,8 +571,11 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [~] disk-tier loads off the scheduler thread (`Session::prefetch`, `BlockStore::load`): a
          97k-token prompt restored from disk after a restart blocked every request for ~54 s
          (TTFT 53.9 s, other streams stalled). Now the request waits in a loading state while a
-         background thread reads the entries into RAM, then restores from RAM. Built and unit
-         tested (admission), not yet measured live or deployed
+         background thread reads the entries into RAM, then restores from RAM. First live run
+         (cf08ac4, 80.8k-token prompt, 317 entries, 6.8 GB in 21.9 s): a short request was
+         admitted at once (TTFT 0.11 s) but decoded at 1.5 tok/s, because the pinned buffers
+         were still taken on the scheduler thread and the pools, empty after a start, pinned
+         new arenas for ~14 s. Now the load thread takes them too; to be measured again
    - [ ] host memory: production (bf16 table 102 GB pinned + host cache up to 128 GB, container
          limit 240 GiB of the host's 251) was killed by the host's OOM killer on 2026-09-27
          17:40 (constraint none: the host itself ran out). Needs a smaller host cache budget

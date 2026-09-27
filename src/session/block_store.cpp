@@ -217,21 +217,24 @@ bool BlockStore::load(const Hit &h) {
         const Node &nd = nodes_.at(k);
         if (!nd.kv && nd.kv_disk) {
             const size_t rb = e_.kv_rank_bytes(int64_t(nd.tokens.size()));
-            ld->items.push_back({k, false, alloc(false), rb, {}});
+            ld->items.push_back({k, false, nullptr, rb, {}});
             bytes += rb * RANKS;
         }
     }
     const Node &target = nodes_.at(h.node);
     if (!target.snap && target.snap_disk) {
-        ld->items.push_back({h.node, true, alloc(true), Engine::recurrent_rank_bytes(), {}});
+        ld->items.push_back({h.node, true, nullptr, Engine::recurrent_rank_bytes(), {}});
         bytes += Engine::recurrent_rank_bytes() * RANKS;
     }
     if (ld->items.empty()) return false;
     log("prefix cache: loading %zu entries (%.1f GB) from disk in the background", ld->items.size(), double(bytes) / 1e9);
+    // taking the pinned buffers can mean pinning new arenas (seconds per GB when the pools are
+    // empty, as after a start), so the load thread takes them
     Load *l = ld.get();
     ld->th = std::thread([this, l, t0] {
         size_t failed = 0;
         for (auto &it : l->items) {
+            it.pl = alloc(it.snap);
             const bool ok = disk_->read(it.key, it.snap, it.pl->p, it.rank_bytes, it.snap ? &it.logits : nullptr);
             if (!ok) {
                 it.pl.reset();
