@@ -28,12 +28,12 @@
     <div class="card">
       <h2>Prompt processing speed (tokens/s)</h2>
       <canvas id="chart-prompt"></canvas>
-      <div class="legend"><span style="--c:var(--accent)">while prefilling, all requests in the batch</span></div>
+      <div class="legend"><span style="--c:var(--accent)">all prefilling requests together, while any is prefilling</span></div>
     </div>
     <div class="card">
       <h2>Generation speed (tokens/s)</h2>
       <canvas id="chart-gen"></canvas>
-      <div class="legend"><span style="--c:var(--accent2)">while decoding, sum over running requests</span></div>
+      <div class="legend"><span style="--c:var(--accent2)">all running requests together, while any is decoding</span></div>
     </div>
     <div class="card">
       <h2>Demand (tokens/s over wall time)</h2>

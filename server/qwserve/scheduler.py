@@ -286,12 +286,11 @@ class Scheduler:
             computed = sum(min(n, r.left) for r, n in batch)
             self.win["prefill"] += computed
             try:
-                tp = time.time()
                 if len(batch) == 1:
                     done = [self.e.prefill_some(batch[0][0].slot, batch[0][1])]
                 else:
                     done = self.e.prefill_batch([(r.slot, n) for r, n in batch])
-                self.metrics.add_prefill(computed, time.time() - tp)
+                self.metrics.add_prefill(computed)
             except Exception as ex:  # noqa: BLE001
                 print(f"prefill error ({', '.join(r.rid for r, _ in batch)}): {ex}\n{traceback.format_exc()}",
                       file=sys.stderr, flush=True)
@@ -344,7 +343,6 @@ class Scheduler:
         st["steps"] += 1
         st["rows"] += len(batch)
         st["tokens"] += sum(len(t) for t, _, _, _ in res)
-        self.metrics.add_step(sum(len(t) for t, _, _, _ in res), time.time() - t0)
         for r, (toks, lps, first, _) in zip(batch, res):
             if r.forced:  # emit the next forced token; the engine's sample for this row is dropped
                 if not self._took(r, r.forced.pop(0), 0.0, None):
@@ -371,6 +369,7 @@ class Scheduler:
                     return
                 self.waiting += self.queue  # the queue is shared; waiting is this thread's
                 self.queue = []
+            t_pass = time.time()
             try:
                 self._admit()
                 self._poll_loading()
@@ -382,6 +381,7 @@ class Scheduler:
                 while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
                     self._step()
                 self._stats()
+                self.metrics.tick(time.time() - t_pass, len(self.prefilling), len(self.active))
                 self.metrics.sample(len(self.active), len(self.prefilling),
                                     len(self.waiting) + len(self.queue) + len(self.loading),
                                     sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),

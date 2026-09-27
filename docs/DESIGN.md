@@ -565,9 +565,11 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [x] dashboard (`server/qwserve/dashboard/`, served at `/`, which llama-swap links as the
          model's upstream page): totals, charts of prompt processing speed, generation speed, demand, queue and KV
          (an hour of 5 s samples; hovering shows the exact values at that time). Speed is
-         tokens over the time the engine spent prefilling or decoding them (the sum of the
-         rates of the requests processed together); demand is tokens over wall time, which
-         is what the charts showed first and read low whenever the server was partly idle,
+         the aggregate of all requests in that phase: tokens over the wall time during which
+         at least one request was prefilling (or decoding), so interleaved work counts the
+         way the requests experience it (a first version divided by the phase's own GPU
+         time and read up to 2x high while prefill and decode alternated); demand is tokens
+         over all wall time, which the charts showed first and read low when partly idle,
          KV in the GPUs, per-card VRAM and power, host cache, disk tier, PLE table, averages of
          TTFT, request time and decode speed, recent requests. A collector thread builds the
          snapshot every 2 s; the handler only returns it; figures to one decimal

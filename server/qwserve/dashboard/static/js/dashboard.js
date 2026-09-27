@@ -32,7 +32,7 @@ function renderCards(d) {
   const [pp, ppWhen] = lastOf("prompt_tps"), [tg, tgWhen] = lastOf("gen_tps");
   const fromCache = t.prompt_tokens ? fmt.percent(100 * t.cached_tokens / t.prompt_tokens) + " from cache" : "";
   $("cards").innerHTML = [
-    ui.card("Prompt processing speed", fmt.rate(pp), "while prefilling, " + ppWhen),
+    ui.card("Prompt processing speed", fmt.rate(pp), "all prefilling requests, " + ppWhen),
     ui.card("Generation speed", fmt.rate(tg), "all running requests, " + tgWhen),
     ui.card("Avg time to first token", fmt.seconds(a.ttft_s), `last ${a.requests} requests`),
     ui.card("Avg request time", fmt.seconds(a.total_s), a.queue_s != null ? "queue " + fmt.seconds(a.queue_s) : ""),
