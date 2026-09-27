@@ -15,6 +15,8 @@
 #pragma once
 
 #include <array>
+#include <thread>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -49,6 +51,11 @@ public:
     // *logits when they are stored (else clears it). False if a file could not
     // be read (the entry is dropped; the slot's state is then undefined).
     bool restore(const Hit &h, const std::vector<int32_t> &prompt, int slot, int64_t keep, std::vector<float> *logits);
+    // Brings a hit's entries that are only on disk into RAM on a background
+    // thread, so restore() then reads nothing from disk: true while that load
+    // runs (call again to poll; one load at a time, so another hit's load also
+    // reads as running), false once everything the hit needs is in RAM.
+    bool load(const Hit &h);
     // Stores the state of `slot` at VRAM snapshot `snap`, which was taken at
     // tokens.size() tokens of the slot: the path's blocks not stored yet, and
     // the snapshot (with the logits after its last token, if given).
@@ -95,6 +102,22 @@ private:
     bool ensure_snap(Node &nd, uint64_t k);
     void remove_subtree(uint64_t k);
     void enforce_budgets();
+    // A background load of on-disk entries (load()): the payloads are allocated
+    // by the caller's thread and filled by the loader; finish_load() attaches
+    // them to the nodes that still want them.
+    struct Load {
+        struct Item {
+            uint64_t key;
+            bool snap;
+            std::shared_ptr<Payload> pl;
+            size_t rank_bytes;
+            std::vector<float> logits;
+        };
+        std::vector<Item> items;
+        std::atomic<bool> done{false};
+        std::thread th;
+    };
+    void finish_load();
     void load_index();
 
     Engine &e_;
@@ -104,6 +127,7 @@ private:
     std::unordered_map<uint64_t, Node> nodes_;
     uint64_t clock_ = 0;
     Stats stats_;
+    std::unique_ptr<Load> load_;
     std::unique_ptr<DiskTier> disk_;  // declared last: destroyed (writes finished) before the pools
 };
 

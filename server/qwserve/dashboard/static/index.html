@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qw engine dashboard</title>
+<link rel="stylesheet" href="static/css/dashboard.css">
+<script type="module" src="static/js/dashboard.js"></script>
+</head>
+<body>
+<header>
+  <h1>qw engine</h1>
+  <span class="sub" id="model">-</span>
+  <span class="sub"><span class="dot" id="dot"></span><span id="state">connecting...</span></span>
+  <span class="sub" id="uptime"></span>
+  <span class="sub push">window
+    <select id="win">
+      <option value="300">5 min</option>
+      <option value="900">15 min</option>
+      <option value="3600" selected>60 min</option>
+    </select>
+  </span>
+</header>
+<main>
+  <section class="grid" id="cards"></section>
+
+  <section class="panels">
+    <div class="card">
+      <h2>Throughput (tokens/s)</h2>
+      <canvas id="chart-throughput"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">prompt processing</span><span style="--c:var(--accent2)">generation</span></div>
+    </div>
+    <div class="card">
+      <h2>Requests</h2>
+      <canvas id="chart-queue"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">running</span><span style="--c:var(--accent2)">waiting / prefilling / loading</span></div>
+    </div>
+    <div class="card">
+      <h2>KV cache in use (% of GPU slots)</h2>
+      <canvas id="chart-kv"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">KV used</span></div>
+    </div>
+  </section>
+
+  <section class="panels">
+    <div class="card"><h2>GPU memory</h2><div id="gpu"></div></div>
+    <div class="card"><h2>Host RAM and disk</h2><div id="host"></div></div>
+  </section>
+
+  <section class="card">
+    <h2>Recent requests</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>ended</th><th>id</th><th>finish</th><th>prompt</th><th>cached</th><th>generated</th>
+          <th>queue</th><th>TTFT</th><th>total</th><th>decode</th><th>slot</th></tr></thead>
+        <tbody id="requests"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+</body>
+</html>

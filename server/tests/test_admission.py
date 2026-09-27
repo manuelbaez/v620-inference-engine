@@ -35,6 +35,9 @@ class FakeEngine:
         self.busy[slot] = True
         return slot
 
+    def prefetch(self, slot, tokens, media=None):
+        return False  # nothing on disk
+
     def set_stop_tokens(self, slot, ids):
         pass
 

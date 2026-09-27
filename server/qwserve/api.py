@@ -2,9 +2,7 @@
 /v1/models, /tokenize, /health."""
 
 import asyncio
-import glob
 import json
-import os
 import sys
 import time
 import traceback
@@ -106,62 +104,6 @@ class Server:
             st["tokens_per_request_step"] = round(st["tokens"] / st["rows"], 3)
             st["ms_per_step"] = round(1e3 * st["time"] / st["steps"], 2)
         return web.json_response({"status": "ok", "decode": st, "prefix_cache": self.sched.cache_stats})
-
-    # --- dashboard
-    KV_BYTES_PER_TOKEN = 4 * 20800  # all 4 cards: K/V, raw and compressed indexer keys of 13 QSA layers
-
-    def _gpus(self):
-        """VRAM and power of the V620s from sysfs (readable without privileges)."""
-        out = []
-        for card in sorted(glob.glob("/sys/class/drm/card*/device")):
-            try:
-                if open(os.path.join(card, "vendor")).read().strip() != "0x1002":
-                    continue
-                used = int(open(os.path.join(card, "mem_info_vram_used")).read())
-                total = int(open(os.path.join(card, "mem_info_vram_total")).read())
-                power = None
-                for h in glob.glob(os.path.join(card, "hwmon", "hwmon*", "power1_average")):
-                    power = int(open(h).read()) / 1e6
-                out.append({"card": os.path.basename(os.path.dirname(card)), "vram_used": used, "vram_total": total,
-                            "power_w": power})
-            except (OSError, ValueError):
-                continue
-        return out
-
-    def _ple_bytes(self):
-        try:
-            meta = json.load(open(os.path.join(self.args.ple_dir, "META.json")))
-            per_value = {"bf16": 2.0, "group16_int8_fp16scale": 1.125}.get(meta["layout"], 0.5625)
-            return int(meta["rows"] * meta["width"] * per_value)
-        except (OSError, ValueError, KeyError):
-            return None
-
-    async def metrics_json(self, _):
-        snap = self.sched.metrics.snapshot()
-        cs = self.sched.cache_stats or {}
-        mem = {}
-        try:
-            info = dict(l.split(":", 1) for l in open("/proc/meminfo"))
-            mem = {k: int(info[k].split()[0]) * 1024 for k in ("MemTotal", "MemAvailable") if k in info}
-        except OSError:
-            pass
-        cap = sum(self.engine.capacity)
-        snap["memory"] = {
-            "kv_gpu_allocated": cap * self.KV_BYTES_PER_TOKEN,
-            "kv_gpu_used": snap["live"].get("kv_used_tokens", 0) * self.KV_BYTES_PER_TOKEN,
-            "slots": self.engine.capacity,
-            "host_cache_used": cs.get("ram_bytes"), "host_cache_budget": int(self.args.host_cache_gb * 1e9),
-            "disk_cache_used": cs.get("disk_bytes"), "disk_cache_budget": int(self.args.disk_cache_gb * 1e9),
-            "cache_blocks": cs.get("blocks"), "cache_snapshots": cs.get("snapshots"),
-            "ple_table": self._ple_bytes(), "ple_dir": os.path.basename(self.args.ple_dir.rstrip("/")),
-            "host_total": mem.get("MemTotal"), "host_available": mem.get("MemAvailable"),
-            "gpus": self._gpus(),
-        }
-        snap["model"] = self.model_name
-        return web.json_response(snap)
-
-    async def dashboard(self, _):
-        return web.FileResponse(os.path.join(os.path.dirname(__file__), "dashboard.html"))
 
     async def models(self, _):
         return web.json_response({"object": "list", "data": [{

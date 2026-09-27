@@ -30,6 +30,13 @@ bool Session::restore_from_store(int slot, const std::vector<int32_t> &prompt, s
     return true;
 }
 
+bool Session::prefetch(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media) {
+    if (!store_) return false;
+    const std::vector<int32_t> keys = media.empty() ? prompt : media_keys(prompt, media);
+    const BlockStore::Hit hit = store_->lookup(keys, int64_t(reusable(slot, keys)));
+    return hit.n > 0 && store_->load(hit);
+}
+
 std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
                                                     int max_caps, bool append) {
     std::vector<Engine::Capture> caps;

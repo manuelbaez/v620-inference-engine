@@ -66,6 +66,11 @@ public:
     // prefill_some prefills up to max_tokens more and returns true once the
     // whole prompt is in (logits for sample_prompt ready).
     int64_t begin_prompt(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media = {});
+    // Before begin_prompt: if the prefix cache's hit for `prompt` in `slot` has
+    // entries only on disk, loads them into RAM on a background thread. True
+    // while that runs (poll until false, then call begin_prompt, which then
+    // restores from RAM), so a long disk read never blocks other requests.
+    bool prefetch(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media = {});
     bool prefill_some(int slot, int64_t max_tokens);
     // prefill_some for several slots (slot, max_tokens) in one engine pass
     // (Engine::prefill_batch) when their pieces fit one prefill chunk and none

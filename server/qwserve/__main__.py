@@ -7,6 +7,7 @@ import sys
 from aiohttp import web
 
 from . import __doc__ as DOC
+from . import dashboard
 from .api import Server
 
 
@@ -45,9 +46,7 @@ def main():
     os.environ["QW_DISK_CACHE_GB"] = str(args.disk_cache_gb)
     srv = Server(args)
     app = web.Application(client_max_size=256 * 1024 * 1024)
-    app.router.add_get("/", srv.dashboard)
-    app.router.add_get("/dashboard", srv.dashboard)
-    app.router.add_get("/metrics.json", srv.metrics_json)
+    dashboard.setup(app, srv)  # /, /metrics.json, /static/
     app.router.add_get("/health", srv.health)
     app.router.add_get("/v1/models", srv.models)
     app.router.add_post("/tokenize", srv.tokenize)

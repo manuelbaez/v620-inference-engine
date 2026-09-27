@@ -7,7 +7,7 @@ import time
 import traceback
 
 from .engine import Sampling
-from .metrics import Metrics
+from .dashboard.metrics import Metrics
 
 
 class Request:
@@ -92,6 +92,7 @@ class Scheduler:
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
+        self.loading = []     # in a slot, its cached prompt still loading from disk (background)
         self.prefilling = []  # in a slot, prompt partly prefilled
         self.active = []
         self.stopping = False
@@ -109,7 +110,7 @@ class Scheduler:
             self.stopping = True
             self.cv.notify_all()
         self.thread.join(timeout)
-        for r in self.waiting + self.prefilling + self.active + self.queue:
+        for r in self.waiting + self.loading + self.prefilling + self.active + self.queue:
             r.emit("error", "server shutting down")
 
     def submit(self, req):
@@ -141,8 +142,8 @@ class Scheduler:
             reuse = f"{100 * w['cached'] / w['prompt']:.0f}%" if w["prompt"] else "-"
             step = f", {1e3 * w['step_time'] / w['steps']:.1f} ms/step, {w['gen'] / w['rows']:.2f} tok/row" if w["steps"] else ""
             print(f"stats: prompt {w['prefill'] / dt:.0f} tok/s, generation {w['gen'] / dt:.1f} tok/s{step} | "
-                  f"running {len(self.active)}, prefilling {len(self.prefilling)}, waiting "
-                  f"{len(self.waiting) + len(self.queue)} | slots {len(self.active) + len(self.prefilling)}/"
+                  f"running {len(self.active)}, prefilling {len(self.prefilling)}, loading {len(self.loading)}, waiting "
+                  f"{len(self.waiting) + len(self.queue)} | slots {len(self.active) + len(self.prefilling) + len(self.loading)}/"
                   f"{len(self.e.capacity)}, KV {100 * used / cap:.1f}% | prompt tokens from cache {reuse}", flush=True)
         self.win = {"t": now, "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0, "rows": 0}
 
@@ -209,18 +210,48 @@ class Scheduler:
                 r.limit = min(r.max_new, room) if r.max_new else room
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
                 r.t_admit = time.time()
-                r.cached, r.keep = self.e.begin_prompt(slot, r.prompt, r.media)
-                r.left = len(r.prompt) - r.cached
-                self.win["prompt"] += len(r.prompt)
-                self.win["cached"] += r.cached
-                self.metrics.add_admitted(len(r.prompt), r.cached)
-                self.cache_stats = self.e.cache_stats()
-                r.emit("start", r.cached)
+                if self.e.prefetch(slot, r.prompt, r.media):  # cached entries on disk: load them in the background
+                    self.loading.append(r)
+                    continue
             except Exception as ex:  # noqa: BLE001
                 r.emit("error", str(ex))
                 self._finish(r, "abort")
                 continue
-            self.prefilling.append(r)
+            self._begin(r)
+
+    def _poll_loading(self):
+        """Requests whose cached prompt was loading from disk: begin those whose load is done."""
+        for r in list(self.loading):
+            if r.cancelled.is_set():
+                self.loading.remove(r)
+                self._finish(r, "abort")
+                continue
+            try:
+                if self.e.prefetch(r.slot, r.prompt, r.media):
+                    continue
+            except Exception as ex:  # noqa: BLE001
+                self.loading.remove(r)
+                r.emit("error", str(ex))
+                self._finish(r, "abort")
+                continue
+            self.loading.remove(r)
+            self._begin(r)
+
+    def _begin(self, r):
+        """Restores what the caches hold of r's prompt into its slot and queues the rest for prefill."""
+        try:
+            r.cached, r.keep = self.e.begin_prompt(r.slot, r.prompt, r.media)
+            r.left = len(r.prompt) - r.cached
+            self.win["prompt"] += len(r.prompt)
+            self.win["cached"] += r.cached
+            self.metrics.add_admitted(len(r.prompt), r.cached)
+            self.cache_stats = self.e.cache_stats()
+            r.emit("start", r.cached)
+        except Exception as ex:  # noqa: BLE001
+            r.emit("error", str(ex))
+            self._finish(r, "abort")
+            return
+        self.prefilling.append(r)
 
     def _batch(self):
         """The prefills to advance in one engine pass: the oldest one, plus the next ones while
@@ -327,7 +358,7 @@ class Scheduler:
         while True:
             with self.cv:
                 while (not self.queue and not self.waiting and not self.prefilling and not self.active
-                       and not self.stopping):
+                       and not self.loading and not self.stopping):
                     self._stats(force=True)  # the last window before going idle
                     self.metrics.idle()
                     self.cv.wait()
@@ -340,23 +371,28 @@ class Scheduler:
                 self.queue = []
             try:
                 self._admit()
+                self._poll_loading()
+                if self.loading and not (self.active or self.prefilling or self.waiting or self.queue):
+                    time.sleep(0.02)  # only disk loads in flight: poll them without spinning
                 spent = self._prefill()
                 t0 = time.time()
                 self._step()
                 while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
                     self._step()
                 self._stats()
-                self.metrics.sample(len(self.active), len(self.prefilling), len(self.waiting) + len(self.queue),
+                self.metrics.sample(len(self.active), len(self.prefilling),
+                                    len(self.waiting) + len(self.queue) + len(self.loading),
                                     sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),
                                     sum(self.e.capacity))
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
                 print(f"scheduler error ({len(self.prefilling) + len(self.active)} requests failed): {ex}\n"
                       f"{traceback.format_exc()}", file=sys.stderr, flush=True)
-                for r in self.prefilling + self.active:
+                for r in self.loading + self.prefilling + self.active:
                     r.emit("error", str(ex))
                     try:
                         self._finish(r, "abort")
                     except Exception:  # noqa: BLE001
                         pass
+                self.loading = []
                 self.prefilling = []
                 self.active = []

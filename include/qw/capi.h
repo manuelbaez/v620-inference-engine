@@ -80,6 +80,10 @@ int64_t qw_set_prompt_media(qw_handle *h, int slot, const int32_t *tokens, int64
  * and returns 1 once the whole prompt is in, 0 while some is left. */
 int64_t qw_begin_prompt(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media, int n_media);
 int qw_prefill_some(qw_handle *h, int slot, int64_t max_tokens);
+/* Before qw_begin_prompt: 1 while the prompt's prefix-cache entries that are
+ * only on disk are being read into RAM in the background (poll), 0 when there
+ * is nothing (more) to load; -1 on error. */
+int qw_prefetch(qw_handle *h, int slot, const int32_t *tokens, int64_t n, const qw_media *media, int n_media);
 /* qw_prefill_some for n slots in one pass when their pieces fit one prefill
  * chunk (else one after the other); done[i] = 1 once slots[i]'s prompt is in. */
 int qw_prefill_batch(qw_handle *h, int n, const int32_t *slots, const int64_t *max_tokens, int32_t *done);

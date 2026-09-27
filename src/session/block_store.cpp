@@ -51,7 +51,9 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     }
 }
 
-BlockStore::~BlockStore() = default;
+BlockStore::~BlockStore() {
+    if (load_ && load_->th.joinable()) load_->th.join();
+}
 
 // Rebuilds the index from the disk tier's files; drops files whose chain is broken.
 void BlockStore::load_index() {
@@ -200,6 +202,69 @@ bool BlockStore::ensure_snap(Node &nd, uint64_t k) {
     nd.logits = std::move(logits);
     ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + nd.logits.size() * 4;
     return true;
+}
+
+bool BlockStore::load(const Hit &h) {
+    if (load_) {
+        if (!load_->done) return true;
+        finish_load();
+    }
+    if (!disk_ || !nodes_.count(h.node)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ld = std::make_unique<Load>();
+    size_t bytes = 0;
+    for (uint64_t k : path_to(h.node)) {
+        const Node &nd = nodes_.at(k);
+        if (!nd.kv && nd.kv_disk) {
+            const size_t rb = e_.kv_rank_bytes(int64_t(nd.tokens.size()));
+            ld->items.push_back({k, false, alloc(false), rb, {}});
+            bytes += rb * RANKS;
+        }
+    }
+    const Node &target = nodes_.at(h.node);
+    if (!target.snap && target.snap_disk) {
+        ld->items.push_back({h.node, true, alloc(true), Engine::recurrent_rank_bytes(), {}});
+        bytes += Engine::recurrent_rank_bytes() * RANKS;
+    }
+    if (ld->items.empty()) return false;
+    log("prefix cache: loading %zu entries (%.1f GB) from disk in the background", ld->items.size(), double(bytes) / 1e9);
+    Load *l = ld.get();
+    ld->th = std::thread([this, l, t0] {
+        size_t failed = 0;
+        for (auto &it : l->items) {
+            const bool ok = disk_->read(it.key, it.snap, it.pl->p, it.rank_bytes, it.snap ? &it.logits : nullptr);
+            if (!ok) {
+                it.pl.reset();
+                ++failed;
+            }
+        }
+        log("prefix cache: background load of %zu entries done in %.2f s%s", l->items.size(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+            failed ? " (some unreadable)" : "");
+        l->done = true;
+    });
+    load_ = std::move(ld);
+    return true;
+}
+
+void BlockStore::finish_load() {
+    if (load_->th.joinable()) load_->th.join();
+    for (auto &it : load_->items) {
+        auto nd = nodes_.find(it.key);
+        if (!it.pl || nd == nodes_.end()) continue;  // unreadable, or dropped meanwhile
+        Node &n = nd->second;
+        n.used = ++clock_;
+        if (it.snap && !n.snap) {
+            n.snap = std::move(it.pl);
+            n.logits = std::move(it.logits);
+            ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + n.logits.size() * 4;
+        } else if (!it.snap && !n.kv) {
+            n.kv = std::move(it.pl);
+            ram_bytes_ += kv_pool_[0]->unit_bytes() * RANKS;
+        }
+    }
+    load_.reset();
+    enforce_budgets();
 }
 
 bool BlockStore::restore(const Hit &h, const std::vector<int32_t> &prompt, int slot, int64_t keep,

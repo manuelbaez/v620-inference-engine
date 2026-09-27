@@ -66,6 +66,8 @@ class Engine:
             "qw_begin_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
                                                  ctypes.POINTER(MediaStruct), ctypes.c_int]),
             "qw_prefill_some": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int64]),
+            "qw_prefetch": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int64, ctypes.POINTER(MediaStruct),
+                                           ctypes.c_int]),
             "qw_prefill_batch": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.POINTER(ctypes.c_int64), I32P]),
             "qw_top_logprobs_prompt": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int, I32P, FP]),
             "qw_acquire_media": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64,
@@ -148,6 +150,12 @@ class Engine:
         arr_m, keep = self._media_array(media or [])
         reused = self._check(self.lib.qw_begin_prompt(self.h, slot, arr, len(tokens), arr_m, len(media or [])))
         return reused, keep  # keep: buffers the C side reads until the prompt is in
+
+    def prefetch(self, slot, tokens, media=None):
+        """True while the prompt's disk-only cache entries are loading into RAM in the background."""
+        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr_m, keep = self._media_array(media or [])
+        return bool(self._check(self.lib.qw_prefetch(self.h, slot, arr, len(tokens), arr_m, len(media or []))))
 
     def prefill_some(self, slot, max_tokens):
         """Prefills up to max_tokens more of the slot's prompt; True once it is all in."""
