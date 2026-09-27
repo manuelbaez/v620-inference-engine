@@ -189,6 +189,10 @@ Speed figures are single-stream decode unless stated.
 | int8 dense weights | W8A16 copies of dense matrices | +13% at 1 row, 0% at 8 | **worse**: +0.012..0.033 | off | off | `QW_INT8_DENSE=1` (+ `QW_INT8_DIR` GPTQ) |
 | W4A8 experts | int8 activations for the expert GEMM in prefill | prefill +2% | **worse** (0.075 -> 0.104) | off | off | `QW_INT8_EXPERTS=1` |
 
+| Logs | stats line every N s while busy, one line per request, errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
+| Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
+| Background disk loads | a prompt whose cache is on disk waits while a thread reads it into RAM; others keep running | removes a ~54 s stall per 97k-token disk restore | none | on | not yet deployed | |
+
 Diagnostics: `QW_TRACE` (step phase timings, sampling fallbacks), `QW_PROFILE`
 (prefill timings), `QW_GUARD` (allocation guard zones), `QW_NOGRAPH`.
 

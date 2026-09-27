@@ -557,6 +557,25 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          per step without drafts); budget 0 = no thinking. Defaults: `--reasoning-effort` /
          `QW_REASONING_EFFORT` (xhigh), `--thinking-budget` / `QW_THINKING_BUDGET` (-1).
          `server/tests/test_thinking.py` covers the mapping
+   - [x] logs like vLLM's (`server/qwserve/scheduler.py`): a stats line every `QW_LOG_INTERVAL`
+         (10) s while busy (prompt and generation throughput, ms/step, running / prefilling /
+         loading / waiting, slots and KV use, share of prompt tokens from the cache), one line per
+         request (finish, prompt and cached tokens, generated, TTFT, decode speed, slot), errors
+         with tracebacks, client disconnects as one line
+   - [x] dashboard (`server/qwserve/dashboard/`, served at `/`, which llama-swap links as the
+         model's upstream page): totals, throughput / queue / KV charts (an hour of 5 s samples),
+         KV in the GPUs, per-card VRAM and power, host cache, disk tier, PLE table, averages of
+         TTFT, request time and decode speed, recent requests. A collector thread builds the
+         snapshot every 2 s; the handler only returns it; figures to one decimal
+   - [~] disk-tier loads off the scheduler thread (`Session::prefetch`, `BlockStore::load`): a
+         97k-token prompt restored from disk after a restart blocked every request for ~54 s
+         (TTFT 53.9 s, other streams stalled). Now the request waits in a loading state while a
+         background thread reads the entries into RAM, then restores from RAM. Built and unit
+         tested (admission), not yet measured live or deployed
+   - [ ] host memory: production (bf16 table 102 GB pinned + host cache up to 128 GB, container
+         limit 240 GiB of the host's 251) was killed by the host's OOM killer on 2026-09-27
+         17:40 (constraint none: the host itself ran out). Needs a smaller host cache budget
+         (~96 GB) or the int8 table (54 GB)
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the

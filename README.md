@@ -59,6 +59,11 @@ defaults `--reasoning-effort` (xhigh; production sets medium) and `--thinking-bu
 (-1, unlimited).
 All settings and their defaults: docs/ENGINE_GUIDE.md, section 4.
 
+The server logs a stats line every 10 s while busy and one line per request,
+and serves a dashboard at `/` (throughput, queue, KV and memory use, request
+times; JSON at `/metrics.json`). Through llama-swap:
+`http://llm-backend-amd.local.net:8080/upstream/qw/qwen3.8-flash-next/`.
+
 ```sh
 python3 -m venv ~/qwenv && ~/qwenv/bin/pip install tokenizers jinja2 aiohttp
 server/ctl.sh start                             # port 8000; stop | restart | status
