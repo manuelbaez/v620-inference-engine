@@ -533,6 +533,20 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          single error source. int8: 54 GB of host RAM (int4 30, bf16 96)
    - [x] startup: the four ranks load in parallel, each on its own thread and pool (warm cache
          105.6 -> 33.4 s; `QW_LOAD_SERIAL=1` for the old order)
+   - [x] thinking controls (`server/qwserve/prompt.py` `resolve_thinking`, scheduler): this
+         model's template takes `reasoning_effort` low / medium / xhigh (default xhigh; it adds
+         an instruction to the system prompt) and `enable_thinking`. Requests may send
+         `reasoning_effort` (OpenAI / vLLM values none, minimal, low, medium, high, xhigh, max,
+         mapped onto the template's three; none turns thinking off; vLLM passes the raw value, so
+         high or minimal would make this template raise), `chat_template_kwargs` (win, as in
+         vLLM), a thinking-token budget as `thinking_token_budget` (vLLM, -1 unlimited),
+         `thinking_budget_tokens` (opencode) or Anthropic's `thinking: {type, budget_tokens}`
+         (LiteLLM turns the latter into reasoning_effort for OpenAI-type routes). A spent budget
+         appends Qwen's closing text ("Considering the limited time by the user, I have to give
+         the solution based on the thinking directly now.\n</think>\n\n", ~24 tokens, fed one
+         per step without drafts); budget 0 = no thinking. Defaults: `--reasoning-effort` /
+         `QW_REASONING_EFFORT` (xhigh), `--thinking-budget` / `QW_THINKING_BUDGET` (-1).
+         `server/tests/test_thinking.py` covers the mapping
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
