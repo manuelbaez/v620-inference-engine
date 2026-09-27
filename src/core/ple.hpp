@@ -57,6 +57,8 @@ public:
     // disk read per row. lock: also mlock it (never evicted, but the memory is
     // taken for good); otherwise it is page cache the kernel may reclaim.
     void pin_in_background(bool lock);
+    // Blocks until the background read of pin_in_background() is done.
+    void wait_pinned();
     ~PleTable();
 
 private:

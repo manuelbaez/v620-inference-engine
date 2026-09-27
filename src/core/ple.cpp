@@ -221,6 +221,10 @@ void PleTable::pin_in_background(bool lock) {
     });
 }
 
+void PleTable::wait_pinned() {
+    if (pin_thread_.joinable()) pin_thread_.join();
+}
+
 PleTable::~PleTable() {
     stop_pin_ = true;
     if (pin_thread_.joinable()) pin_thread_.join();

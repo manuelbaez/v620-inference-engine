@@ -102,6 +102,15 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         }
         st_.clear();
     }
+    // Ready means ready: the n-gram table has been reading into RAM while the
+    // ranks loaded; wait for the rest before warmup (which would otherwise read
+    // rows from disk) and before the server reports healthy.
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        ple_->wait_pinned();
+        const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (waited > 1.0) log("waited %.0f s for the PLE table to finish loading", waited);
+    }
     if (saturated_weights)
         log("warning: %lld bf16 weights saturated to fp16 range", (long long)saturated_weights.load());
     for (int r = 0; r < RANKS; ++r) threads_.emplace_back([this, r] { rank_loop(r); });
