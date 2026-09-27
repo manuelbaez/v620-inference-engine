@@ -564,7 +564,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          with tracebacks, client disconnects as one line
    - [x] dashboard (`server/qwserve/dashboard/`, served at `/`, which llama-swap links as the
          model's upstream page): totals, charts of prompt processing speed, generation speed, demand, queue and KV
-         (an hour of 5 s samples; hovering shows the exact values at that time). Speed is
+         (an hour of 5 s samples; lines are dotted across idle time; hovering shows the exact values
+         at that time). Speed is
          the aggregate of all requests in that phase: tokens over the wall time during which
          at least one request was prefilling (or decoding), so interleaved work counts the
          way the requests experience it (a first version divided by the phase's own GPU
