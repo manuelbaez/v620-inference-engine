@@ -1,5 +1,6 @@
 // A line chart on a canvas: time on x (the last windowS seconds), one line per series.
-// Samples come every 5 s; a gap of more than 3 samples breaks the line.
+// Samples come every 5 s; a gap of more than 3 samples, or a null value (no work of that
+// kind in the sample), breaks the line.
 // Hovering (or touching) a chart marks the nearest sample and shows its exact values.
 
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -23,7 +24,7 @@ function draw(canvas) {
   const now = Date.now() / 1000, t0 = now - windowS;
   const points = history.filter(p => p.t >= t0);
   let ymax = minMax || 1;
-  for (const p of points) for (const s of series) ymax = Math.max(ymax, p[s.key] || 0);
+  for (const p of points) for (const s of series) ymax = Math.max(ymax, p[s.key] ?? 0);
   ymax *= 1.1;
 
   const pw = w - L - R, ph = h - T - B;
@@ -43,11 +44,16 @@ function draw(canvas) {
   for (const s of series) {
     g.strokeStyle = cssVar(s.color);
     g.lineWidth = 1.8;
+    g.lineCap = g.lineJoin = "round";
     g.beginPath();
     let prev = null;
     for (const p of points) {
-      const x = X(p.t), y = Y(p[s.key] || 0);
-      if (prev == null || p.t - prev > 16) g.moveTo(x, y); else g.lineTo(x, y);
+      if (p[s.key] == null) { prev = null; continue; }
+      const x = X(p.t), y = Y(p[s.key]);
+      if (prev == null || p.t - prev > 16) {
+        g.moveTo(x, y);
+        g.lineTo(x + 0.01, y);  // a lone sample still shows (as a dot, with round caps)
+      } else g.lineTo(x, y);
       prev = p.t;
     }
     g.stroke();
@@ -62,8 +68,9 @@ function draw(canvas) {
   g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
   g.setLineDash([]);
   for (const s of series) {
+    if (p[s.key] == null) continue;
     g.fillStyle = cssVar(s.color);
-    g.beginPath(); g.arc(x, Y(p[s.key] || 0), 3.5, 0, 2 * Math.PI); g.fill();
+    g.beginPath(); g.arc(x, Y(p[s.key]), 3.5, 0, 2 * Math.PI); g.fill();
   }
   showTip(canvas, p, x);
 }
@@ -79,7 +86,7 @@ function showTip(canvas, p, x) {
   const tip = canvas._tip, {series} = canvas._chart;
   const time = new Date(p.t * 1000).toLocaleTimeString();
   tip.innerHTML = `<div class="tip-t">${time}</div>` + series.map(s =>
-    `<div><span class="tip-c" style="--c:var(${s.color})"></span>${s.label}: <b>${(s.fmt || fixed1)(p[s.key] || 0)}</b></div>`
+    `<div><span class="tip-c" style="--c:var(${s.color})"></span>${s.label}: <b>${p[s.key] == null ? (s.none || "-") : (s.fmt || fixed1)(p[s.key])}</b></div>`
   ).join("");
   tip.hidden = false;
   // Keep the box inside the chart: right of the marker, or left of it near the right edge.

@@ -1,5 +1,8 @@
 """Serving metrics collected by the scheduler thread: cumulative counters, a
-history of throughput and queue samples, and the recent requests. The
+history of throughput and queue samples, and the recent requests. Throughput
+comes two ways: speed (tokens over the time the engine spent prefilling or
+decoding them, i.e. the sum of the rates of the requests processed together)
+and demand (tokens over wall time, so it drops when the server is idle). The
 dashboard's collector thread reads them (snapshot()); values are replaced
 whole, never mutated in place, so a reader needs no lock. Figures are rounded
 to one decimal place."""
@@ -20,16 +23,27 @@ class Metrics:
         self.history = collections.deque(maxlen=HISTORY_SECONDS // SAMPLE_SECONDS)
         self.requests = collections.deque(maxlen=RECENT_REQUESTS)
         self.live = {}  # running / prefilling / waiting counts, KV tokens used
-        self._win = {"t": time.time(), "prefill": 0, "gen": 0}
+        self._win = self._new_window(time.time())
+
+    @staticmethod
+    def _new_window(t):
+        return {"t": t, "prefill": 0, "gen": 0, "prefill_s": 0.0, "step_tokens": 0, "step_s": 0.0}
 
     # --- scheduler side
-    def add_prefill(self, n):
+    def add_prefill(self, n, seconds):
+        """n prompt tokens computed in one prefill call (one or several requests) taking `seconds`."""
         self.totals["computed_prompt_tokens"] += n
         self._win["prefill"] += n
+        self._win["prefill_s"] += seconds
 
     def add_generated(self, n=1):
         self.totals["generated_tokens"] += n
         self._win["gen"] += n
+
+    def add_step(self, tokens, seconds):
+        """A decode step emitting `tokens` over all its rows in `seconds`."""
+        self._win["step_tokens"] += tokens
+        self._win["step_s"] += seconds
 
     def add_admitted(self, prompt, cached):
         self.totals["prompt_tokens"] += prompt
@@ -57,17 +71,23 @@ class Metrics:
         dt = now - self._win["t"]
         if dt < SAMPLE_SECONDS and not force:
             return
-        self.history.append({"t": round(now, 1), "prompt_tps": round(self._win["prefill"] / dt, 1),
-                             "gen_tps": round(self._win["gen"] / dt, 1), "running": running,
-                             "waiting": waiting + prefilling, "kv_pct": round(100 * kv_used / max(1, kv_capacity), 1)})
-        self._win = {"t": now, "prefill": 0, "gen": 0}
+        w = self._win
+        self.history.append({
+            "t": round(now, 1),
+            # speed while busy; None when the window had no such work (a gap in the chart)
+            "prompt_tps": round(w["prefill"] / w["prefill_s"], 1) if w["prefill_s"] > 0 else None,
+            "gen_tps": round(w["step_tokens"] / w["step_s"], 1) if w["step_s"] > 0 else None,
+            "prompt_demand_tps": round(w["prefill"] / dt, 1), "gen_demand_tps": round(w["gen"] / dt, 1),
+            "running": running, "waiting": waiting + prefilling,
+            "kv_pct": round(100 * kv_used / max(1, kv_capacity), 1)})
+        self._win = self._new_window(now)
 
     def idle(self):
         """The loop is about to sleep: close the current window, restart it on wake."""
         self.sample(0, 0, 0, self.live.get("kv_used_tokens", 0), self.live.get("kv_capacity_tokens", 1), force=True)
 
     def wake(self):
-        self._win = {"t": time.time(), "prefill": 0, "gen": 0}
+        self._win = self._new_window(time.time())
 
     # --- HTTP side
     def snapshot(self):

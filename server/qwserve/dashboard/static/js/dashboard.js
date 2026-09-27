@@ -21,12 +21,19 @@ function renderHeader(d) {
 
 function renderCards(d) {
   const t = d.totals, a = d.averages, h = d.history;
-  const cur = h.length ? h[h.length - 1] : {prompt_tps: 0, gen_tps: 0};
-  const fresh = Date.now() / 1000 - (h.length ? cur.t : 0) < 12;
+  const lastOf = key => {  // the latest sample that measured `key`, and how it is described
+    for (let i = h.length - 1; i >= 0; i--)
+      if (h[i][key] != null) {
+        const ago = Date.now() / 1000 - h[i].t;
+        return [h[i][key], ago < 12 ? "last 5 s" : "last busy " + fmt.seconds(ago) + " ago"];
+      }
+    return [null, "no work yet"];
+  };
+  const [pp, ppWhen] = lastOf("prompt_tps"), [tg, tgWhen] = lastOf("gen_tps");
   const fromCache = t.prompt_tokens ? fmt.percent(100 * t.cached_tokens / t.prompt_tokens) + " from cache" : "";
   $("cards").innerHTML = [
-    ui.card("Prompt processing", fmt.rate(fresh ? cur.prompt_tps : 0), "last 5 s"),
-    ui.card("Generation", fmt.rate(fresh ? cur.gen_tps : 0), "last 5 s, all requests"),
+    ui.card("Prompt processing speed", fmt.rate(pp), "while prefilling, " + ppWhen),
+    ui.card("Generation speed", fmt.rate(tg), "all running requests, " + tgWhen),
     ui.card("Avg time to first token", fmt.seconds(a.ttft_s), `last ${a.requests} requests`),
     ui.card("Avg request time", fmt.seconds(a.total_s), a.queue_s != null ? "queue " + fmt.seconds(a.queue_s) : ""),
     ui.card("Avg decode speed", fmt.rate(a.decode_tps), "per request"),
@@ -40,8 +47,13 @@ function renderCards(d) {
 function renderCharts(d) {
   const win = +$("win").value, h = d.history;
   const tps = v => v.toFixed(1) + " tok/s", n = v => String(Math.round(v));
-  lineChart($("chart-prompt"), h, [{key: "prompt_tps", color: "--accent", label: "prompt processing", fmt: tps}], win, 10);
-  lineChart($("chart-gen"), h, [{key: "gen_tps", color: "--accent2", label: "generation", fmt: tps}], win, 10);
+  lineChart($("chart-prompt"), h, [{key: "prompt_tps", color: "--accent", label: "prompt processing", fmt: tps,
+                                     none: "no prefill"}], win, 10);
+  lineChart($("chart-gen"), h, [{key: "gen_tps", color: "--accent2", label: "generation", fmt: tps,
+                                  none: "no decoding"}], win, 10);
+  lineChart($("chart-demand"), h, [
+    {key: "prompt_demand_tps", color: "--accent", label: "prompt tokens computed", fmt: tps},
+    {key: "gen_demand_tps", color: "--accent2", label: "tokens generated", fmt: tps}], win, 10);
   lineChart($("chart-queue"), h, [
     {key: "running", color: "--accent", label: "running", fmt: n},
     {key: "waiting", color: "--accent2", label: "waiting / prefilling / loading", fmt: n}], win, 4);

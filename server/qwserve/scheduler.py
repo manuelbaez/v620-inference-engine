@@ -285,12 +285,13 @@ class Scheduler:
             batch = self._batch()
             computed = sum(min(n, r.left) for r, n in batch)
             self.win["prefill"] += computed
-            self.metrics.add_prefill(computed)
             try:
+                tp = time.time()
                 if len(batch) == 1:
                     done = [self.e.prefill_some(batch[0][0].slot, batch[0][1])]
                 else:
                     done = self.e.prefill_batch([(r.slot, n) for r, n in batch])
+                self.metrics.add_prefill(computed, time.time() - tp)
             except Exception as ex:  # noqa: BLE001
                 print(f"prefill error ({', '.join(r.rid for r, _ in batch)}): {ex}\n{traceback.format_exc()}",
                       file=sys.stderr, flush=True)
@@ -343,6 +344,7 @@ class Scheduler:
         st["steps"] += 1
         st["rows"] += len(batch)
         st["tokens"] += sum(len(t) for t, _, _, _ in res)
+        self.metrics.add_step(sum(len(t) for t, _, _, _ in res), time.time() - t0)
         for r, (toks, lps, first, _) in zip(batch, res):
             if r.forced:  # emit the next forced token; the engine's sample for this row is dropped
                 if not self._took(r, r.forced.pop(0), 0.0, None):

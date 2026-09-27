@@ -26,14 +26,19 @@
 
   <section class="panels">
     <div class="card">
-      <h2>Prompt processing (tokens/s)</h2>
+      <h2>Prompt processing speed (tokens/s)</h2>
       <canvas id="chart-prompt"></canvas>
-      <div class="legend"><span style="--c:var(--accent)">prompt processing</span></div>
+      <div class="legend"><span style="--c:var(--accent)">while prefilling, all requests in the batch</span></div>
     </div>
     <div class="card">
-      <h2>Token generation (tokens/s)</h2>
+      <h2>Generation speed (tokens/s)</h2>
       <canvas id="chart-gen"></canvas>
-      <div class="legend"><span style="--c:var(--accent2)">generation</span></div>
+      <div class="legend"><span style="--c:var(--accent2)">while decoding, sum over running requests</span></div>
+    </div>
+    <div class="card">
+      <h2>Demand (tokens/s over wall time)</h2>
+      <canvas id="chart-demand"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">prompt tokens computed</span><span style="--c:var(--accent2)">tokens generated</span></div>
     </div>
     <div class="card">
       <h2>Requests</h2>
