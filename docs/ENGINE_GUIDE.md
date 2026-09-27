@@ -191,7 +191,7 @@ Speed figures are single-stream decode unless stated.
 
 | Logs | stats line every N s while busy, one line per request, errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
 | Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
-| Background disk loads | a prompt whose cache is on disk waits while a thread reads it into RAM; others keep running | removes a ~54 s stall per 97k-token disk restore | none | on | not yet deployed | |
+| Background disk loads | a prompt whose cache is on disk waits while a thread reads it into RAM; others keep running | removes a ~54 s stall per 97k-token disk restore | none | on | on | |
 
 Diagnostics: `QW_TRACE` (step phase timings, sampling fallbacks), `QW_PROFILE`
 (prefill timings), `QW_GUARD` (allocation guard zones), `QW_NOGRAPH`.
