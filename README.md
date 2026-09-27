@@ -12,6 +12,7 @@ reusable across turns without re-prefilling.
 
 - [`docs/MODEL.md`](docs/MODEL.md): the exact forward pass (the spec).
 - [`docs/DESIGN.md`](docs/DESIGN.md): parallelism, kernels, memory plan, the prefix
+- [docs/ENGINE_GUIDE.md](docs/ENGINE_GUIDE.md): how the engine works, every feature with its effect and defaults, the decisions made, and a plan for porting to a new model
   cache, CacheBlend notes and the roadmap.
 
 ## Status
