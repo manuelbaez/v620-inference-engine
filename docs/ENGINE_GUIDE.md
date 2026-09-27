@@ -167,7 +167,7 @@ Speed figures are single-stream decode unless stated.
 | Two prefill micro-batches | collectives of one half overlap the other | prefill +7% | rounding only | on | on | `QW_NO_SPLIT=1` |
 | Prefill chunk | tokens per prefill pass | 8k vs 4k: ~2% faster prefill | rounding only | 8192 | **4096** (frees ~0.9 GB/card for KV) | `QW_PREFILL_CHUNK` |
 | Batched prefill | several waiting prompts in one pass | bursts +4-7%, 4 prompts 2.05 -> 1.62 s | rounding only | on | on | `QW_PREFILL_BATCH=0` |
-| Interleaved prefill | long prompts go in pieces between decode steps | longest stall 12.4 -> 1.15 s; decoders keep ~22 tok/s | none | piece 2048, decode share 0.25 | same | `QW_PREFILL_PIECE`, `QW_DECODE_SHARE` |
+| Interleaved prefill | long prompts go in pieces between decode steps; short prompts go first, and a lone long prefill yields to arrivals | longest stall 12.4 -> 1.15 s; decoders keep ~22 tok/s | none | piece 2048, decode share 0.25 | same | `QW_PREFILL_PIECE`, `QW_DECODE_SHARE` |
 | KV slots | sequences held at once, each with a KV capacity | more slots = more concurrency | none | 262144,65536,32768,32768 | **262144,131072,65536,32768** | `QW_SLOTS` / `--slots` |
 | Prefix cache, VRAM | reuse a slot's own history and snapshots | skips prefill of reused tokens | none (exact) | on | on | |
 | Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 128 GB | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
@@ -407,6 +407,9 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 - **Interleaved prefill:** while others decode, a prefill advances one 2,048
   token piece at a time, then the running requests decode for 25% of the
   piece's time. A 30k-token prompt no longer freezes other streams for 12 s.
+  With nothing decoding a prefill goes a chunk at a time and yields when a
+  request arrives; prompts that fit whole in a piece go before a long one in
+  progress (a 65k-token prefill once kept new requests waiting for 95 s).
 - **Batched prefill:** prompts waiting together go into one prefill pass up
   to a piece (a prefill chunk when nothing decodes), paying the pass's fixed
   cost (~80 ms of collectives) once.

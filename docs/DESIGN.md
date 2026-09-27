@@ -538,6 +538,15 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [x] admission: a request that fits no free slot waits without holding up later ones that
          fit the free slots; freed slots are offered in arrival order, so it is not starved
          (`server/tests/test_admission.py`)
+   - [x] no freeze behind a lone long prefill: with nothing decoding, a prompt went in whole,
+         so a 128.8k-token prompt (63.8k restored from disk, 65k prefilled in ~95 s) kept an
+         11-token request waiting until it was done; this looked like a lock-up during disk
+         loads, which are what long prompts often start with. Now it goes a chunk at a time,
+         yields when a request arrives, and prompts that fit whole in a piece go first
+         (`server/tests/test_prefill_order.py`)
+   - [ ] decode slows during a disk-tier load: steps ~300 ms instead of ~22 ms while 8.6 GB
+         loads (requests at 2.6-12.6 tok/s instead of ~65); suspects: pinning new arenas, page
+         cache pressure from the reads. To measure on the dev box
    - [x] KV slots 256k + 128k + 64k + 32k in production: 4096-token prefill chunks
          (`QW_PREFILL_CHUNK`) free ~0.9 GB per card of prefill buffers for the 64k slot
          (prefill -2%); ~1.1 GB per card stays free

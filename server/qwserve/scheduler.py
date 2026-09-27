@@ -76,7 +76,10 @@ class Scheduler:
     more than one piece, and they keep a share of the GPUs while it goes in.
     Prompts waiting together go into one prefill pass while they fit a piece
     (a prefill chunk when nothing decodes), so a burst of short prompts pays
-    the pass's fixed cost once (QW_PREFILL_BATCH=0 turns that off)."""
+    the pass's fixed cost once (QW_PREFILL_BATCH=0 turns that off). Prompts
+    that fit whole in a piece go before a long one already under way, and a
+    long prefill with nothing decoding still returns after each chunk when new
+    requests have arrived, so they are admitted instead of waiting it out."""
 
     DEFAULT_RESERVE = 2048  # room reserved when the request sets no max_tokens
     LOG_INTERVAL = float(os.environ.get("QW_LOG_INTERVAL", "10"))  # seconds between stats lines (0: off)
@@ -254,27 +257,27 @@ class Scheduler:
         self.prefilling.append(r)
 
     def _batch(self):
-        """The prefills to advance in one engine pass: the oldest one, plus the next ones while
-        their whole prompts fit (QW_PREFILL_PIECE tokens while others decode, else one prefill
-        chunk); only the first may go in partly. [(request, tokens)]."""
+        """The prefills to advance in one engine pass: prompts that fit whole go first (in
+        arrival order, so a short request does not wait behind a long prompt), then the oldest
+        of the rest; several while their whole prompts fit (QW_PREFILL_PIECE tokens while
+        others decode, else one prefill chunk); only the first may go in partly. [(request, tokens)]."""
         room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if self.active else self.e.prefill_chunk
+        short = [r for r in self.prefilling if r.left <= room and not r.media]
         batch = []
-        for r in self.prefilling:
+        for r in short + [r for r in self.prefilling if r not in short]:
             if r.media or room <= 0 or (batch and (r.left > room or not self.BATCH_PREFILL)):
                 break  # media prompts go alone (their vision tokens are encoded per slot)
             take = min(r.left, room)
             batch.append((r, take))
             room -= take
-        if not batch:
-            batch = [(self.prefilling[0], self.PREFILL_PIECE)]
-        if len(batch) == 1 and not self.active:
-            batch = [(batch[0][0], 1 << 40)]  # nothing decoding: the whole prompt now
+        if not batch:  # a media prompt first in line
+            batch = [(self.prefilling[0], self.PREFILL_PIECE if self.active else self.e.prefill_chunk)]
         return batch
 
     def _prefill(self):
-        """Advances the oldest prefills: by one piece (several short prompts batched into one
-        pass) while others decode, then returns so they get steps; to the end when nothing is
-        decoding. Returns the seconds spent."""
+        """Advances the prefills (see _batch): by one piece while others decode, then returns so
+        they get steps; chunk by chunk to the end when nothing is decoding, but returning as
+        soon as new requests arrive so they are admitted. Returns the seconds spent."""
         t0 = time.time()
         while self.prefilling:
             for r in [r for r in self.prefilling if r.cancelled.is_set()]:
@@ -316,8 +319,8 @@ class Scheduler:
                     continue
                 if self._took(r, tid, lp, top):
                     self.active.append(r)
-            if self.active:
-                return time.time() - t0  # let the running requests take steps before the next prefill
+            if self.active or self.queue:
+                return time.time() - t0  # running requests take steps, new ones are admitted
         return time.time() - t0
 
     def _step(self):
