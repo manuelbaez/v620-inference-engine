@@ -83,9 +83,10 @@ Measured through HTTP (2026-09-24/25):
 ## Inputs
 
 - `/mnt/llms/qwen3.8-flash-next-awq`: AWQ checkpoint (int4 experts, bf16 rest)
-- `/mnt/llms/qwen3.8-flash-next-ple/ples_int4`, `ples_int8`, `ples_bf16`: the n-gram
-  table sidecar in three precisions (int4 is the `--ple-dir` default; bf16 is Qwen's
-  original, `tools/ple_download.py` + `tools/ple_convert.py`)
+- `/mnt/llms/qwen3.8-flash-next-ple/ples_int4`, `ples_int8`, `ples_fp8`, `ples_bf16`: the
+  n-gram table sidecar in four precisions (int4 is the `--ple-dir` default; bf16 is Qwen's
+  original, `tools/ple_download.py` + `tools/ple_convert.py`; fp8 is from Qwen's FP8
+  checkpoint, `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8`; production runs fp8)
 
 ## Layout
 

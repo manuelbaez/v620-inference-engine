@@ -728,7 +728,14 @@ different things: int8 brings the next-token probabilities measurably closer
 to the original model's, but greedy final answers on these tasks almost never
 depend on that difference.
 
-**Decision (2026-09-27): production runs the original bf16 table**
+**Decision (2026-09-28): production runs the official fp8 table** (`ples_fp8`,
+51.2 GB) with a 160 GB host prefix cache. The bf16 table plus a 128 GB cache
+and the vLLM LMCache servers passed the host's 251 GB and the host OOM killer
+took the engine twice; with bf16 the cache had to shrink to 96 GB. fp8 costs
++0.006 mean |dlogprob| against bf16 (0.050 vs 0.044) and is within noise of
+int8 (0.048; 6 GB more); the owner chose the official table for the RAM.
+
+Earlier decision (2026-09-27): production runs the original bf16 table
 (`ples_bf16`, 102.4 GB pinned in RAM; the container limit went to 240 GiB and
 the host prefix cache stays at 128 GB): at worst it scores like int4 on tasks,
 and its next-token distributions are the model's own. The bf16 task run is
