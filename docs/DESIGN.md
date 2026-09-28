@@ -608,11 +608,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [x] `scripts/prod-idle-unload.sh` also asks the engine: llama-swap's /api/metrics lists
          finished requests only, so a request in flight for over 60 s looked idle and an
          unload cut it off (502, 2026-09-28 00:46)
-   - [~] fp8 PLE table from the official `Qwen/Qwen3.8-Flash-Next-FP8`: the 128 n-gram shards
+   - [x] fp8 PLE table from the official `Qwen/Qwen3.8-Flash-Next-FP8`: the 128 n-gram shards
          are F8_E4M3 with one bf16 scale for the whole table (51.2 GB, half of bf16).
          `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8` writes them ready to serve
          (layout `f8e4m3_tensorscale`, decoded through a 256-entry table). Accuracy against
-         the fp32 reference still to measure (int8 0.048, bf16 0.044 mean |dlogprob|)
+         the fp32 reference: 0.050 mean |dlogprob| (int8 0.048, bf16 0.044; see "PLE n-gram
+         table precision")
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -692,6 +693,15 @@ with the original bf16 table; paired bootstrap over tokens):
 | int4 table | 0.065 | 96.8% | |
 | int8 table | 0.048 | 97.4% | -0.017 (-0.022, -0.013) |
 | bf16 table | 0.044 | 98.0% | -0.021 (-0.026, -0.015) |
+| fp8 table (official FP8 checkpoint) | 0.050 | 97.3% | |
+
+The fp8 row is from a rerun on 2026-09-28 (the same 4,000 tokens, rebuilt; the
+fp32 reference recomputed): bf16 0.0444 / 98.0% and int8 0.0476 / 97.4%
+reproduce the first run, fp8 0.0503 / 97.3%. Paired: fp8 - bf16 +0.0059 (95% CI
++0.0023, +0.0095), int8 - bf16 +0.0032 (+0.0002, +0.0062), fp8 - int8 +0.0027
+(-0.0007, +0.0063). `Qwen/Qwen3.8-Flash-Next-FP8` stores the table as e4m3 with
+one scale for all 320M rows; our int8 has an fp16 scale per 16 values, and is at
+least as close for 6 GB more (57.6 vs 51.2 GB).
 
 The old fp32 reference, built with the int4 table, is itself 0.064 from the
 new one: the int4 table was the largest single source of error, more than all
