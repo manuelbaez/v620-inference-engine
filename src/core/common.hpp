@@ -1,6 +1,7 @@
 // Small shared utilities: errors, logging, number conversions.
 #pragma once
 
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -62,6 +63,15 @@ inline float f16_to_f32(uint16_t h) {
     float f;
     std::memcpy(&f, &u, 4);
     return f;
+}
+
+// fp8 e4m3 ("fn": bias 7, no infinities, S.1111.111 is NaN).
+inline float f8e4m3_to_f32(uint8_t v) {
+    const int exp = (v >> 3) & 0xf, man = v & 7;
+    const float mag = exp == 0 ? std::ldexp(float(man) / 8.0f, -6)
+                      : exp == 15 && man == 7 ? NAN
+                                              : std::ldexp(1.0f + float(man) / 8.0f, exp - 7);
+    return v & 0x80 ? -mag : mag;
 }
 
 // Round-to-nearest-even fp32 -> fp16.

@@ -133,23 +133,34 @@ PleTable::PleTable(const std::string &dir) {
         layout_ = Layout::Int8;
     else if (layout == "bf16")
         layout_ = Layout::Bf16;
+    else if (layout == "f8e4m3_tensorscale")
+        layout_ = Layout::F8;
     else
         fail("PLE sidecar: unsupported layout " + layout);
     QW_CHECK(meta["width"].as_int() == cfg::NGRAM_DIM, "PLE sidecar: width");
+    if (layout_ == Layout::F8) {
+        const float scale = float(meta["scale"].as_double());
+        for (int b = 0; b < 256; ++b) f8_[size_t(b)] = f8e4m3_to_f32(uint8_t(b)) * scale;
+    }
     rows_ = meta["rows"].as_int();
     int64_t n_shards = meta["shards"].as_int();
     rows_per_shard_ = (rows_ + n_shards - 1) / n_shards;
     for (int64_t s = 0; s < n_shards; ++s) {
         auto st = std::make_unique<SafeTensors>();
         st->add_file(dir + "/shard_" + std::to_string(s) + ".safetensors");
-        const char *name = layout_ == Layout::Int4 ? "weight_i4" : layout_ == Layout::Int8 ? "weight_i8" : "weight";
+        const char *name = layout_ == Layout::Int4 ? "weight_i4"
+                           : layout_ == Layout::Int8 ? "weight_i8"
+                           : layout_ == Layout::F8   ? "weight_f8"
+                                                     : "weight";
         const TensorView &q = st->get(name);
-        const DType want = layout_ == Layout::Int4 ? DType::U8 : layout_ == Layout::Int8 ? DType::I8 : DType::BF16;
+        const DType want = layout_ == Layout::Int4 || layout_ == Layout::F8 ? DType::U8
+                           : layout_ == Layout::Int8                        ? DType::I8
+                                                                            : DType::BF16;
         const int64_t width = layout_ == Layout::Int4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
         QW_CHECK(q.dtype == want && q.dim(1) == width, "PLE shard layout");
         QW_CHECK(q.dim(0) == rows_per_shard_ || s == n_shards - 1, "PLE shard row count");
         q_.push_back(q.u8());
-        if (layout_ != Layout::Bf16) {
+        if (layout_ == Layout::Int4 || layout_ == Layout::Int8) {
             const TensorView &sc = st->get("weight_scale");
             QW_CHECK(sc.dtype == DType::F16 && sc.dim(1) == cfg::NGRAM_DIM / 16, "PLE scale layout");
             scale_.push_back(sc.u16());
@@ -168,6 +179,11 @@ void PleTable::row(int64_t id, float *out) const {
     if (layout_ == Layout::Bf16) {
         const uint16_t *v = reinterpret_cast<const uint16_t *>(q_[size_t(s)]) + r * cfg::NGRAM_DIM;
         for (int j = 0; j < cfg::NGRAM_DIM; ++j) out[j] = bf16_to_f32(v[j]);
+        return;
+    }
+    if (layout_ == Layout::F8) {
+        const uint8_t *v = q_[size_t(s)] + r * cfg::NGRAM_DIM;
+        for (int j = 0; j < cfg::NGRAM_DIM; ++j) out[j] = f8_[v[j]];
         return;
     }
     const uint16_t *sc = scale_[size_t(s)] + r * (cfg::NGRAM_DIM / 16);

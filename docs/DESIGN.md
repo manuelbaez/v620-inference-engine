@@ -596,7 +596,18 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] host memory: production (bf16 table 102 GB pinned + host cache up to 128 GB, container
          limit 240 GiB of the host's 251) was killed by the host's OOM killer on 2026-09-27
          17:40 (constraint none: the host itself ran out). Needs a smaller host cache budget
-         (~96 GB) or the int8 table (54 GB)
+         (~96 GB) or the int8 table (54 GB). Again on 2026-09-28 00:26, while a disk-tier load
+         pinned new arenas (`kfd_ioctl_alloc_memory_of_gpu` in the OOM trace); engine 90 GB
+         anon + 100 GB table. The host's other big users: the vLLM LMCache server in
+         llm-backend-amd (32 GB, unused since the vLLM entries were commented out) and the
+         `lmcache` incus container (17 GB). At a full cache the sum is ~294 GB of 251. The
+         memory pressure (swap 6 of 7 GB used) is also the likely cause of decode slowing to
+         ~300 ms/step during disk loads: pinning has to reclaim first
+   - [~] fp8 PLE table from the official `Qwen/Qwen3.8-Flash-Next-FP8`: the 128 n-gram shards
+         are F8_E4M3 with one bf16 scale for the whole table (51.2 GB, half of bf16).
+         `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8` writes them ready to serve
+         (layout `f8e4m3_tensorscale`, decoded through a 256-entry table). Accuracy against
+         the fp32 reference still to measure (int8 0.048, bf16 0.044 mean |dlogprob|)
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the

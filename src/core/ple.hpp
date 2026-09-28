@@ -1,6 +1,6 @@
 // PLE n-gram hashing and the host-RAM embedding table (docs/MODEL.md, "PLE").
 // The table stays in host memory in every engine configuration: 320M rows of
-// 160 values (int4: ~30 GB, int8: ~58 GB, bf16: ~102 GB), and only 16 rows
+// 160 values (int4: ~30 GB, int8 or fp8: ~51-58 GB, bf16: ~102 GB), and only 16 rows
 // are touched per token.
 #pragma once
 
@@ -64,8 +64,11 @@ public:
 private:
     // META.json "layout": group16_int4_fp16scale_lownibblefirst (weight_i4 u8 [rows][80],
     // low nibble first, stored + 8), group16_int8_fp16scale (weight_i8 i8 [rows][160]),
-    // both with weight_scale f16 [rows][10]; or bf16 (weight bf16 [rows][160]).
-    enum class Layout { Int4, Int8, Bf16 } layout_ = Layout::Int4;
+    // both with weight_scale f16 [rows][10]; bf16 (weight bf16 [rows][160]); or
+    // f8e4m3_tensorscale (weight_f8 u8 [rows][160] of fp8 e4m3, times META.json "scale":
+    // the official FP8 checkpoint's table, one scale for all of it).
+    enum class Layout { Int4, Int8, Bf16, F8 } layout_ = Layout::Int4;
+    std::array<float, 256> f8_{};  // F8: each e4m3 byte's value times the scale
     int64_t rows_ = 0, rows_per_shard_ = 0;
     std::vector<std::unique_ptr<SafeTensors>> shards_;
     std::vector<const uint8_t *> q_;       // per shard: the values (layout above)
