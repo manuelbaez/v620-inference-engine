@@ -170,7 +170,7 @@ Speed figures are single-stream decode unless stated.
 | Interleaved prefill | long prompts go in pieces between decode steps; short prompts go first, and a lone long prefill yields to arrivals | longest stall 12.4 -> 1.15 s; decoders keep ~22 tok/s | none | piece 2048, decode share 0.25 | same | `QW_PREFILL_PIECE`, `QW_DECODE_SHARE` |
 | KV slots | sequences held at once, each with a KV capacity | more slots = more concurrency | none | 262144,65536,32768,32768 | **262144,131072,65536,32768** | `QW_SLOTS` / `--slots` |
 | Prefix cache, VRAM | reuse a slot's own history and snapshots | skips prefill of reused tokens | none (exact) | on | on | |
-| Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 128 GB | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
+| Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 96 GB (host RAM; see Host RAM below) | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
 | Prefix cache, disk | blocks and snapshots survive restarts | 4k tokens restored in 0.55 s after restart | none (exact) | 200 GB | 200 GB (`/cache` volume) | `--disk-cache-dir`, `--disk-cache-gb` |
 | Snapshot spacing | captures at chat message starts at least N apart | | none | 1024 | 1024 | `QW_SNAP_MIN_GAP` |
 | MTP speculative decoding | drafts up to K tokens, verified exactly | 67 -> 107-112 tok/s (Qwen sampling) | none (exact sampling) | K = 5 | 5 | `--mtp` (0 off) |
@@ -442,7 +442,12 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 - **Host RAM:** PLE table (bf16: 102.4 GB pinned) + block store (up to 128 GB)
   + model page cache; the container limit was raised to 240 GiB. With the table
   pinned, the model files no longer all fit in the page cache, so a warm start
-  reads part of them from disk again (~120 s instead of ~60 s with int8).
+  reads part of them from disk again (~120 s instead of ~60 s with int8). The
+  limit that matters is the host's (251 GB, shared with other services): the
+  host OOM killer took the engine twice when everything together passed it, so
+  production runs a 96 GB cache with the bf16 table, and the LMCache servers
+  for vLLM (32 + 17 GB) are stopped. Budget = host RAM - table - ~10 GB engine
+  - other services - ~15 GB margin (with the fp8 table: ~170 GB).
 - **Readiness:** the engine reports ready (and the server answers `/health`)
   only after the table is in RAM; before, a cold start served requests while
   rows still came from disk (warmup 28-35 s instead of ~5 s).

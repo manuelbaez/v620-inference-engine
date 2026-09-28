@@ -593,7 +593,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          new arenas for ~14 s. Now the load thread takes them too (1a9510c): the next live run
          (9148b24, 101k-token prompt, 396 entries, 8.5 GB in 30.1 s) served a short request
          in the meantime at TTFT 0.11 s and 40 tok/s, done 0.7 s after the load started
-   - [ ] host memory: production (bf16 table 102 GB pinned + host cache up to 128 GB, container
+   - [x] host memory: production (bf16 table 102 GB pinned + host cache up to 128 GB, container
          limit 240 GiB of the host's 251) was killed by the host's OOM killer on 2026-09-27
          17:40 (constraint none: the host itself ran out). Needs a smaller host cache budget
          (~96 GB) or the int8 table (54 GB). Again on 2026-09-28 00:26, while a disk-tier load
@@ -602,7 +602,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          llm-backend-amd (32 GB, unused since the vLLM entries were commented out) and the
          `lmcache` incus container (17 GB). At a full cache the sum is ~294 GB of 251. The
          memory pressure (swap 6 of 7 GB used) is also the likely cause of decode slowing to
-         ~300 ms/step during disk loads: pinning has to reclaim first
+         ~300 ms/step during disk loads: pinning has to reclaim first. Done 2026-09-28: the
+         two LMCache servers stopped (host available 61 -> 109 GB), host cache 128 -> 96 GB
+         until the fp8 table is in (then ~170 GB)
+   - [x] `scripts/prod-idle-unload.sh` also asks the engine: llama-swap's /api/metrics lists
+         finished requests only, so a request in flight for over 60 s looked idle and an
+         unload cut it off (502, 2026-09-28 00:46)
    - [~] fp8 PLE table from the official `Qwen/Qwen3.8-Flash-Next-FP8`: the 128 n-gram shards
          are F8_E4M3 with one bf16 scale for the whole table (51.2 GB, half of bf16).
          `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8` writes them ready to serve
