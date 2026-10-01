@@ -15,6 +15,8 @@ reusable across turns without re-prefilling.
   cache, CacheBlend notes and the roadmap.
 - [`docs/ENGINE_GUIDE.md`](docs/ENGINE_GUIDE.md): how the engine works, every feature
   with its effect and defaults, the decisions made, and a plan for porting to a new model.
+- [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md): open improvement points found by reading the
+  code, each with evidence, fix, effort and status.
 
 ## Status
 
