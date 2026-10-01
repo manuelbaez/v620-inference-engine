@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Slot admission order (no GPU): a request waiting for a big slot does not
 hold up later ones that fit the free slots, and gets the big slot first once
-it frees.
+it frees. A request that found no slot is not offered to the engine again
+until a slot has been released (acquire hands the engine the whole prompt).
 
   python3 server/tests/test_admission.py
 """
@@ -23,11 +24,16 @@ class FakeEngine:
         self.capacity = capacity
         self.max_tokens = max(capacity)
         self.busy = [False] * len(capacity)
+        self.acquire_calls = 0
 
     def cache_stats(self):
         return None
 
+    def release(self, slot):
+        self.busy[slot] = False
+
     def acquire(self, tokens, max_new, media=None):
+        self.acquire_calls += 1
         fits = [i for i, c in enumerate(self.capacity) if not self.busy[i] and c >= len(tokens) + max_new]
         if not fits:
             return -1
@@ -68,10 +74,18 @@ def main():
           {"big1": 262144, "small1": 32768, "mid": 131072, "small2": 32768})
     check("waiting", [r.name for r in s.waiting], ["big2", "small3"])
 
+    # nothing was released: the two that found no slot are not offered again
+    calls = e.acquire_calls
+    for _ in range(5):
+        s._admit()
+    check("acquire calls while nothing is released", e.acquire_calls - calls, 0)
+
     # big1 ends: its slot goes to big2, the oldest waiting request that fits it
     big1 = s.prefilling.pop(0)
-    e.busy[big1.slot] = False
+    s._finish(big1, "stop")
+    calls = e.acquire_calls
     s._admit()
+    check("acquire calls after a release (both waiting are offered)", e.acquire_calls - calls, 2)
     check("big2 gets the 256k slot", [(r.name, e.capacity[r.slot]) for r in s.prefilling if r.name == "big2"],
           [("big2", 262144)])
     check("still waiting", [r.name for r in s.waiting], ["small3"])

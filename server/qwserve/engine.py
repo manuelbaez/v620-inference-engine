@@ -1,7 +1,35 @@
 """ctypes binding of the engine's C API (include/qw/capi.h)."""
 
+import array
 import ctypes
 import json
+
+assert array.array("i").itemsize == 4  # the C API takes int32 token ids
+
+
+class Tokens(list):
+    """A token list that remembers its int32 array for the C API. The scheduler hands one
+    request's prompt to acquire / prefetch / begin_prompt again and again (every pass while the
+    request waits for a slot or loads from disk), and `(c_int32 * n)(*tokens)` costs 5 ms per
+    100k tokens with the GIL held, which also delays the event loop that streams every client's
+    tokens. Built once here (0.9 ms per 100k), then free. The list must not change afterwards."""
+    __slots__ = ("_c",)
+
+    def __init__(self, tokens=()):
+        super().__init__(tokens)
+        self._c = None
+
+
+def c_array(tokens):
+    """The int32 ctypes array of `tokens`: cached on a `Tokens`, built per call for a plain list."""
+    n = len(tokens)
+    c = getattr(tokens, "_c", None)
+    if c is not None and len(c) == n:
+        return c
+    c = (ctypes.c_int32 * n).from_buffer(array.array("i", tokens)) if n else (ctypes.c_int32 * 0)()
+    if isinstance(tokens, Tokens):
+        tokens._c = c
+    return c
 
 
 class Sampling(ctypes.Structure):
@@ -122,7 +150,7 @@ class Engine:
         return (MediaStruct * len(items))(*items), keep
 
     def acquire(self, tokens, max_new, media=None):
-        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr = c_array(tokens)
         if media:
             arr_m, keep = self._media_array(media)
             r = self.lib.qw_acquire_media(self.h, arr, len(tokens), max_new, arr_m, len(media))
@@ -137,7 +165,7 @@ class Engine:
 
     def set_prompt(self, slot, tokens, media=None):
         """media: vision.Media items whose spans are set (their pads are in `tokens`)."""
-        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr = c_array(tokens)
         if not media:
             return self._check(self.lib.qw_set_prompt(self.h, slot, arr, len(tokens)))
         arr_m, keep = self._media_array(media)
@@ -146,14 +174,14 @@ class Engine:
     def begin_prompt(self, slot, tokens, media=None):
         """Restores what the caches hold of the prompt; returns (reused tokens, buffers to keep
         alive until prefill_some has put the rest in)."""
-        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr = c_array(tokens)
         arr_m, keep = self._media_array(media or [])
         reused = self._check(self.lib.qw_begin_prompt(self.h, slot, arr, len(tokens), arr_m, len(media or [])))
         return reused, keep  # keep: buffers the C side reads until the prompt is in
 
     def prefetch(self, slot, tokens, media=None):
         """True while the prompt's disk-only cache entries are loading into RAM in the background."""
-        arr = (ctypes.c_int32 * len(tokens))(*tokens)
+        arr = c_array(tokens)
         arr_m, keep = self._media_array(media or [])
         return bool(self._check(self.lib.qw_prefetch(self.h, slot, arr, len(tokens), arr_m, len(media or []))))
 

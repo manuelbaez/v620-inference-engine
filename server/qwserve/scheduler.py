@@ -6,13 +6,13 @@ import threading
 import time
 import traceback
 
-from .engine import Sampling
+from .engine import Sampling, Tokens
 from .dashboard.metrics import Metrics
 
 
 class Request:
     def __init__(self, prompt_ids, body, emit, eos_ids, media=None):
-        self.prompt = prompt_ids
+        self.prompt = Tokens(prompt_ids)  # its int32 array is built once, not on every pass
         self.media = media or []  # vision.Media items of the prompt
         self.emit = emit
         self.cancelled = threading.Event()
@@ -33,6 +33,7 @@ class Request:
         if not body.get("ignore_eos"):
             self.end_ids |= eos_ids
         self.slot = -1
+        self.no_slot_at = None  # Scheduler.slot_epoch when no slot could take it (retried once one frees)
         self.limit = 0      # max new tokens in the slot it got
         self.generated = 0
         self.next = None    # sampled token not yet fed to the engine
@@ -95,6 +96,7 @@ class Scheduler:
         self.cv = threading.Condition()
         self.queue = []    # submitted, guarded by cv
         self.waiting = []  # admitted in FIFO order by the scheduler thread
+        self.slot_epoch = 0   # counts slot releases: a waiting request that found no slot is retried after one
         self.loading = []     # in a slot, its cached prompt still loading from disk (background)
         self.prefilling = []  # in a slot, prompt partly prefilled
         self.active = []
@@ -161,6 +163,7 @@ class Scheduler:
         if r.slot >= 0:
             self.e.release(r.slot)
             r.slot = -1
+            self.slot_epoch += 1
 
     def _took(self, r, tid, lp, top):
         """Handles a sampled token; returns False when the request is done."""
@@ -191,22 +194,32 @@ class Scheduler:
         """Gives waiting requests slots in arrival order. One that no free slot fits keeps
         waiting while the ones after it may take the slots that are free (a request waiting for
         the big slot does not hold up short ones). It is not starved: every pass offers free
-        slots in arrival order, so it gets the first one it fits."""
+        slots in arrival order, so it gets the first one it fits. A request that found no slot is
+        not offered again until some slot has been released (acquire hands the whole prompt to
+        the engine, so asking every pass for every waiting request is not free). Returns whether
+        any request left the waiting list."""
         i = 0
+        moved = False
         while i < len(self.waiting):
             r = self.waiting[i]
             if r.cancelled.is_set():
                 self.waiting.pop(i)
                 r.emit("end", "abort")
+                moved = True
+                continue
+            if r.no_slot_at == self.slot_epoch:  # no slot was released since it found none
+                i += 1
                 continue
             n = len(r.prompt)
             need = r.max_new if r.max_new else self.DEFAULT_RESERVE
             need = max(1, min(need, self.e.max_tokens - n))
             slot = self.e.acquire(r.prompt, need, r.media)
             if slot < 0:
+                r.no_slot_at = self.slot_epoch
                 i += 1  # keeps waiting; later ones may fit the free slots
                 continue
             self.waiting.pop(i)
+            moved = True
             r.slot = slot
             try:
                 room = self.e.capacity[slot] - n
@@ -221,6 +234,7 @@ class Scheduler:
                 self._finish(r, "abort")
                 continue
             self._begin(r)
+        return moved
 
     def _poll_loading(self):
         """Requests whose cached prompt was loading from disk: begin those whose load is done."""
@@ -374,10 +388,10 @@ class Scheduler:
                 self.queue = []
             t_pass = time.time()
             try:
-                self._admit()
+                moved = self._admit()
                 self._poll_loading()
-                if self.loading and not (self.active or self.prefilling or self.waiting or self.queue):
-                    time.sleep(0.02)  # only disk loads in flight: poll them without spinning
+                if not (self.active or self.prefilling or self.queue or moved):
+                    time.sleep(0.02)  # only disk loads in flight, or requests waiting for a slot: do not spin
                 spent = self._prefill()
                 t0 = time.time()
                 self._step()
