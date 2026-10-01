@@ -193,6 +193,12 @@ public:
     // state is only loadable by an engine with the same id.
     uint64_t state_layout_id() const;
 
+    // Why the engine can no longer be used, or "" while it works: a rank's job
+    // failed or a collective timed out. Both stay set for good (the next job
+    // fails with the same message), so only a restart recovers. Safe to call
+    // from any thread.
+    std::string failure() const;
+
     // ---- CacheBlend experiment (blend.hip; docs/DESIGN.md). Reusing a chunk
     // cached after another prefix: its KV is copied to the new positions (keys
     // re-rotated, compressed keys rebuilt) and the GDN state is carried across
@@ -356,7 +362,7 @@ private:
 
     // watchdog: per-rank phase of the current job (0 idle, 1 enqueueing, 2 waiting for the GPU)
     std::array<std::atomic<int>, RANKS> phase_{};
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     uint64_t gen_ = 0;
     int done_ = 0;

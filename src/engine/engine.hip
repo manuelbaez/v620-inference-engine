@@ -248,6 +248,16 @@ void Engine::dispatch() {
     if (comm2_->error()) fail("collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error()));
 }
 
+std::string Engine::failure() const {
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (!error_.empty()) return error_;
+    }
+    if (comm_->error()) return "collective timed out: " + Comm::describe_error(comm_->error());
+    if (comm2_->error()) return "collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error());
+    return {};
+}
+
 void Engine::slot_reset(int slot) {
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];

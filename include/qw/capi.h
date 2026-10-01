@@ -31,6 +31,11 @@ void qw_close(qw_handle *h);
  * waits for the writes; call before exiting, with no request in flight. */
 int qw_persist(qw_handle *h);
 const char *qw_error(qw_handle *h);
+/* Why the engine can no longer be used (a rank's job failed or a collective timed out; it stays
+ * so until the process restarts), copied into buf; 0 while it works, else the length of the
+ * message (not counting the final 0). Safe to call from a thread other than the one driving
+ * the engine. */
+int qw_engine_failure(qw_handle *h, char *buf, int buflen);
 
 /* ---- prefix cache */
 /* Token that starts a chat message (<|im_start|>): prefill snapshots the state

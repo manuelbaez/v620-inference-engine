@@ -83,6 +83,7 @@ class Engine:
         sig = {
             "qw_open": (P, [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]),
             "qw_error": (ctypes.c_char_p, [P]),
+            "qw_engine_failure": (ctypes.c_int, [P, ctypes.c_char_p, ctypes.c_int]),
             "qw_num_slots": (ctypes.c_int, [P]),
             "qw_slot_capacity": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_acquire": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64]),
@@ -128,6 +129,12 @@ class Engine:
 
     def _err(self):
         return RuntimeError(self.lib.qw_error(self.h).decode(errors="replace"))
+
+    def failure(self):
+        """Why the engine can no longer be used (a rank's job failed or a collective timed out; it
+        stays so until the process restarts), or "" while it works. Safe to call from any thread."""
+        buf = ctypes.create_string_buffer(1024)
+        return buf.value.decode(errors="replace") if self.lib.qw_engine_failure(self.h, buf, len(buf)) else ""
 
     def _check(self, r):
         if r < 0:

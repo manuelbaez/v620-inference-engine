@@ -41,7 +41,8 @@ class FakeEngine:
     """Enough of qwserve.engine.Engine for the real Scheduler thread: slots, instant prefill and one
     token per request per step. Failures are injected: `poison` (first token of a prompt whose acquire
     raises, as media that do not match their prompt do), `generate_error` (raised by every step),
-    `generate_block` (an Event the step waits on, a stuck GPU)."""
+    `generate_block` (an Event the step waits on, a stuck GPU), `failed_with` (what failure() reports,
+    a rank that failed)."""
     has_mtp = False
     prefill_chunk = 4096
 
@@ -55,9 +56,13 @@ class FakeEngine:
         self.poison = set()
         self.generate_error = None
         self.generate_block = None
+        self.failed_with = ""
 
     def cache_stats(self):
         return None
+
+    def failure(self):
+        return self.failed_with
 
     def acquire(self, tokens, max_new, media=None):
         if tokens and tokens[0] in self.poison:

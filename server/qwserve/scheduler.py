@@ -10,6 +10,28 @@ from .engine import Sampling, Tokens
 from .dashboard.metrics import Metrics
 
 
+class _Watched:
+    """The engine as the scheduler thread calls it: records the call in progress and since when
+    (Scheduler.call), which the watchdog reads to tell a wedged GPU from a long job."""
+
+    def __init__(self, engine, owner):
+        self._engine, self._owner = engine, owner
+
+    def __getattr__(self, name):
+        attr = getattr(self._engine, name)
+        if not callable(attr):
+            return attr
+        owner = self._owner
+
+        def call(*args, **kwargs):
+            owner.call = (name, time.time())
+            try:
+                return attr(*args, **kwargs)
+            finally:
+                owner.call = None
+        return call
+
+
 class Request:
     def __init__(self, prompt_ids, body, emit, eos_ids, media=None):
         self.prompt = Tokens(prompt_ids)  # its int32 array is built once, not on every pass
@@ -87,9 +109,18 @@ class Scheduler:
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
     BATCH_PREFILL = os.environ.get("QW_PREFILL_BATCH", "1") != "0"  # several prompts per prefill pass
+    # A prefill chunk or decode step takes seconds at most: an engine call running this long
+    # (QW_STUCK_SECONDS) is a wedged GPU. Unhealthy for EXIT_GRACE seconds (QW_EXIT_GRACE), the
+    # process exits so the supervisor restarts it (QW_WATCHDOG_EXIT=0: only /health says so).
+    STUCK_SECONDS = float(os.environ.get("QW_STUCK_SECONDS", "300"))
+    WATCHDOG_EXIT = os.environ.get("QW_WATCHDOG_EXIT", "1") != "0"
+    EXIT_GRACE = float(os.environ.get("QW_EXIT_GRACE", "30"))
+    WATCH_INTERVAL = 5.0
 
     def __init__(self, engine, mtp_drafts=3):
-        self.e = engine
+        self.raw_engine = engine  # for calls from other threads (failure()); the scheduler thread uses self.e
+        self.call = None          # (engine method, time.time()) of the engine call in progress
+        self.e = _Watched(engine, self)
         self.k = mtp_drafts if engine.has_mtp else 0
         self.stats = {"steps": 0, "rows": 0, "tokens": 0, "time": 0.0}  # decode steps, request-steps, emitted tokens
         self.cache_stats = engine.cache_stats()  # refreshed by the scheduler thread (the engine is not thread-safe)
@@ -108,6 +139,40 @@ class Scheduler:
         self.metrics = Metrics()  # for the dashboard
         self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
         self.thread.start()
+        if self.WATCHDOG_EXIT:
+            threading.Thread(target=self._watchdog, daemon=True, name="qw-watchdog").start()
+
+    def health(self):
+        """(ok, reason): whether this engine can still serve. Not when the scheduler thread died, an
+        engine call has run for over STUCK_SECONDS (a wedged GPU), or the engine reports that a rank
+        failed or a collective timed out (permanent: every later job fails the same way)."""
+        if not self.thread.is_alive() and not self.stopping:
+            return False, "the scheduler thread died"
+        call = self.call
+        if call and time.time() - call[1] > self.STUCK_SECONDS:
+            return False, f"engine call {call[0]} has been running for {time.time() - call[1]:.0f} s"
+        failure = getattr(self.raw_engine, "failure", None)
+        why = failure() if failure else ""
+        if why:
+            return False, f"engine failed: {why}"
+        return True, "ok"
+
+    def _watchdog(self):
+        """Exits the process once health() has failed for EXIT_GRACE seconds: a failed or wedged
+        engine does not recover, and while the process stays up its supervisor sees a running
+        server that fails every request."""
+        bad_since = None
+        while not self.stopping:
+            time.sleep(self.WATCH_INTERVAL)
+            ok, why = self.health()
+            if ok:
+                bad_since = None
+                continue
+            bad_since = bad_since or time.time()
+            if time.time() - bad_since >= self.EXIT_GRACE:
+                print(f"watchdog: unhealthy for {time.time() - bad_since:.0f} s ({why}); exiting so the supervisor "
+                      "restarts the engine", file=sys.stderr, flush=True)
+                os._exit(3)
 
     def shutdown(self, timeout=30):
         """Stops after the current step; in-flight requests end with an error."""

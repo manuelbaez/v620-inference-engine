@@ -116,7 +116,11 @@ class Server:
         if st["rows"]:
             st["tokens_per_request_step"] = round(st["tokens"] / st["rows"], 3)
             st["ms_per_step"] = round(1e3 * st["time"] / st["steps"], 2)
-        return web.json_response({"status": "ok", "decode": st, "prefix_cache": self.sched.cache_stats})
+        ok, why = self.sched.health()  # 503 for a failed or wedged engine, so a supervisor can restart it
+        body = {"status": "ok" if ok else "unhealthy", "decode": st, "prefix_cache": self.sched.cache_stats}
+        if not ok:
+            body["reason"] = why
+        return web.json_response(body, status=200 if ok else 503)
 
     async def models(self, _):
         return web.json_response({"object": "list", "data": [{

@@ -83,6 +83,14 @@ void qw_close(qw_handle *h) {
 const char *qw_error(qw_handle *h) {
     return h->error.c_str();
 }
+int qw_engine_failure(qw_handle *h, char *buf, int buflen) {
+    const std::string why = h->engine->failure();
+    if (!why.empty() && buf && buflen > 0) {
+        std::strncpy(buf, why.c_str(), size_t(buflen - 1));
+        buf[buflen - 1] = 0;
+    }
+    return int(why.size());
+}
 int qw_num_slots(qw_handle *h) {
     return h->engine->num_slots();
 }
