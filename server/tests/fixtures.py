@@ -6,7 +6,7 @@ import os
 import random
 import time
 
-from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 SPECIAL = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<think>", "</think>", "<tool_call>", "</tool_call>",
            "<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"]
@@ -28,6 +28,7 @@ def make_model_dir(path, vocab_size=2000):
     os.makedirs(path, exist_ok=True)
     tok = Tokenizer(models.BPE())
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=SPECIAL,
                                   initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
     tok.train_from_iterator([words(40, seed=i) for i in range(2000)], trainer)
