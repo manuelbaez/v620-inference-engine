@@ -120,7 +120,7 @@ def main():
     alphabet = "abcXYZ 0123456789_-./:;,()[]{}=+*#'\"\\ \n"
     names = ["path", "count", "flag", "opts", "ratio", "maybe", "content", "other", "x1", "unknown_param"]
     diffs = 0
-    for i in range(3000):
+    for _ in range(3000):
         fn = rng.choice(["edit", "edit", "edit", "nope", "mcp.tool-1"])
         parts = []
         for _ in range(rng.randrange(0, 6)):
