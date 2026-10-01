@@ -574,7 +574,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          and, at the end, MB/s and the thread time spent getting pinned buffers and reading
    - [~] `QW_LOAD_THREADS` (default 1): load threads reading a load's files in parallel. A
          two-HDD mirror can serve two streams; to measure (needs files colder than the ARC)
-   - [ ] code review 2026-10-01: 24 improvement points with where, evidence, fix, effort and a
+   - [~] code review 2026-10-01 (6 of 24 applied the same day: S1, S2, S3, R1, S6, S7): 24 improvement points with where, evidence, fix, effort and a
          status line each, in `docs/CODE_REVIEW.md` (serving path S1-S8, reliability R1-R7,
          performance P1-P3, maintainability M1-M6). Measured ones first: the scheduler rebuilds a
          long prompt's ctypes array on every pass (5 ms at 100k tokens; the event loop that

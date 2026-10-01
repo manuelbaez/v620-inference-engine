@@ -62,14 +62,23 @@ defaults `--reasoning-effort` (xhigh; production sets medium) and `--thinking-bu
 (-1, unlimited).
 All settings and their defaults: docs/ENGINE_GUIDE.md, section 4.
 
+`/health` answers 503 with a reason when the engine can no longer serve (a rank
+failed, a collective timed out, an engine call has run for over 300 s, the
+scheduler thread died), and the process then exits after 30 s so its supervisor
+restarts it (`QW_WATCHDOG_EXIT=0` only reports). Media by URL is fetched from
+public addresses only (`QW_MEDIA_ALLOW_PRIVATE=1` allows the LAN,
+`QW_MEDIA_FETCH=0` allows `data:` URLs only); videos decode as a stream.
+
 The server logs a stats line every 10 s while busy and one line per request,
 and serves a dashboard at `/` (prompt and generation speed while busy, demand, queue, KV and memory use, request
 times; JSON at `/metrics.json`). Through llama-swap:
 `http://llm-backend-amd.local.net:8080/upstream/qw/qwen3.8-flash-next/`.
 
 ```sh
-python3 -m venv ~/qwenv && ~/qwenv/bin/pip install tokenizers jinja2 aiohttp
+python3 -m venv ~/qwenv && ~/qwenv/bin/pip install tokenizers jinja2 aiohttp numpy pillow
 server/ctl.sh start                             # port 8000; stop | restart | status
+for t in admission prefill_order thinking marshal event_loop isolation health tool_calls fetch video api; do
+  ~/qwenv/bin/python server/tests/test_$t.py; done   # no GPU, no checkpoint (test_video needs ffmpeg)
 server/tests/test_e2e.py --url http://host:8000 --model qw --compare ref.json
 server/tests/test_concurrency.py --url http://host:8000 --model qw -n 4
 ```

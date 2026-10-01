@@ -14,6 +14,10 @@ Effort is S (under an hour), M (a few hours) or L (days). Every point ends with
 a status line: when one is fixed, put the commit and the before/after numbers
 there and tick the roadmap bullet in `docs/DESIGN.md`.
 
+**Applied 2026-10-01:** S1, S2, S3, R1, S6 and S7 (commits cb63dd4, 22e3839, 65e3c30, 553a5db, d793c7b,
+dba9bef), each with a test that fails on the previous code; their status lines carry the before and after
+numbers. The rest are open. Nothing is deployed yet: production runs an older image.
+
 The reliability points are latent: nothing in the production log shows them
 firing. The measured serving-path points are not: they cost latency whenever a
 long prompt waits or loads.
@@ -72,15 +76,15 @@ ideas are recorded with numbers.
 
 | id | point | evidence | effort | status |
 |---|---|---|---|---|
-| S1 | prompts re-marshalled on every scheduler pass | measured | S-M | open |
-| S2 | tokenize and render on the event loop | measured | S | open |
-| S3 | one request's exception fails every request | read | S | open |
+| S1 | prompts re-marshalled on every scheduler pass | measured | S-M | done |
+| S2 | tokenize and render on the event loop | measured | S | done |
+| S3 | one request's exception fails every request | read | S | done |
 | S4 | no admission control, silent ignores, 500s on bad input | read | S-M | open |
 | S5 | streaming with `stop` leaks the start of a stop string | read | S | open |
-| S6 | tool-call parser edge cases | measured | S-M | open |
-| S7 | media: SSRF, whole video in RAM, bomb error type | read | M | open |
+| S6 | tool-call parser edge cases | measured | S-M | done |
+| S7 | media: SSRF, whole video in RAM, bomb error type | read | M | done |
 | S8 | dashboard shows the fp8 PLE table as 28.8 GB | measured | S | open |
-| R1 | a failed or stuck engine is never reported or restarted | read | S-M | open |
+| R1 | a failed or stuck engine is never reported or restarted | read | S-M | done |
 | R2 | collective sequence numbers wrap (unsigned compare) | read | S | open |
 | R3 | kernel launch errors are never read | read | S | open |
 | R4 | saved-state identity ignores the weights | read | S | open |
@@ -101,7 +105,12 @@ ideas are recorded with numbers.
 
 ### S1. Prompts are re-marshalled on every scheduler pass
 
-Evidence: **measured**. Effort: S-M. Status: open.
+Evidence: **measured**. Effort: S-M. Status: **done** (cb63dd4). `Request.prompt` is a `Tokens` (a list that caches its int32 array, built once: 0.9 ms
+per 100k tokens, nothing after) and `Engine.c_array` uses it; a request that found no slot is offered again
+only after a slot was released (`Scheduler.slot_epoch`); the loop sleeps 20 ms instead of spinning when only
+loads or blocked waiters remain (it spun at 100% while a request waited for a slot and another loaded).
+Measured with a fake C library: `Engine.prefetch` at 100k tokens 7.4 ms to 0.001 ms per call; event-loop
+lateness while polling, median 4.68 ms to 0.06 ms (max 5.64 to 0.51). `test_marshal`, `test_admission`.
 
 **Where.** `server/qwserve/engine.py:124-160`: `acquire`, `set_prompt`,
 `begin_prompt` and `prefetch` each build `(ctypes.c_int32 * len(tokens))(*tokens)`.
@@ -140,7 +149,9 @@ while another prompt loads.
 
 ### S2. Tokenizing and rendering run on the event loop
 
-Evidence: **measured**. Effort: S. Status: open.
+Evidence: **measured**. Effort: S. Status: **done** (22e3839). `chat`, `/tokenize` and `/v1/completions` run render + encode through
+`Server.offload` / `Server.prepare`. `test_event_loop` (tiny tokenizer from `fixtures.py`): a 2 MB request
+stalled the loop 392 ms on the loop and 22 ms through `prepare()`, same tokens.
 
 **Where.** `server/qwserve/api.py:133-136` (`chat`), `:116-119` (`tokenize`),
 `:272` (`completions`): `self.render(body)` (Jinja) and `self.encode(text)` run
@@ -155,16 +166,21 @@ a long history (not measured). Every other stream stalls meanwhile and its
 tokens arrive in a burst. Agents send such a request every turn.
 
 **Fix.** `await loop.run_in_executor(None, ...)` for render and encode; both are
-pure functions of the request body. Check whether `Tokenizer.encode` releases
-the GIL (not verified); if it does not, the loop is still free between GIL
-switches, which is better than blocked.
+pure functions of the request body. An executor alone is not enough: `Tokenizer.encode`
+keeps the GIL for the whole call (measured: with `encode` in an executor the loop still
+stalled 157 ms), while `encode_batch([text])` returns identical ids at the same speed and
+releases it (4.3 ms). So `ChatPrompt.encode` uses `encode_batch` and the handlers call it
+through `Server.offload`.
 
 **Verify.** Event-loop lateness probe (appendix) while a large request is
 tokenized; stream inter-token times of a concurrent request.
 
 ### S3. One request's exception fails every request in flight
 
-Evidence: **read**. Effort: S. Status: open.
+Evidence: **read**. Effort: S. Status: **done** (65e3c30). `acquire` has its own try: the request gets its error and end events and holds no slot.
+`test_isolation` runs the real scheduler thread: next to a poisoned prompt the long request decodes to its
+length and the next one finishes; against the previous `scheduler.py` the long request is failed after 21
+tokens and the other two are never answered.
 
 **Where.** `server/qwserve/scheduler.py:205`: `self.e.acquire(...)` is outside
 the `try` that starts at `:211`. The catch-all at `:392-405` fails everything in
@@ -176,8 +192,10 @@ inside the batched step, which only has the same catch-all above it.
 batch's requests, and `_begin` has its own handler, so only `acquire` and the
 decode step are exposed. A malformed request that makes `acquire` throw (for
 example the media-key checks in `Session::media_keys`) ends every active
-request with an error. No scheduler error occurred in the 587 requests since
-09-28, so this is latent.
+request with an error, and, found while testing, it
+stays at the head of the waiting list and raises again on every pass, so no
+request behind it is admitted either until its client disconnects. No
+scheduler error occurred in the 587 requests since 09-28, so this is latent.
 
 **Fix.** Move `acquire` into the `try` and fail only that request. Validate
 budget and room per request in Python before `generate` (`r.limit` already
@@ -231,7 +249,10 @@ stop string; release it when it is disproved or at the end of the stream.
 
 ### S6. Tool-call parser edge cases
 
-Evidence: **measured** (16-case probe, appendix). Effort: S-M. Status: open.
+Evidence: **measured** (16-case probe, appendix). Effort: S-M. Status: **done** (d793c7b). `test_tool_calls`: the 16 cases and new ones, a differential fuzz of 3,000 random
+well-formed calls against the previous implementation (identical), and the cases through `OutputParser`
+(a call cut off by `max_tokens` now yields its partial value). 12 of its checks fail on the old parser;
+the whole-sample-call case gave `path = /x, content = <function=edit>`.
 
 **Where.** `server/qwserve/tool_calls.py:8` (`_PARAM_RE`), `:75-101`
 (`parse_tool_call`), `server/qwserve/output_parser.py:57` (`finish`).
@@ -252,9 +273,12 @@ follows vLLM's qwen3_coder parser; the two were not diffed here. The cases
 matter for agents that edit files documenting this format (this repository's
 own docs and tests are such files).
 
-**Fix.** End a value at a `</parameter>` that is followed, after whitespace, by
-`<parameter=`, `</function>` or the end of the text; keep an unterminated final
-value. Add the 16 cases as a unit test (no model needed).
+**Fix.** A value ends at the first `</parameter>` that is followed, after whitespace, by `<parameter=` or
+the end of the call, and the call at its final `</function>`. Two exceptions keep the old tolerance:
+a declared parameter that has not appeared yet and starts a line ends the value before it (the model
+forgot the closing tag; needs the tool's schema, without one the two cannot be told apart), and a
+value with no such closing tag runs to the end of the call, minus a cut-off fragment of the closing
+tag. The 16 cases are a unit test.
 
 **Verify.** The probe cases as a test; `server/tests/test_text.py` (needs the
 checkpoint) for the cases the current parser already gets right.
@@ -262,7 +286,10 @@ checkpoint) for the cases the current parser already gets right.
 ### S7. Media: any URL is fetched, a whole video is held in RAM, one error escapes
 
 Evidence: **read** (arithmetic and a checked exception class). Effort: M.
-Status: open.
+Status: **done** (dba9bef). `test_video`: output identical to the previous decoder on five clips (patches, grid,
+hash, timestamps); peak memory for 300 frames of 720p 69 MB against 1,631 MB, and 73-83 MB flat for 5, 10
+and 20 s clips; garbage and empty input are ValueErrors. `test_fetch`: 13 refusals without contacting the
+local server, public addresses allowed, redirects checked, the overrides, the bomb error.
 
 **Where.** `server/qwserve/vision.py:175-186` (`fetch`: any http(s) URL through
 `urllib.request.urlopen`, redirects followed, 64 MB cap, 30 s timeout);
@@ -282,11 +309,13 @@ Status: open.
 - `PIL.Image.DecompressionBombError` derives from `Exception` only (checked in
   Pillow 12), so an oversize image gives a 500 instead of a 400.
 
-**Fix.** Make remote fetch opt-in (or deny loopback, private and link-local
-addresses after resolving, and re-check on redirects). Read ffmpeg's stdout in
-frame-sized pieces and keep only the sampled frames; the sampled indices come
-from the frame count `ffprobe` reports, so the result is identical to today's.
-Cap total decoded pixels. Catch the bomb error as a 400.
+**Fix.** Remote fetch is refused unless every address the host resolves to is public (decimal and
+hex spellings of 127.0.0.1, `::ffff:127.0.0.1`, 169.254.169.254 and 100.64/10 are caught), every
+redirect is checked, `QW_MEDIA_ALLOW_PRIVATE=1` allows the LAN and `QW_MEDIA_FETCH=0` allows `data:`
+URLs only; DNS rebinding between the check and the connection is not covered. Videos decode as a
+stream: one pass counts the frames, a second keeps only the sampled ones, each resized and
+normalized as it arrives (the video goes to a file, not a pipe, so an mp4 with its index at the end
+also decodes). The bomb error and ffmpeg failures are `ValueError`s (400).
 
 **Verify.** `server/tests/test_vision_preprocess.py` (compares with HF's
 processor) must stay identical; peak RSS of a long video before and after.
@@ -312,7 +341,10 @@ for an unknown layout instead of guessing int4.
 
 ### R1. A failed or stuck engine is never reported or restarted
 
-Evidence: **read**. Effort: S-M. Status: open.
+Evidence: **read**. Effort: S-M. Status: **done** (553a5db); the C++ getter compiles and links on the dev box (symbol exported) and has not run on
+the GPUs. `test_health`: 503 with the reason, exit after the grace, no exit when it recovers inside it, a call
+stuck in `generate()` reported and exited for, a dead scheduler thread, the binding. Still to check: that
+llama-swap restarts the model on the next request after the exit (as it did after the 10-01 OOM kill).
 
 **Where.** `src/engine/engine.hip:202` (`error_` is set by the first failing
 rank and never cleared), `:246` (every later `dispatch()` fails with it),
@@ -326,12 +358,14 @@ rank and never cleared), `:246` (every later `dispatch()` fails with it),
 GPU wedge on this platform) hangs the scheduler thread without a sound beyond
 the 60 s log line. A dead scheduler thread is not noticed either.
 
-**Fix.** The engine exposes `failed()`; the scheduler keeps a heartbeat (time of
-its last pass and of the start of the current engine call). `/health` answers
-503 when the engine failed or one call has run for more than N seconds
-(default 300), so the supervisor restarts it. Optionally abort the process after
-N minutes inside one `dispatch()`. Check llama-swap's health-check settings so
-it acts on the 503.
+**Fix.** `Engine::failure()` (a mutex-guarded getter of `error_` and the comm timeout flags) is exported as
+`qw_engine_failure` and bound as `Engine.failure()`, callable from any thread. `Scheduler.health()` is
+not ok when the scheduler thread died, an engine call has run for over `QW_STUCK_SECONDS` (300; the
+scheduler's engine is wrapped to record the call in progress), or the engine reports a failure.
+`/health` answers 503 with the reason, and a watchdog thread exits the process (code 3) once health
+has failed for `QW_EXIT_GRACE` seconds (30) so the supervisor restarts it (`QW_WATCHDOG_EXIT=0`: only
+report). A failure streak heuristic was rejected: a few malformed requests in a row would look like a
+failed engine.
 
 **Verify.** A fake engine that raises or sleeps; a dev-box run that kills a
 rank's stream with a bad launch.

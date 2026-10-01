@@ -192,6 +192,8 @@ Speed figures are single-stream decode unless stated.
 | Logs | stats line every N s while busy, one line per request, errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
 | Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
 | Background disk loads | a prompt whose cache is on disk waits while threads read it into RAM; others keep running, including prompts whose cache is all in RAM | removes a ~54 s stall per 97k-token disk restore | none | on, 1 thread | on, 1 thread | `QW_LOAD_THREADS` (parallel file reads, to be measured) |
+| Health and watchdog | `/health` answers 503 with a reason when the scheduler thread died, an engine call has run over `QW_STUCK_SECONDS` (a wedged GPU) or a rank failed / a collective timed out (permanent); a watchdog exits the process after `QW_EXIT_GRACE` s so the supervisor restarts it | a failed or wedged engine is restarted instead of failing every request behind a healthy-looking server | none | on (300 s, 30 s) | on | `QW_STUCK_SECONDS`, `QW_EXIT_GRACE`, `QW_WATCHDOG_EXIT=0` |
+| Media by URL | an image or video URL is fetched only when every address of its host is public, and each redirect is checked; videos decode as a stream (one pass counts the frames, one keeps the sampled ones) | a 60 s 1080p30 video: ~11 GB of server memory -> ~0.1 GB; 300 frames of 720p: 1,631 -> 69 MB | none (identical pixels) | public addresses only | public addresses only | `QW_MEDIA_FETCH=0` (data: URLs only), `QW_MEDIA_ALLOW_PRIVATE=1` |
 
 Diagnostics: `QW_TRACE` (step phase timings, sampling fallbacks), `QW_PROFILE`
 (prefill timings), `QW_GUARD` (allocation guard zones), `QW_NOGRAPH`.
@@ -433,7 +435,26 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 - **Vision:** images and video are preprocessed in the server exactly as HF's
   Qwen3-VL processor (tested against dumps), encoded lazily only for tokens
   that are actually prefilled, and cached by content hash; vision tokens get
-  content-derived ids so the prefix cache never confuses two images.
+  content-derived ids so the prefix cache never confuses two images. Videos
+  are decoded as a stream, so a long one never sits in memory, and media URLs
+  are fetched from public addresses only (section 4, "Media by URL").
+- **The event loop stays free** (each of these used to delay every stream by
+  5-400 ms): the chat template and the tokenizer run on a worker thread
+  (`Server.prepare`; `encode_batch`, because `Tokenizer.encode` keeps the GIL
+  even there), a request's prompt is converted to int32 once (`Tokens`, 5 ms
+  per call at 100k tokens with the GIL held, and the scheduler used to do it
+  every pass for every waiting or loading request), and a request that found no
+  slot is not offered to the engine again until one is released.
+- **Failure isolation and health:** a request the engine cannot admit fails
+  alone (it used to fail every request in flight and sit at the head of the
+  waiting list, raising on every pass). `/health` reports the scheduler thread,
+  an engine call that runs for minutes and the engine's own sticky failure
+  (`Engine::failure()`), and a watchdog exits the process when that persists.
+- **Tool calls:** a parameter's value may contain the format's own tags
+  (a file that documents it); a value ends at a `</parameter>` followed by the
+  next parameter or the end of the call, a forgotten closing tag is tolerated
+  for declared parameter names, and a call cut off by `max_tokens` keeps its
+  partial last value.
 - **Timings** in llama.cpp format per request (llama-swap's activity log), so
   real use can be analyzed (prefill vs decode share, cache hit rate).
 
