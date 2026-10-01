@@ -574,6 +574,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          and, at the end, MB/s and the thread time spent getting pinned buffers and reading
    - [~] `QW_LOAD_THREADS` (default 1): load threads reading a load's files in parallel. A
          two-HDD mirror can serve two streams; to measure (needs files colder than the ARC)
+   - [ ] code review 2026-10-01 (section "Code review: improvement points"): 26 points with
+         evidence and effort. Measured ones first: the scheduler rebuilds a long prompt's
+         ctypes array on every pass (5 ms at 100k tokens; the event loop that streams tokens
+         is then 4.7 ms late per wakeup), tokenizing and rendering run on the event loop
+         (~100-250 ms for a 100k-token prompt), the dashboard shows the fp8 table as 28.8 GB
+         instead of 51.2 GB, the tool-call parser mis-splits values containing `<parameter=`
    - [x] KV slots 256k + 128k + 64k + 32k in production: 4096-token prefill chunks
          (`QW_PREFILL_CHUNK`) free ~0.9 GB per card of prefill buffers for the 64k slot
          (prefill -2%); ~1.1 GB per card stays free
@@ -835,6 +841,60 @@ Open, in the order I would try them (all need the GPUs): the attention kernel,
 the sequence-parallel single-image encode, layer-sliced encoding between
 decode steps so other requests are delayed by ~50 ms rather than ~1.2 s, a
 vectorized fp16 conversion.
+
+## Code review: improvement points (2026-10-01)
+
+Method: a read of `src/`, `server/`, `tests/`, `scripts/` and `docker/` (~20k
+lines), the production log since 2026-09-28 (587 requests: 585 stop, 2 abort,
+no scheduler error, watchdog line or collective timeout, so the reliability
+items below are latent, not observed), and measurements on the desktop (Ryzen
+5 9600X; the server's EPYC is slower per thread). Evidence: **measured**,
+**read** (from the code), **estimate**. Effort: S under an hour, M a few
+hours, L days. Lint is clean (ruff E9/F/B: 13 trivial findings).
+
+**Serving path (the user-visible ones)**
+
+| # | finding | evidence | fix | effort |
+|---|---|---|---|---|
+| S1 | `Engine.acquire`, `prefetch` and `begin_prompt` rebuild `(c_int32 * n)(*tokens)` on every call; `_admit` calls `acquire` for every waiting request and `_poll_loading` calls `prefetch` for every loading one, each pass. 0.5 / 2.5 / 5.1 / 10.2 ms at 10k / 50k / 100k / 200k tokens; the C side copies the prompt again and re-hashes it | **measured**; with that call in a loop the asyncio loop is late by 4.7 ms (median) per wakeup against 0.06 ms idle, 0.08 ms with the buffer built once | build one int32 buffer per request (numpy or `array.array`: 1 ms, pointer 22 us); poll a load with a cheap "load pending" call; skip `acquire` when no slot was freed | S-M |
+| S2 | `ChatPrompt.render` and `encode` run on the event loop in `chat()`; every stream stalls meanwhile | **measured**: 4.0 MB/s (649 KB, 203k tokens in 161 ms), so ~80 ms for 100k tokens here, more on the EPYC | `run_in_executor`, as media already does | S |
+| S3 | `Scheduler._admit` calls `acquire` outside its try: one request's exception reaches the loop's catch-all, which fails every request in flight. `Session::generate`'s `QW_CHECK`s do the same | **read** | per-request try around `acquire`; validate per request before the engine call | S |
+| S4 | no admission control: unbounded `queue`/`waiting` (a 100k-token request is ~3.5 MB of Python ints plus its body), no 429/503, unsupported fields (`response_format`, `logit_bias`, `tool_choice` required / named, `parallel_tool_calls`) silently ignored, bad JSON or `max_tokens` types give 500 | **read** | queue cap + 429; 400 for bad input; reject or log unsupported fields | S-M |
+| S5 | streaming with `stop` emits the part of a stop string that arrives before it completes ("ST" of "STOP" is already sent when "OP" arrives) | **read** | hold back a suffix that could start a stop string | S |
+| S6 | tool-call parser: a value containing `<parameter=` splits into extra parameters (`see <parameter=count> in docs` became two), one containing `</parameter>` is cut at it, a truncated last parameter is dropped (`{}`). An agent editing files that document this format hits all three | **measured** (probe of 16 cases; same as vLLM's parser) | end a value at a `</parameter>` that is followed by `<parameter=`, `</function>` or the end; keep an unterminated last value | S-M |
+| S7 | media: any http(s) URL is fetched by the server (SSRF into the LAN); `ffmpeg` decodes a whole video at its native rate into RAM (`capture_output`: 60 s of 30 fps 1080p is ~11 GB) to keep ~2 frames per second; `PIL.DecompressionBombError` is not an `OSError`/`ValueError` and gives 500 | **read** | block private ranges or make remote fetch opt-in; stream frames and keep only the sampled indices (output-identical); catch the bomb error as 400 | M |
+| S8 | the dashboard sizes the PLE table by layout and does not know `f8e4m3_tensorscale`: shows 28.8 GB for the 51.2 GB table | **measured** (live `/metrics.json`) | add the layout (1 byte per value) | S |
+
+**Reliability (latent)**
+
+| # | finding | evidence | fix | effort |
+|---|---|---|---|---|
+| R1 | `/health` answers ok whatever the state. `Engine::error_` is set once and never cleared (every later job throws), the dispatch watchdog only logs every 60 s and waits forever (a stuck rank hangs the scheduler thread), and a dead scheduler thread is not noticed, so llama-swap never restarts a failed engine | **read** | health = scheduler heartbeat + engine-failed flag (503); abort after N minutes in one job | S-M |
+| R2 | collective sequence numbers are `uint32` compared unsigned (`flag < seq`): after 2^32 collectives (~350 per decode step, ~4 days of continuous decoding) the first waits of each slot pass without waiting and read stale data | **read**, arithmetic | `(int32_t)(flag - seq) < 0` | S |
+| R3 | no kernel launch error is ever read (`hipGetLastError` appears once, to clear a sticky flag); a failed launch inside a graph or a job leaves stale buffers and wrong tokens | **read** | `CK(hipGetLastError())` after each capture and each job, per kernel in a debug mode | S |
+| R4 | the saved state's identity (`state_layout_id`) hashes shapes only: not the checkpoint, not the PLE table layout. Switching either reuses KV computed by other weights (the bf16 to fp8 table switch on 09-28 kept bf16-era disk entries) | **read** | add a fingerprint of `model.safetensors.index.json`, the PLE `META.json` and a numerics version | S |
+| R5 | the checkpoint (74 GB, mmapped at start) stays in the page cache after the upload: 63.8 GB of file cache in the container's cgroup, which pinned allocations then have to reclaim | **measured** (cgroup `memory.stat`) | `posix_fadvise(DONTNEED)` on the shards after `st_.clear()`; to test on ZFS | S |
+| R6 | startup scans every cache file serially (header and tokens): 3-5 s on six starts, 58 s on the cold start after the 10-01 OOM kill (6,000 files on two HDDs) | **measured** (log) | parallel scan, or an index file validated against the directory listing | S-M |
+| R7 | the 8-row cap on speculative batches (wrong tokens or GPU faults above it, cause unknown) is still the largest open correctness question | known (roadmap) | root-cause with `test_speculative --repeat`; PCIe AER on 83:00.0 overlaps | L |
+
+**Performance**
+
+| # | finding | evidence | fix | effort |
+|---|---|---|---|---|
+| P1 | prefill's host input preparation (bf16 to fp32 embeddings, PLE gather, fp32 to fp16) runs single-threaded before each chunk is dispatched, with the GPUs idle: fp32 to fp16 alone is 41 ms per 12.5M values (3.3 ns each), ~34 ms per 4096-token chunk, ~60 ms for all three | **measured** (conversion), **estimate** (total, ~3% of a 2 s chunk) | `ThreadPool::parallel_for` over tokens, F16C, or convert on the GPU; or prepare chunk n+1 while n runs | S-M |
+| P2 | `Engine::accept` syncs all four ranks once per request per step | **read** (~1% at 4 requests) | one batched call, one sync | S |
+| P3 | vision warmup encodes a 32x32 slice only: the first real image pays the workspace allocation (~330 MB per card at 1080p, with a `hipFree`) and rocBLAS kernel loads; the tower then costs 1.23 s per 1080p image on one card of four and stalls every other request | **read**; numbers from the Vision section | warm up at the production maximum; attention kernel, sequence-parallel encode, layer-sliced encode (Vision section) | M-L |
+
+**Maintainability and tests**
+
+| # | finding | evidence | fix | effort |
+|---|---|---|---|---|
+| M1 | code of rejected experiments in hot paths: 1,274 lines in experiment-only files (CacheBlend, GPTQ calibration, W4A8, vision-position study) plus hooks: `prefill.hip` 17 calibration, 13 `rope3`, 6 transfer; `weights.hip` 24 int8; `decode.hip` 7; `calibrating()` strings built per layer | **measured** (grep) | a CMake option or removal (the docs and git keep the results) | M |
+| M2 | `count_reuse` hashes every admitted prompt into `seen_chunks_` (up to 1M entries) for `blend_candidate_tokens`, a statistic of the rejected CacheBlend work | **read** | remove it and the field | S |
+| M3 | ~35 `getenv` sites, many function-local statics, and no log line with the effective configuration | **measured** (grep) | one config struct, parsed and logged at start | S-M |
+| M4 | tests: `ctest` runs two unit tests (ngram, chunker) and `comm`; the other GPU tests need arguments (without them they hang), known only from notes; the Python tests are scripts (three run without a model and pass, the rest need a server or the checkpoint); the scheduler imports `dashboard`, which imports aiohttp; the parser, tool-call parser, detokenizer and API streaming have no model-free tests; no CI | **measured** (ran them) | `scripts/gpu-tests.sh` with the arguments; a tiny tokenizer fixture; move `Metrics` out of `dashboard`; GitHub Actions for the CPU tests and a `hipcc` compile check | M |
+| M5 | no `requirements.txt`; the Dockerfile installs unpinned `tokenizers jinja2 aiohttp numpy pillow` (PIL's resize and the tokenizer decide token ids and pixels), runs as root, has no `HEALTHCHECK`, and copies `tests/`, `bench/` and `tools/` before compiling, so a test edit rebuilds the engine | **read** | pin, `HEALTHCHECK` on `/health`, build only what the targets need | S |
+| M6 | C API structs are mirrored by hand in `engine.py` with no version or size check | **read** | `qw_api_version()` and `sizeof` checks at load | S |
 
 ## PLE n-gram table precision: int4, int8 or bf16 (2026-09-27)
 
