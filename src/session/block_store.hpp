@@ -15,11 +15,12 @@
 #pragma once
 
 #include <array>
-#include <thread>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -51,10 +52,13 @@ public:
     // *logits when they are stored (else clears it). False if a file could not
     // be read (the entry is dropped; the slot's state is then undefined).
     bool restore(const Hit &h, const std::vector<int32_t> &prompt, int slot, int64_t keep, std::vector<float> *logits);
-    // Brings a hit's entries that are only on disk into RAM on a background
-    // thread, so restore() then reads nothing from disk: true while that load
-    // runs (call again to poll; one load at a time, so another hit's load also
-    // reads as running), false once everything the hit needs is in RAM.
+    // Brings a hit's entries that are only on disk into RAM on background
+    // threads, so restore() then reads nothing from disk: true while that load
+    // runs (call again to poll), false once everything the hit needs is in
+    // RAM. A hit that needs nothing from disk is never held up: false at once,
+    // whatever load is running. Loads run one at a time, so a hit that needs
+    // another read waits for the running one first. QW_LOAD_THREADS (default 1)
+    // threads read the files of a load in parallel.
     bool load(const Hit &h);
     // Stores the state of `slot` at VRAM snapshot `snap`, which was taken at
     // tokens.size() tokens of the slot: the path's blocks not stored yet, and
@@ -102,27 +106,39 @@ private:
     bool ensure_snap(Node &nd, uint64_t k);
     void remove_subtree(uint64_t k);
     void enforce_budgets();
-    // A background load of on-disk entries (load()): the payloads are allocated
-    // by the caller's thread and filled by the loader; finish_load() attaches
-    // them to the nodes that still want them.
+    // A background load of on-disk entries (load()): the loader threads take
+    // the pinned buffers themselves (pinning new arenas can take seconds) and
+    // read the files into them; finish_load() attaches them to the nodes that
+    // still want them.
     struct Load {
         struct Item {
             uint64_t key;
             bool snap;
-            std::shared_ptr<Payload> pl;  // pinned on the load thread
+            std::shared_ptr<Payload> pl;  // pinned on a load thread
             size_t rank_bytes;
             std::vector<float> logits;
         };
         std::vector<Item> items;
+        std::vector<std::thread> workers;
+        std::atomic<size_t> next{0};     // the item a worker takes next
+        std::atomic<size_t> running{0};  // workers still going; the last sets done
+        std::atomic<size_t> failed{0};
+        std::atomic<int64_t> pin_us{0}, read_us{0};  // thread time getting buffers / reading files
         std::atomic<bool> done{false};
-        std::thread th;
+        std::chrono::steady_clock::time_point t0;
+        size_t bytes = 0;
     };
+    // The entries of the hit's path that are only on disk, and their size.
+    std::vector<Load::Item> missing(const Hit &h, size_t *bytes) const;
+    void load_worker(Load *l);
+    size_t pinned_bytes() const;  // arenas held by the pools
     void finish_load();
     void load_index();
 
     Engine &e_;
     size_t ram_budget_, disk_budget_;
     size_t ram_bytes_ = 0, disk_bytes_ = 0;
+    int load_threads_ = 1;
     std::array<std::unique_ptr<PinnedPool>, RANKS> kv_pool_, snap_pool_;
     std::unordered_map<uint64_t, Node> nodes_;
     uint64_t clock_ = 0;

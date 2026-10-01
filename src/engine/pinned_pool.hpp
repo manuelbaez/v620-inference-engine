@@ -1,8 +1,12 @@
 // Fixed-size pinned host buffers, carved from arenas that are allocated on
 // demand and freed once empty (hipHostMalloc is slow per call, and the prefix
-// cache holds thousands of buffers). Pinning costs ~0.05-0.1 s per arena, so
-// arenas are allocated by a background thread: ahead of a known need
-// (reserve()), and whenever the free units drop below a low-water mark.
+// cache holds thousands of buffers). Pinning costs ~0.05-0.1 s per arena on a
+// quiet host, so arenas are allocated by a background thread: ahead of a known
+// need (reserve()), and whenever the free units drop below a low-water mark.
+// Freeing an arena (unpinning, which also waits for the device's streams) is
+// done by that thread too, so put() never stalls the caller (the scheduler
+// thread returns units in bulk when the cache evicts). Arena pins and frees
+// that take long (a host short of memory has to reclaim first) are logged.
 // Thread-safe.
 #pragma once
 
@@ -37,6 +41,7 @@ private:
         std::vector<int> free;  // unit indices
     };
     std::unique_ptr<Arena> new_arena() const;  // without the lock
+    void free_arena(Arena &a) const;           // without the lock
     void add_arena(std::unique_ptr<Arena> a);  // with the lock held
     void want(size_t n);                       // with the lock held
     void prefetch_loop();
@@ -47,6 +52,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_, ready_cv_;
     std::vector<std::unique_ptr<Arena>> arenas_;
+    std::vector<std::unique_ptr<Arena>> retired_;  // empty arenas for the thread to free
     size_t free_units_ = 0;
     int empty_ = 0;                            // arenas with every unit free
     size_t target_ = 0;  // free units the prefetch thread works toward

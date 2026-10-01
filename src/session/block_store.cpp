@@ -45,6 +45,7 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
             std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r), 0);
     }
     nodes_[ROOT] = Node{};
+    if (const char *t = std::getenv("QW_LOAD_THREADS")) load_threads_ = std::max(1, std::atoi(t));
     if (!disk_dir.empty()) {
         disk_ = std::make_unique<DiskTier>(disk_dir, e_.state_layout_id());
         load_index();
@@ -52,7 +53,9 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
 }
 
 BlockStore::~BlockStore() {
-    if (load_ && load_->th.joinable()) load_->th.join();
+    if (load_)
+        for (auto &t : load_->workers)
+            if (t.joinable()) t.join();
 }
 
 // Rebuilds the index from the disk tier's files; drops files whose chain is broken.
@@ -204,54 +207,88 @@ bool BlockStore::ensure_snap(Node &nd, uint64_t k) {
     return true;
 }
 
-bool BlockStore::load(const Hit &h) {
-    if (load_) {
-        if (!load_->done) return true;
-        finish_load();
-    }
-    if (!disk_ || !nodes_.count(h.node)) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    auto ld = std::make_unique<Load>();
-    size_t bytes = 0;
+std::vector<BlockStore::Load::Item> BlockStore::missing(const Hit &h, size_t *bytes) const {
+    std::vector<Load::Item> items;
+    *bytes = 0;
     for (uint64_t k : path_to(h.node)) {
         const Node &nd = nodes_.at(k);
         if (!nd.kv && nd.kv_disk) {
             const size_t rb = e_.kv_rank_bytes(int64_t(nd.tokens.size()));
-            ld->items.push_back({k, false, nullptr, rb, {}});
-            bytes += rb * RANKS;
+            items.push_back({k, false, nullptr, rb, {}});
+            *bytes += rb * RANKS;
         }
     }
     const Node &target = nodes_.at(h.node);
     if (!target.snap && target.snap_disk) {
-        ld->items.push_back({h.node, true, nullptr, Engine::recurrent_rank_bytes(), {}});
-        bytes += Engine::recurrent_rank_bytes() * RANKS;
+        items.push_back({h.node, true, nullptr, Engine::recurrent_rank_bytes(), {}});
+        *bytes += Engine::recurrent_rank_bytes() * RANKS;
     }
-    if (ld->items.empty()) return false;
-    log("prefix cache: loading %zu entries (%.1f GB) from disk in the background", ld->items.size(), double(bytes) / 1e9);
+    return items;
+}
+
+size_t BlockStore::pinned_bytes() const {
+    size_t b = 0;
+    for (int r = 0; r < RANKS; ++r) b += kv_pool_[size_t(r)]->allocated_bytes() + snap_pool_[size_t(r)]->allocated_bytes();
+    return b;
+}
+
+bool BlockStore::load(const Hit &h) {
+    if (!disk_ || !nodes_.count(h.node)) return false;
+    if (load_ && load_->done) finish_load();  // attaches what it read, which may be this hit's
+    size_t bytes = 0;
+    std::vector<Load::Item> items = missing(h, &bytes);
+    if (items.empty()) return false;  // all in RAM: a load running for another hit does not hold it up
+    if (load_) return true;           // one load at a time: this hit's starts once that one is attached
+    auto ld = std::make_unique<Load>();
+    ld->items = std::move(items);
+    ld->bytes = bytes;
+    ld->t0 = std::chrono::steady_clock::now();
+    const size_t nthreads = std::min<size_t>(size_t(load_threads_), ld->items.size());
+    log("prefix cache: loading %zu entries (%.1f GB) from disk in the background (%zu threads; RAM cache %.1f GB in "
+        "%.1f GB of pinned arenas, %.2f GB of disk writes queued)",
+        ld->items.size(), double(bytes) / 1e9, nthreads, double(ram_bytes_) / 1e9, double(pinned_bytes()) / 1e9,
+        double(disk_->pending_bytes()) / 1e9);
     // taking the pinned buffers can mean pinning new arenas (seconds per GB when the pools are
-    // empty, as after a start), so the load thread takes them
+    // empty, as after a start, or the host is short of memory), so the load threads take them
     Load *l = ld.get();
-    ld->th = std::thread([this, l, t0] {
-        size_t failed = 0;
-        for (auto &it : l->items) {
-            it.pl = alloc(it.snap);
-            const bool ok = disk_->read(it.key, it.snap, it.pl->p, it.rank_bytes, it.snap ? &it.logits : nullptr);
-            if (!ok) {
-                it.pl.reset();
-                ++failed;
-            }
-        }
-        log("prefix cache: background load of %zu entries done in %.2f s%s", l->items.size(),
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-            failed ? " (some unreadable)" : "");
-        l->done = true;
-    });
+    l->running = nthreads;
+    for (size_t w = 0; w < nthreads; ++w) l->workers.emplace_back([this, l] { load_worker(l); });
     load_ = std::move(ld);
     return true;
 }
 
+void BlockStore::load_worker(Load *l) {
+    using clk = std::chrono::steady_clock;
+    auto us = [](clk::time_point a, clk::time_point b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
+    for (size_t i; (i = l->next++) < l->items.size();) {
+        Load::Item &it = l->items[i];
+        const auto t0 = clk::now();
+        it.pl = alloc(it.snap);
+        const auto t1 = clk::now();
+        const bool ok = disk_->read(it.key, it.snap, it.pl->p, it.rank_bytes, it.snap ? &it.logits : nullptr);
+        const auto t2 = clk::now();
+        l->pin_us += us(t0, t1);
+        l->read_us += us(t1, t2);
+        if (!ok) {
+            it.pl.reset();
+            ++l->failed;
+        }
+    }
+    if (--l->running == 0) {  // the last one reports
+        const double s = std::chrono::duration<double>(clk::now() - l->t0).count();
+        log("prefix cache: background load of %zu entries done in %.2f s (%.0f MB/s; thread time %.2f s getting "
+            "pinned buffers, %.2f s reading)%s",
+            l->items.size(), s, double(l->bytes) / 1e6 / std::max(s, 1e-3), double(l->pin_us) / 1e6,
+            double(l->read_us) / 1e6, l->failed ? " (some unreadable)" : "");
+        l->done = true;
+    }
+}
+
 void BlockStore::finish_load() {
-    if (load_->th.joinable()) load_->th.join();
+    for (auto &t : load_->workers)
+        if (t.joinable()) t.join();
     for (auto &it : load_->items) {
         auto nd = nodes_.find(it.key);
         if (!it.pl || nd == nodes_.end()) continue;  // unreadable, or dropped meanwhile

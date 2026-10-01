@@ -51,6 +51,8 @@ public:
     void remove(uint64_t hash, bool snap);
     // Blocks until queued writes are on disk.
     void flush();
+    // Bytes of files queued or being written; their pinned buffers stay held until then.
+    size_t pending_bytes() const;
 
 private:
     struct Job {
@@ -59,6 +61,7 @@ private:
         Engine::RankBufs bufs;
         size_t rank_bytes;
         std::shared_ptr<const void> keep;
+        size_t bytes = 0;  // the file's size
     };
     std::string path(uint64_t hash, bool snap) const;
     void writer_loop();
@@ -67,10 +70,11 @@ private:
 
     std::string dir_;
     uint64_t layout_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_, done_cv_;
     std::deque<Job> queue_;
     std::set<std::pair<uint64_t, bool>> pending_;  // queued or being written
+    size_t pending_bytes_ = 0;
     bool stop_ = false;
     std::thread writer_;
 };

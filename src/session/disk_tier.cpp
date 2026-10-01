@@ -103,7 +103,8 @@ size_t DiskTier::write(const Meta &m, std::vector<float> logits, const Engine::R
     const size_t bytes = sizeof(Header) + m.tokens.size() * 4 + logits.size() * 4 + size_t(RANKS) * rank_bytes;
     std::lock_guard<std::mutex> lk(mu_);
     pending_.insert({m.hash, m.snap});
-    queue_.push_back({m, std::move(logits), bufs, rank_bytes, std::move(keep)});
+    pending_bytes_ += bytes;
+    queue_.push_back({m, std::move(logits), bufs, rank_bytes, std::move(keep), bytes});
     cv_.notify_all();
     return bytes;
 }
@@ -123,6 +124,7 @@ void DiskTier::writer_loop() {
         {
             std::lock_guard<std::mutex> lk(mu_);
             pending_.erase({job.m.hash, job.m.snap});
+            pending_bytes_ -= job.bytes;
         }
         done_cv_.notify_all();
     }
@@ -189,6 +191,11 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
 void DiskTier::remove(uint64_t hash, bool snap) {
     wait_written(hash, snap);
     std::remove(path(hash, snap).c_str());
+}
+
+size_t DiskTier::pending_bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return pending_bytes_;
 }
 
 void DiskTier::flush() {
