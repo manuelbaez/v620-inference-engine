@@ -399,8 +399,11 @@ a 12k-token system prompt shared nothing. The block store
 - **Resume** = the deepest snapshot on the prompt's path, whoever stored it;
   only blocks the slot doesn't already hold are copied in.
 - **Memory.** Pinned buffers come from arenas of ~250 MB per rank, allocated
-  on demand and freed when empty (a spare is kept). Pinning costs ~0.05-0.1 s
-  per arena, so a prefill tells the store what its saves will need and the
+  on demand and freed when empty (a spare is kept). Pinning was measured at
+  ~0.05-0.1 s per arena on 2026-09-25; the pool now logs every pin over 0.5 s, and
+  the first start of the 2026-10-01 deploy (108 GB of host memory available, the
+  four pools pinning at once) logged 0.73-1.47 s per 251-256 MB arena. So a
+  prefill tells the store what its saves will need and the
   arenas are pinned by a background thread while the GPUs work. Budget
   `QW_HOST_CACHE_GB` (default 128); LRU over nodes whose children hold nothing
   in RAM; evicting a snapshot also drops the ancestor blocks no other snapshot
@@ -556,8 +559,15 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          no load running. Found and fixed on the way: the pinned pool could leave a caller
          waiting forever (see next item), a hit that needs nothing from disk was held up by a
          load running for another prompt, and the load log now says where the time goes.
-         Still to measure on the dev box (needs a GPU window): `tests/gpu/test_disk_load`, then
-         decode steps during a load with and without the changes
+         Measured in production after the deploy of `qw-engine:15822e2` (2026-10-01, a freshly
+         started engine with 108 GB of host memory available and an empty RAM cache): a
+         replayed 29.8k-token chain from the disk tier (118 entries, 2.6 GB) loaded in 16.04 s
+         (162 MB/s: 15.39 s reading, 0.65 s getting pinned buffers), restored in 0.155 s and
+         was reported as 29,809 cached tokens; a decode running alongside it kept 79.4 tok/s
+         (79.2 alone) with at most 30 ms between tokens. So with memory headroom a load of this
+         size does not slow decode; the 83-300 ms/step windows were under memory pressure.
+         Not yet measured: a larger load while the host cache is full. Still to run on the dev
+         box (needs a GPU window): `tests/gpu/test_disk_load`, `tests/gpu/test_pinned_pool`
    - [x] pinned pool: `get()` could wait forever. A caller woken after another took the arena's
          units went back to sleep without asking for another arena, and `put()` never woke a
          waiting `get()`; with the scheduler and a load thread both taking buffers this left a

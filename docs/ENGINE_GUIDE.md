@@ -262,7 +262,8 @@ from that.
    chat message starts (`<|im_start|>`) at least 1,024 tokens apart, at chunk
    ends and at the prompt end. Pinned host memory comes from ~250 MB arenas
    pinned in the background while the GPUs prefill (pinning on demand stalled
-   prefill 0.2-0.4 s), and unpinned by the pool's thread once empty (never in
+   prefill 0.2-0.4 s; an arena took 0.7-1.5 s to pin on 2026-10-01 with the four
+   pools pinning at once), and unpinned by the pool's thread once empty (never in
    the caller). The pool must serve several callers at once (the scheduler's
    saves and the disk-load threads): a caller that wakes to find the arena's
    units taken has to ask again, and a returned unit has to wake a waiting

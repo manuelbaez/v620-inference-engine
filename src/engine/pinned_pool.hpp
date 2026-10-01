@@ -1,7 +1,8 @@
 // Fixed-size pinned host buffers, carved from arenas that are allocated on
 // demand and freed once empty (hipHostMalloc is slow per call, and the prefix
-// cache holds thousands of buffers). Pinning costs ~0.05-0.1 s per arena on a
-// quiet host, so arenas are allocated by a background thread: ahead of a known
+// cache holds thousands of buffers). Pinning an arena took 0.05-0.1 s when
+// measured first and 0.7-1.5 s with the four pools pinning at once (2026-10-01),
+// so arenas are allocated by a background thread: ahead of a known
 // need (reserve()), and whenever the free units drop below a low-water mark.
 // Freeing an arena (unpinning, which also waits for the device's streams) is
 // done by that thread too, so put() never stalls the caller (the scheduler

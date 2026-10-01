@@ -16,7 +16,9 @@ there and tick the roadmap bullet in `docs/DESIGN.md`.
 
 **Applied 2026-10-01:** S1, S2, S3, R1, S6 and S7 (commits cb63dd4, 22e3839, 65e3c30, 553a5db, d793c7b,
 dba9bef), each with a test that fails on the previous code; their status lines carry the before and after
-numbers. The rest are open. Nothing is deployed yet: production runs an older image.
+numbers. The rest are open. Deployed to production the same day as `qw-engine:15822e2` (rollback:
+`qw-engine:e7f5a3f`): the 11 tests pass inside that image, the smoke test and a replay of a cached 30k-token
+chain through the disk tier pass on the live engine, and `/health` answers 200.
 
 The reliability points are latent: nothing in the production log shows them
 firing. The measured serving-path points are not: they cost latency whenever a
@@ -341,8 +343,8 @@ for an unknown layout instead of guessing int4.
 
 ### R1. A failed or stuck engine is never reported or restarted
 
-Evidence: **read**. Effort: S-M. Status: **done** (553a5db); the C++ getter compiles and links on the dev box (symbol exported) and has not run on
-the GPUs. `test_health`: 503 with the reason, exit after the grace, no exit when it recovers inside it, a call
+Evidence: **read**. Effort: S-M. Status: **done** (553a5db), deployed in `qw-engine:15822e2`: the getter returns "" on the live engine (`/health`
+answers 200); its failure path has not run on hardware. `test_health`: 503 with the reason, exit after the grace, no exit when it recovers inside it, a call
 stuck in `generate()` reported and exited for, a dead scheduler thread, the binding. Still to check: that
 llama-swap restarts the model on the next request after the exit (as it did after the 10-01 OOM kill).
 
