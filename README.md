@@ -23,7 +23,7 @@ reusable across turns without re-prefilling.
 | 1. Spec + CPU fp32 reference (`src/ref`) | done; matches vLLM (greedy identical at 57 and 4,266 tokens) |
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
 | 3. 4-GPU runtime (TP4 dense + EP4 experts) | plain decode **67 tok/s** single stream (HIP graphs per batch size), **prefill ~2,050-2,200 tok/s** (vLLM: ~56 / ~1,060); the four ranks load in parallel |
-| 4. Prefix cache | per-slot reuse, VRAM snapshots, and a block store shared by all conversations in host RAM (128 GB) and on disk (survives restarts): any stored prefix up to a chat message boundary is restored in 0.02-0.5 s instead of re-prefilled (a shared 12k system prompt: 6.1 s -> 0.34 s) |
+| 4. Prefix cache | per-slot reuse, VRAM snapshots, and a block store shared by all conversations in host RAM (128 GB) and on disk (survives restarts): any stored prefix up to a chat message boundary is restored in 0.02-0.5 s instead of re-prefilled (a shared 12k system prompt: 6.1 s -> 0.34 s); a restore from a cold disk takes as long as the disk reads (production's HDD mirror: 160-205 MB/s), see docs/DESIGN.md "Disk-tier loads and host memory" |
 | 5. MTP speculative decoding | done: exact, adaptive draft count up to 5 (off while drafting does not pay), draft steps chained on the GPUs; **107-112 tok/s** single stream with Qwen's sampling settings (~117 greedy), **~231 tok/s** at 4 concurrent; on by default (`--mtp 5`) |
 | 6. Prefill kernels and scheduling | two micro-batches per chunk, several waiting prompts per pass (batched prefill), long prompts in pieces between decode steps (interleaved prefill) |
 | 7. OpenAI server, tokenizer, llama-swap entry | done: serving production through llama-swap and litellm; images and video (vision tower on every card, 720p in 0.33 s) |
@@ -33,8 +33,9 @@ reusable across turns without re-prefilling.
 
 The n-gram (PLE) table never goes to the GPUs. It stays pinned in host RAM and
 the host gathers 16 rows per token. It comes in three precisions (int4 30 GB,
-int8 54 GB, the original bf16 102 GB; `--ple-dir`); production runs bf16
-(docs/DESIGN.md, "PLE n-gram table precision").
+int8 54 GB, the original bf16 102 GB, and the official fp8 51 GB;
+`--ple-dir`); production runs the official fp8 table (docs/DESIGN.md, "PLE
+n-gram table precision").
 
 ## Serving
 

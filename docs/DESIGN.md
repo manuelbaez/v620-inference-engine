@@ -157,9 +157,13 @@ The state that makes a prefix reusable:
 - **Keys:** blocks of 256 tokens, each hashed with its parent's hash (a hash
   chain). A lookup walks the prompt's block hashes. (Implemented: see "Block
   store" below.)
-- **KV blocks** live in three tiers: VRAM, then pinned host RAM, then NVMe on
-  `/main-storage` (the ZFS pool, 1.2 TB free). They are evicted by LRU with
-  prefix-aware refcounts, so a parent can't go while a live child needs it.
+- **KV blocks** live in three tiers: VRAM, then pinned host RAM, then disk on
+  `/main-storage` (the ZFS pool). That pool is a mirror of two 4 TB 5400 rpm
+  HDDs (WD40EZRZ) with NVMe only as special vdev, log and L2ARC (an earlier
+  version of this note said NVMe; the measured load speed, 160-205 MB/s, is
+  the HDDs'; see "Disk-tier loads and host memory"). They are evicted by LRU
+  with prefix-aware refcounts, so a parent can't go while a live child needs
+  it.
 - **GDN snapshots** are only taken where they pay off. The recurrent state can't
   be rebuilt from KV, so a hit needs a snapshot at the exact hit boundary.
   Snapshots are taken at the end of every prompt, at the end of every generated
@@ -544,9 +548,32 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          loads, which are what long prompts often start with. Now it goes a chunk at a time,
          yields when a request arrives, and prompts that fit whole in a piece go first
          (`server/tests/test_prefill_order.py`)
-   - [ ] decode slows during a disk-tier load: steps ~300 ms instead of ~22 ms while 8.6 GB
-         loads (requests at 2.6-12.6 tok/s instead of ~65); suspects: pinning new arenas, page
-         cache pressure from the reads. To measure on the dev box
+   - [~] decode slows during a disk-tier load: steps ~300 ms instead of ~22 ms while 8.6 GB
+         loads (requests at 2.6-12.6 tok/s instead of ~65). Re-checked 2026-10-01 against the
+         production log since the fp8 deploy (analysis below, "Disk-tier loads and host memory"):
+         the one window with a load and running requests had 83 ms/step (0.3 GB load); the
+         multi-second decode stalls in that log (5 windows over 500 ms/step, up to 3.6 s) have
+         no load running. Found and fixed on the way: the pinned pool could leave a caller
+         waiting forever (see next item), a hit that needs nothing from disk was held up by a
+         load running for another prompt, and the load log now says where the time goes.
+         Still to measure on the dev box (needs a GPU window): `tests/gpu/test_disk_load`, then
+         decode steps during a load with and without the changes
+   - [x] pinned pool: `get()` could wait forever. A caller woken after another took the arena's
+         units went back to sleep without asking for another arena, and `put()` never woke a
+         waiting `get()`; with the scheduler and a load thread both taking buffers this left a
+         load (or a save) waiting until some other allocation happened, which can look like a
+         disk load taking 14 s for 0.3 GB (2026-09-28 18:02). `tests/gpu/test_pinned_pool`
+         (8 threads) hangs on the old code and passes 120 of 120 runs now. Emptied arenas are
+         also unpinned by the pool's thread instead of inside `put()` (on the scheduler thread,
+         under the pool's lock), and a pin or free that takes over 0.5 s is logged
+   - [x] `BlockStore::load`: a hit whose entries are all in RAM returns at once even while a
+         load runs for another prompt (before: every hit read as "loading" until that load
+         was attached, so a RAM-resident prompt waited out someone else's 20-40 s disk read; no
+         such case in the production log since 2026-09-28, where requests are mostly alone).
+         The load log line now gives the RAM cache, the pinned arenas, the disk writes queued,
+         and, at the end, MB/s and the thread time spent getting pinned buffers and reading
+   - [~] `QW_LOAD_THREADS` (default 1): load threads reading a load's files in parallel. A
+         two-HDD mirror can serve two streams; to measure (needs files colder than the ARC)
    - [x] KV slots 256k + 128k + 64k + 32k in production: 4096-token prefill chunks
          (`QW_PREFILL_CHUNK`) free ~0.9 GB per card of prefill buffers for the 64k slot
          (prefill -2%); ~1.1 GB per card stays free
@@ -604,7 +631,11 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          memory pressure (swap 6 of 7 GB used) is also the likely cause of decode slowing to
          ~300 ms/step during disk loads: pinning has to reclaim first. Done 2026-09-28: the
          two LMCache servers stopped (host available 61 -> 109 GB), host cache 128 -> 96 GB
-         until the fp8 table is in (then ~170 GB)
+         until the fp8 table is in (then ~170 GB). Third kill 2026-10-01 01:54 with the fp8
+         table and the 160 GB cache: the engine had 159 GiB anonymous (the cache full) plus
+         the 47.7 GiB table, the `lmcache` incus container was running again (16.8 GiB), page
+         cache down to 8 MB, 0.55 GB free on a 251 GiB host. Open: lower `--host-cache-gb`
+         (128 leaves ~35 GB of headroom), stop the `lmcache` container again; see the analysis
    - [x] `scripts/prod-idle-unload.sh` also asks the engine: llama-swap's /api/metrics lists
          finished requests only, so a request in flight for over 60 s looked idle and an
          unload cut it off (502, 2026-09-28 00:46)
@@ -660,6 +691,150 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          M = 8), so int8 stays off
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
+
+## Disk-tier loads and host memory (analysis 2026-10-01)
+
+Question: why do requests slow down while a KV block is loading from disk, and
+how to fix it. Everything below is from the production log since the fp8
+deploy (`journalctl -t qw`, 2026-09-28 02:30 to 2026-10-01 17:00: 938 stats
+windows, 587 requests, 9 disk loads) and read-only looks at the host.
+
+**Where the cache lives.** `/cache` in the engine's docker container is a
+docker volume inside the `llm-backend-amd` incus container, whose root is the
+ZFS dataset `main-storage/incus/llms` (lz4, 128K records) on pool
+`main-storage`: a mirror of two WD40EZRZ HDDs, 87% full (frag 9%), with a
+3-way NVMe special mirror, a mirrored NVMe SLOG and two NVMe L2ARC partitions
+(1.08 TB cached, 4.5 M L2ARC hits). `l2arc_noprefetch=1`, so ZFS's
+read-ahead of a streamed file is never served from the L2ARC (arcstats:
+prefetch data 115 k hits, 3.0 M misses). The dev box's root is the same
+dataset. The ARC is uncapped (`zfs_arc_max=0`: all RAM), 43 GB now.
+
+**How fast loads are** (all 9 loads in the window; 285 entries = 6.2 GB):
+
+| load | entries | size | time | rate |
+|---|---|---|---|---|
+| 09-28 15:30 | 1 | 0.1 GB | 0.57 s | 0.2 GB/s |
+| 09-28 18:02 | 12 | 0.3 GB | **14.3 s** | 21 MB/s |
+| 09-30 01:19 | 33 | 0.8 GB | 0.46 s | 1.7 GB/s (ARC) |
+| 10-01 01:37 | 14 | 0.3 GB | 0.19 s | 1.6 GB/s (ARC) |
+| 10-01 02:36 | 285 | 6.2 GB | 38.5 s | 161 MB/s |
+| 10-01 03:37 | 201 | 4.4 GB | 21.4 s | 205 MB/s |
+| 10-01 09:00 | 33 | 0.8 GB | 0.64 s | 1.3 GB/s (ARC) |
+| 10-01 09:00 | 4 | 0.1 GB | 0.05 s | ARC |
+
+Cold loads run at an HDD's streaming speed, about 1.7 times faster than
+recomputing the same tokens (a 256-token block is 21.8 MB, 136 ms at 160 MB/s,
+against ~250 ms of prefill at ~1,000 tok/s); what is in the ARC loads at GB/s.
+The 12-entry load that took 14 s is the outlier: 0.3 GB cannot take that long
+at any disk speed, and it ran during a prefill-heavy minute (prompt 700-900
+tok/s, so a stream of saves being written to the same two spindles) with
+three other requests in flight. Two candidate causes, not separated by this
+log: the writes (a reader and a writer on two HDDs), and the pinned pool's
+lost wakeup (fixed above). The new load log line splits the time into pinned
+buffers and reading, which will tell.
+
+**Which requests wait for a load.** The request that needs it: 6.2 GB took 40.5 s
+TTFT, 4.4 GB 50 s (21 s load + 31.8k tokens prefilled at ~1,000 tok/s). A
+request whose prompt was cached in RAM and arrived meanwhile would have waited
+too (single-slot `load()`, fixed above); no request in the window did.
+
+**Decode step time by situation** (stats windows, median ms/step):
+
+| windows | n | median | p90 | max |
+|---|---|---|---|---|
+| nothing loading, nothing prefilling | 911 | 27.9 | 35.6 | 3,632 |
+| a prefill running | 26 | 28.5 | 58.4 | 390 |
+| a disk load running | 1 | 83.5 | | |
+
+So in this window of the log a load slowed decode once (3x, a 0.3 GB load) and
+there is no sample of the 6 GB loads that happened to run next to decoding. The
+multi-second stalls are not loads: 3,633 ms/step (09-29 01:31, one request
+decoding, no load), 2,741 (09-28 17:55), 890, 589, 513 ms. Host correctable
+PCIe errors (AER BadTLP on the GPU's upstream port 83:00.0 and root port 80:03.1,
+110-250 events per day) overlap two of them (09-28 17:41, 09-29 00:00) and not
+the others. The earlier 300 ms/step with an 8.6 GB load was measured under the
+bf16 table, when the host was swapping and being OOM-killed.
+
+**The 32.5 s image encode** (09-27 19:06, 1,501 tokens, normally ~0.5 s): it
+started right after a 1.4 GB disk load finished (19:05:58), on the bf16
+configuration that was OOM-killed twice that day. The host kernel log has no
+GPU reset, ring timeout or eviction message in that minute. Unexplained; the
+same class as the decode stalls, a stall of the whole process.
+
+**Host memory: the third OOM kill (2026-10-01 01:54).** The kernel's report
+(constraint none: the host itself was out): anonymous 180 GiB (the engine's
+159 GiB: the cache at its 160 GB budget, plus Python and staging), unevictable
+47.7 GiB (the mlocked fp8 table), page cache 8 MB, free 0.55 GB, all four
+NUMA nodes under their watermarks. `lmcache` (incus container, 16.8 GiB, back
+in `incus list` although 09-28 stopped it) and the other containers hold the
+rest. The sum is ~233 GiB plus kernel and ZFS on a 251 GiB host: the 160 GB
+budget does not fit next to the table and the other tenants. An OOM kill
+empties the RAM tier, so the next requests load from the HDDs: the 02:36
+request (40 s TTFT) came after this kill; the process that is running now
+started at ~14:00 with the cache empty again.
+
+What the accounting misses (budget = bytes held by nodes): a load takes its
+pinned buffers before `finish_load` evicts, a prefill pins ahead for all its
+saves (`reserve`: ~8 GB for a 100k-token prompt), the buffers of evicted
+nodes stay pinned until their disk write finishes (a 100k-token prefill
+produces ~14 GB of files at ~140 MB/s, an HDD mirror's write speed), and an
+arena is only unpinned when completely empty. So the pinned total runs above
+the budget by several GB at the worst times. Setting the budget with that
+slack in mind: engine anonymous ~ budget + 11 GB observed.
+
+**Changed (this commit):** the pool fixes, `load()` per-hit needs, the load
+log, `QW_LOAD_THREADS`, `tests/gpu/test_pinned_pool`, `test_disk_tier`,
+`test_disk_load`. Not changed: production settings and the host (below).
+
+**Recommended, in order of effect:**
+
+1. Host cache 160 -> 128 GB (`--host-cache-gb` in llama-swap's qw command): at
+   the observed slack the engine then tops out near 140 GB + 51 GB table,
+   ~35 GB under the host. Stop the `lmcache` container (16.8 GiB).
+2. Make streamed reads eligible for the L2ARC: `l2arc_noprefetch=0` (module
+   parameter, runtime-settable; modprobe.d to keep). Whether the cache files
+   are in the L2ARC is not known; with 1 TB cached and 640 GB written to it
+   they may well be. Test: restore a cache file written in the last hours and
+   watch `l2_hits` / `zpool iostat -v`.
+3. Put the disk tier on NVMe (a dataset or filesystem on the NVMe devices the
+   L2ARC uses; `--disk-cache-dir`): a cold 6 GB load would take ~3 s, not 38,
+   and the writer stops competing with loads for two spindles. The cache is
+   disposable, so no redundancy is needed.
+4. Engine: bound the pinned total (count in-flight loads, reserve-ahead and
+   queued writes in the budget; evict before a load pins), evaluate pausing
+   the writer during a load, and a recompute-vs-load choice from the measured
+   disk speed. All need a GPU window to measure.
+
+## Vision: where image time goes (2026-10-01)
+
+CPU preprocessing in the server (`server/qwserve/vision.py`, PIL + numpy,
+off the event loop) for a 1080p screenshot to 1920x1088 (2,040 tokens, 50 MB of
+fp32 patches), measured on a Ryzen 5 9600X (the server's EPYC is slower per
+thread): decode 3-24 ms (JPEG 3.5, PNG 13-24), bicubic resize 6.5-18,
+normalize 15.5, two-frame copy 2.4, patchify 7.3, sha256 digest 21, total
+56-90 ms against 1.23 s of vision tower on one card (720p: 26 ms against
+0.34 s). Inside `VisionEncoder::encode` the scalar fp32 to fp16 conversion of
+the 12.5 M patch values takes 41 ms on the same CPU, before the first kernel
+starts. So the tower is the cost, not the Python. Facts that bound the options:
+
+- attention is ~80% of the tower at ~20% of the packed-dot peak (the
+  roadmap's register-blocked redesign: at 50% the 1080p tower would take
+  ~0.7 s);
+- a single image uses one card of four; the encode is synchronous on the
+  scheduler thread, so every other request waits for it (1.2 s per 1080p
+  image, longer for several slices or a video);
+- `comm.hpp` already has an all-gather: a sequence-parallel encode (each card
+  takes a quarter of the rows through the GEMMs and the queries, K and V
+  gathered per layer, 9.4 MB per card per layer at 1080p) should cut a single
+  1080p image to ~0.45 s with identical attention results; an estimate, not a
+  measurement;
+- the first image of a size allocates the workspace (~330 MB per card at
+  1080p, with a `hipFree` that waits for the device).
+
+Open, in the order I would try them (all need the GPUs): the attention kernel,
+the sequence-parallel single-image encode, layer-sliced encoding between
+decode steps so other requests are delayed by ~50 ms rather than ~1.2 s, a
+vectorized fp16 conversion.
 
 ## PLE n-gram table precision: int4, int8 or bf16 (2026-09-27)
 

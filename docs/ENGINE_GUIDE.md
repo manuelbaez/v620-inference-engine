@@ -170,8 +170,8 @@ Speed figures are single-stream decode unless stated.
 | Interleaved prefill | long prompts go in pieces between decode steps; short prompts go first, and a lone long prefill yields to arrivals | longest stall 12.4 -> 1.15 s; decoders keep ~22 tok/s | none | piece 2048, decode share 0.25 | same | `QW_PREFILL_PIECE`, `QW_DECODE_SHARE` |
 | KV slots | sequences held at once, each with a KV capacity | more slots = more concurrency | none | 262144,65536,32768,32768 | **262144,131072,65536,32768** | `QW_SLOTS` / `--slots` |
 | Prefix cache, VRAM | reuse a slot's own history and snapshots | skips prefill of reused tokens | none (exact) | on | on | |
-| Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 160 GB (host RAM; see Host RAM below) | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
-| Prefix cache, disk | blocks and snapshots survive restarts | 4k tokens restored in 0.55 s after restart | none (exact) | 200 GB | 200 GB (`/cache` volume) | `--disk-cache-dir`, `--disk-cache-gb` |
+| Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 160 GB, which the host did not hold (OOM kill 2026-10-01); 128 GB recommended (see Host RAM below) | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
+| Prefix cache, disk | blocks and snapshots survive restarts | 4k tokens restored in 0.55 s after restart (dev box); production's cache is on a 2-HDD ZFS mirror: cold loads 160-205 MB/s, 4-6 GB in 21-38 s, ARC-resident GB/s | none (exact) | 200 GB | 200 GB (`/cache` volume, ZFS on HDDs) | `--disk-cache-dir`, `--disk-cache-gb` |
 | Snapshot spacing | captures at chat message starts at least N apart | | none | 1024 | 1024 | `QW_SNAP_MIN_GAP` |
 | MTP speculative decoding | drafts up to K tokens, verified exactly | 67 -> 107-112 tok/s (Qwen sampling) | none (exact sampling) | K = 5 | 5 | `--mtp` (0 off) |
 | Adaptive draft count | K per request from its running acceptance | avoids drafting that does not pay | none | on | on | `QW_SPEC_BASE`, `QW_SPEC_COST` |
@@ -191,7 +191,7 @@ Speed figures are single-stream decode unless stated.
 
 | Logs | stats line every N s while busy, one line per request, errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
 | Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
-| Background disk loads | a prompt whose cache is on disk waits while a thread reads it into RAM; others keep running | removes a ~54 s stall per 97k-token disk restore | none | on | on | |
+| Background disk loads | a prompt whose cache is on disk waits while threads read it into RAM; others keep running, including prompts whose cache is all in RAM | removes a ~54 s stall per 97k-token disk restore | none | on, 1 thread | on, 1 thread | `QW_LOAD_THREADS` (parallel file reads, to be measured) |
 
 Diagnostics: `QW_TRACE` (step phase timings, sampling fallbacks), `QW_PROFILE`
 (prefill timings), `QW_GUARD` (allocation guard zones), `QW_NOGRAPH`.
@@ -260,10 +260,24 @@ from that.
    chat message starts (`<|im_start|>`) at least 1,024 tokens apart, at chunk
    ends and at the prompt end. Pinned host memory comes from ~250 MB arenas
    pinned in the background while the GPUs prefill (pinning on demand stalled
-   prefill 0.2-0.4 s). LRU eviction; budget 128 GB.
+   prefill 0.2-0.4 s), and unpinned by the pool's thread once empty (never in
+   the caller). The pool must serve several callers at once (the scheduler's
+   saves and the disk-load threads): a caller that wakes to find the arena's
+   units taken has to ask again, and a returned unit has to wake a waiting
+   caller, or a request waits forever (found 2026-10-01). LRU eviction;
+   budget 128 GB. The budget counts what nodes hold: loads, saves' reserved
+   buffers and buffers still waiting for their disk write come on top (observed
+   ~11 GB at 160 GB).
 3. **Disk** (`src/session/disk_tier.cpp`): every block and snapshot is also
    written to a file by a background thread; the index is rebuilt at startup;
    the server persists every slot's newest snapshot at shutdown. Budget 200 GB.
+   Loads run on threads (`QW_LOAD_THREADS`, default 1) into pinned buffers
+   they take themselves, one load at a time; a prompt whose entries are all in
+   RAM is never held up by another prompt's load. Speed is the medium's: on
+   production's two-HDD mirror a cold load streams at 160-205 MB/s (1.7x
+   faster than recomputing, and the HDDs are shared with the cache writer);
+   fast storage for `--disk-cache-dir` is the largest lever. The load log line
+   splits time into pinned buffers and reading.
 
 **Measured:** a second conversation sharing a 12k-token system prompt: 6.1 ->
 0.34 s. Restore of 4k tokens: 0.02 s from RAM, 0.55 s from disk after a
@@ -446,10 +460,14 @@ fetches that row's full logits (~1 row in 10,000 in real text).
   reads part of them from disk again (~120 s instead of ~60 s with int8). The
   limit that matters is the host's (251 GB, shared with other services): the
   host OOM killer took the engine twice when everything together passed it.
-  Production now runs the fp8 table (51.2 GB) with a 160 GB cache, and the
-  LMCache servers for vLLM (32 + 17 GB) are stopped. Budget = host RAM - table
-  - ~10 GB engine - other services - margin, where the margin also covers a
-  disk-tier load (up to ~9 GB taken before the budget is enforced).
+  Production runs the fp8 table (51.2 GB) with a 160 GB cache, and it was
+  OOM-killed a third time on 2026-10-01 (the cache full: engine 159 GiB
+  anonymous + 47.7 GiB table + the `lmcache` container back at 16.8 GiB + other
+  services on 251 GiB; page cache 8 MB). 128 GB is the recommended budget.
+  Budget = host RAM - table - ~11 GB engine - other services - margin, where
+  the margin also covers a disk-tier load (up to ~9 GB taken before the budget
+  is enforced). A kill empties the RAM tier, so the next requests load from
+  the disk tier. Inside the engine's container `/proc/meminfo` is the host's.
 - **Readiness:** the engine reports ready (and the server answers `/health`)
   only after the table is in RAM; before, a cold start served requests while
   rows still came from disk (warmup 28-35 s instead of ~5 s).
