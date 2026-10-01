@@ -92,7 +92,9 @@ class ChatPrompt:
     default_budget = -1       # thinking tokens, -1 unlimited (--thinking-budget)
 
     def encode(self, text):
-        return self.tok.encode(text, add_special_tokens=False).ids
+        # encode_batch gives the same ids but releases the GIL for the whole call; encode does not,
+        # so on a worker thread only this keeps the event loop free (a 100k-token prompt takes ~0.1 s)
+        return self.tok.encode_batch([text], add_special_tokens=False)[0].ids
 
 
 # reasoning_effort values of the OpenAI / vLLM APIs onto this template's levels (low, medium, xhigh)

@@ -51,6 +51,19 @@ class Server:
     def encode(self, text):
         return self.prompt.encode(text)
 
+    async def offload(self, fn, *args):
+        """Runs fn(*args) on a worker thread. Rendering the chat template and tokenizing a 100k-token
+        prompt take 80-250 ms, and done on the event loop every stream stalls meanwhile."""
+        return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+    async def prepare(self, body):
+        """The chat request's template and tokens, off the event loop: (thinking, tools,
+        think_budget, prompt_ids)."""
+        def work():
+            text, thinking, tools, think_budget = self.render(body)
+            return thinking, tools, think_budget, self.encode(text)
+        return await self.offload(work)
+
     # --- generation
     async def media(self, body, prompt_ids):
         """Decodes and preprocesses the request's images and videos (off the event loop) and
@@ -112,11 +125,11 @@ class Server:
 
     async def tokenize(self, request):
         body = await request.json()
-        if "messages" in body:
-            text, _, _, _ = self.render(body)
-        else:
-            text = body.get("prompt", "")
-        ids = self.encode(text)
+
+        def work():
+            text = self.render(body)[0] if "messages" in body else body.get("prompt", "")
+            return self.encode(text)
+        ids = await self.offload(work)
         return web.json_response({"count": len(ids), "max_model_len": int(self.engine.max_tokens), "tokens": ids})
 
     def _stop_strings(self, body):
@@ -130,10 +143,9 @@ class Server:
         if int(body.get("n") or 1) != 1:
             return web.json_response({"error": {"message": "n > 1 is not supported", "type": "invalid_request_error"}}, status=400)
         try:
-            text, thinking, tools, think_budget = self.render(body)
+            thinking, tools, think_budget, prompt_ids = await self.prepare(body)
         except (jinja2.exceptions.TemplateError, ValueError) as e:
             return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
-        prompt_ids = self.encode(text)
         try:
             prompt_ids, media = await self.media(body, prompt_ids)
         except (ValueError, OSError) as e:
@@ -269,7 +281,7 @@ class Server:
         if isinstance(prompt, list) and prompt and isinstance(prompt[0], int):
             prompt_ids = prompt
         elif isinstance(prompt, str):
-            prompt_ids = self.encode(prompt)
+            prompt_ids = await self.offload(self.encode, prompt)
         else:
             return web.json_response({"error": {"message": "prompt must be a string or a token list"}}, status=400)
         rid = "cmpl-" + uuid.uuid4().hex
