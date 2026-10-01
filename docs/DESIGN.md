@@ -708,6 +708,14 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          M = 8), so int8 stays off
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
+   - [ ] disk-tier write volume (the tier is moving to an SSD; measured 2026-10-01, section "Disk-tier
+         write volume"): tens of GB/day (bound: 42 GB/day from the 4.7-day turnover); snapshots are
+         47% of the bytes and ~80% of them were never restored from. Open, in order: a bytes-written
+         counter; store the replicated rank pairs of a block once (-26.5% of all bytes, bit exact,
+         56 of 56 blocks checked); a disk snapshot policy (skip a prompt-end snapshot next to a
+         capture: -10% of snapshot bytes at no measured cost; hold writes back and keep one per
+         >= 4,096 tokens plus chain ends: -55% for ~0.05 s of extra prefill per request); byte
+         shuffle + zstd-1 (-41% together with the pairs); a daily write cap
 
 ## Disk-tier loads and host memory (analysis 2026-10-01)
 
@@ -821,6 +829,119 @@ log, `QW_LOAD_THREADS`, `tests/gpu/test_pinned_pool`, `test_disk_tier`,
    queued writes in the budget; evict before a load pins), evaluate pausing
    the writer during a load, and a recompute-vs-load choice from the measured
    disk speed. All need a GPU window to measure.
+
+## Disk-tier write volume (SSD endurance; measured 2026-10-01)
+
+Question: the disk tier is moving to an SSD, how to write less. The engine does
+not count bytes written, so this comes from the cache directory (6,075 files),
+the production log (`journalctl -t qw`, 09-27 to 10-01, 989 requests) and
+sampled files, all read-only. Nothing below is implemented yet.
+
+**What is on disk** (199.9 GB; the 200 GB budget is full):
+
+| | files | GB | share | file size |
+|---|---|---|---|---|
+| blocks (`.qwb`) | 5,332 | 106.1 | 53% | 21.3 MB full; 656 partial leaves, 6.5 GB (mean 9.9 MB) |
+| snapshots (`.qws`) | 743 | 93.8 | 47% | 125.7 MB (327 captures), 126.7 MB (416 with logits) |
+
+A snapshot is the bytes of six blocks (1,536 tokens of KV): 12% of the files,
+47% of the bytes. The oldest last-use time is 4.7 days ago, so the full tier
+turns over about every 4.7 days: surviving writes are at most 200 GB / 4.7 d =
+**42 GB/day (15 TB/year)**. The log's fresh prefill (prompt minus cached: 0.2 to
+1.0 M tokens/day, 0.60 M mean over the three full days) bounds the blocks at 50
+GB/day, plus the snapshots; it overcounts, because known content prefilled again
+is in it. Both say tens of GB per day, which a 1 TB TLC drive rated 600 TBW
+survives for decades. What matters for an SSD is the worst case (a batch of
+100k-token prompts writes ~14 GB each) and write amplification on a nearly full
+drive, not the average.
+
+**Reads, for comparison.** 116 GB were read from the tier in the same window,
+93 GB of it on 09-27/28 (restarts and replay experiments); 09-29 and 09-30 read
+0.8 GB. Reads follow a restart or an OOM kill, when the RAM tier is empty, and
+are for conversations that are still active.
+
+**Free: the four ranks hold two copies.** In 56 of 56 sampled blocks (10
+partial) rank 0 equals rank 1 and rank 2 equals rank 3 byte for byte, and rank
+0 differs from rank 2: two KV heads on four cards (Parallelism: "KV head
+replicated on 2 cards each"). The 8 sampled snapshots have no equal pair (the
+recurrent state is sharded). Storing each pair once removes half of every block
+file: -26.5% of all bytes, and a cold block load reads half as much. With a
+`memcmp` guard a pair that ever differs is stored whole, and the compare is
+also a cheap check of the two replicas against each other.
+
+**Lossless compression** (zstd on real files, one thread, sizes relative to
+the file):
+
+| data | lz4 | zstd-1 | byte shuffle + zstd-1 | speed of shuffle + zstd-1 |
+|---|---|---|---|---|
+| block, four ranks as written | 0.995 | 0.84 | 0.805 (zstd-3: 0.757) | |
+| block, one copy of each pair | | 0.420 | 0.401 (zstd-3: 0.379) | 1.1 GB/s compress, 1.8 GB/s decompress |
+| snapshot | 0.99-1.00 | 0.90-0.91 | 0.80-0.81 (4-byte lanes) | 1.2 GB/s, 1.9-2.0 GB/s |
+
+lz4, the dataset's setting, saves nothing on this data. Inside a block's rank
+buffer: K and V 32% each (shuffled zstd 0.855), the fp32 raw indexer keys 32%
+(0.46: their values are exactly representable in fp16, all 425,984 in each of
+two sampled blocks), the compressed indexer keys 4% (0.885). Pairs plus
+shuffled zstd-1: blocks x0.40, snapshots x0.80, **199.9 GB -> ~118 GB (-41%)**,
+bit exact.
+
+**Which snapshots are used.** 416 snapshots carry logits (prompt ends and
+prefill chunk ends, 52.5 GB) and 327 are boundary captures (41.3 GB: at
+`<|im_start|>`, at least 1,024 tokens apart); 656 sit on a partial-block leaf.
+By token prefix, 636 (80.3 GB, 86%) were continued by a later snapshot of the
+same chain (median distance to it 1,077 tokens; one conversation left 71) and
+107 are the end of their chain. Matching the log's restore positions (792
+restores; 854 requests with a cached prefix) to snapshot positions, only
+106-140 of the 743 sit at a position that was restored from (11-12% of the
+captures, 17-24% of the logits snapshots): 603-637 snapshots, 76-80 GB, 38-40%
+of the whole tier, were not read in the up to 4.7 days they have lived. A cached
+prefix equal to an earlier prompt's length: 156 requests; 5 tokens short of it:
+67 (consistent with the chat template dropping `<think>` from the history turn,
+so the next prompt diverges there and the boundary capture is its deepest
+snapshot; not checked against the prompts).
+
+Policies on that structure: a request restores from the deepest kept snapshot
+on its path, every position the log shows in use is charged the distance to the
+nearest kept ancestor at 2,100 tok/s, and a snapshot dropped from the disk is
+taken as unavailable (pessimistic: the RAM tier would serve most of these):
+
+| disk policy | snapshots | GB | saved | extra prefill over 989 requests |
+|---|---|---|---|---|
+| all (today) | 743 | 93.8 | | |
+| skip the prompt-end snapshot when a capture is <= 16 tokens before it | 669 | 84.4 | 10% | 0 |
+| chain ends + one per >= 4,096 tokens | 335 | 42.3 | 55% | 113 k tokens, 54 s (0.05 s/request) |
+| chain ends + one per >= 8,192 tokens | 242 | 30.5 | 67% | 303 k tokens, 144 s (0.15 s/request) |
+| chain ends + one per >= 16,384 tokens | 186 | 23.5 | 75% | 774 k tokens, 369 s (0.37 s/request) |
+| chain ends only | 144 | 18.2 | 81% | 3.7 M tokens, 1,773 s (1.8 s/request) |
+
+"Chain ends" are the deepest snapshot of a chain and those within 16 tokens
+before it. As a write policy this needs writes held back: a snapshot goes to
+disk when its chain has been idle for a while, when the RAM tier evicts it, or
+at shutdown, and is dropped when a later snapshot of the chain arrives first
+and is not far enough from the last written one; the partial block under a
+dropped snapshot is not written either (6.5 GB of the tier). A crash loses at
+most the held-back snapshots; the RAM tier serves them meanwhile.
+
+**Plan, by value for risk** (none implemented):
+
+1. Count bytes written and evicted (blocks and snapshots) in the stats and the
+   dashboard, and read the SSD's SMART written-bytes counter after a few days:
+   the figures above are bounds.
+2. Store the replicated rank pair of a block once (new magic, old files stay
+   readable, `memcmp` guard): -26.5%, and half the bytes on cold block loads.
+3. Disk snapshot policy: skip a prompt-end snapshot next to a capture (free),
+   then the held-back, thinned write (>= 4,096 tokens apart: -55% of snapshot
+   bytes for ~0.05 s per request, priced pessimistically).
+4. Shuffle + zstd-1 on blocks and snapshots (a libzstd dependency; ~1.8 GB/s
+   decompression per thread, so `QW_LOAD_THREADS` >= 2 on NVMe).
+5. A daily write cap as a guard for batch traffic (blocks before snapshots).
+6. The SSD itself: keep 20-30% of it free or unpartitioned and TRIM it; no
+   mirror (the cache is disposable and a mirror doubles the writes); `atime=off`.
+   The engine writes whole files sequentially and never fsyncs, the easy case.
+   On ZFS: recordsize 1M; lz4 gains nothing here.
+
+Rejected: lossy encodings (fp8 KV, int8 snapshots): a cache hit would give
+different outputs from a miss, and the accuracy rule keeps lossy off.
 
 ## Vision: where image time goes (2026-10-01)
 
