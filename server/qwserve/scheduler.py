@@ -213,7 +213,15 @@ class Scheduler:
             n = len(r.prompt)
             need = r.max_new if r.max_new else self.DEFAULT_RESERVE
             need = max(1, min(need, self.e.max_tokens - n))
-            slot = self.e.acquire(r.prompt, need, r.media)
+            try:
+                slot = self.e.acquire(r.prompt, need, r.media)
+            except Exception as ex:  # noqa: BLE001  a malformed request (media that do not match its prompt) fails alone
+                self.waiting.pop(i)
+                moved = True
+                print(f"request {r.rid}: admission error: {ex}", file=sys.stderr, flush=True)
+                r.emit("error", str(ex))
+                self._finish(r, "abort")
+                continue
             if slot < 0:
                 r.no_slot_at = self.slot_epoch
                 i += 1  # keeps waiting; later ones may fit the free slots
