@@ -22,7 +22,7 @@ OUT=${2:-$HOME/suite-$(date +%m%d-%H%M)-$STAGE}
 mkdir -p "$OUT"
 B=build
 FP8=/mnt/llms/qwen3.8-flash-next-ple/ples_fp8
-ALL="QW_POOL_ARENA=huge QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1"
+ALL="QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1"
 
 run() {  # name timeout_s command...: the log is $OUT/name.log; the exit code and time go to the index
     local name=$1 t=$2
@@ -49,7 +49,6 @@ correctness)
     run kv_replicas 1200 $B/test_kv_replicas
     run block_store_default 1500 $B/test_block_store
     run block_store_pairs 1500 env QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1 $B/test_block_store
-    run block_store_huge 1500 env QW_POOL_ARENA=huge QW_RESERVE_AHEAD=2 $B/test_block_store
     run block_store_noncoherent 1500 env QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 $B/test_block_store
     run block_store_all 1500 env $ALL $B/test_block_store
     run host_tier_all 1500 env $ALL $B/test_host_tier
@@ -63,7 +62,7 @@ pool)
     run comm_engine 900 $B/comm_bench engine 200
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
     run cold_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 2 --host-gb 48 \
-        --configs nostore,old,noncoherent,huge,ahead2,pairs,pairs+check,reserve16,reserve16+ahead2,reserve10+pairs
+        --configs nostore,old,noncoherent,ahead2,pairs,pairs+check,reserve16,reserve16+ahead2,reserve10+pairs
     run cold_100k 5400 $B/cold_prefill_bench --tokens 100000 --reps 2 --host-gb 64 \
         --configs nostore,old,reserve16+ahead2,reserve10+pairs
     ;;
@@ -112,7 +111,7 @@ compute)
     # most valuable first, so that a window cut short still has the answers that decide defaults
     export QW_PLE_DIR=$FP8
     run prefill_pipeline_exact 1500 $B/test_prefill_pipeline
-    # the settings meant to become defaults, through the tier tests (the earlier gate used huge-page arenas)
+    # the settings meant to become defaults, through the tier tests
     NEWDEF="QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1 QW_POOL_KEEP=1 QW_POOL_RESERVE_GB=4 QW_COMM_PUSH2D=1"
     run gate_block_store 1500 env $NEWDEF $B/test_block_store
     run gate_host_tier 1500 env $NEWDEF $B/test_host_tier

@@ -1,8 +1,8 @@
 // Pinned pool alone (one HIP device): units are distinct and keep what is
 // written to them while other threads get and put, emptied arenas are given
 // back by the pool's own thread (not inside put()), and the pool grows again
-// after that. Run for both kinds of arena (hipHostMalloc, and huge-page
-// mappings registered with HIP), whose units must also work as DMA targets.
+// after that. Run for both kinds of arena (hipHostMalloc with default flags and
+// non-coherent), whose units must also work as DMA targets.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -180,7 +180,7 @@ int main() {
         std::abort();
     }).detach();
     int fails = 0;
-    for (auto kind : {PoolOptions::Arena::HostMalloc, PoolOptions::Arena::NonCoherent, PoolOptions::Arena::Huge}) {
+    for (auto kind : {PoolOptions::Arena::HostMalloc, PoolOptions::Arena::NonCoherent}) {
         PoolOptions o;
         o.arena = kind;
         fails += run(PoolOptions::name(kind), o);

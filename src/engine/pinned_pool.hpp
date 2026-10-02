@@ -26,9 +26,9 @@ struct PoolOptions {
     // How an arena is made. HostMalloc: hipHostMalloc with default flags (coherent, fine-grained memory on this
     // stack). NonCoherent (the default): hipHostMalloc with hipHostMallocNonCoherent, cached host memory: the usual
     // choice for staging buffers filled and read between explicit stream syncs, and half the pin cost of the default
-    // flags on the bad days. Huge: an anonymous mapping advised for transparent huge pages and registered with
-    // hipHostRegister: slower than both on this host (compaction fails: 39% of huge-page faults fall back).
-    enum class Arena { HostMalloc, NonCoherent, Huge };
+    // flags on the bad days. (Arenas from an anonymous mapping advised for huge pages and registered with
+    // hipHostRegister were slower than both on this host, where compaction fails: docs/DESIGN.md.)
+    enum class Arena { HostMalloc, NonCoherent };
     Arena arena = Arena::NonCoherent;
     // One arena is pinned at a time in the whole process (a gate shared by every pool): pins hold the process's
     // memory-map lock, so overlapping ones make each other, and every thread that maps memory, wait longer.
@@ -38,7 +38,7 @@ struct PoolOptions {
     // budget evicts whole conversations, whose arenas would otherwise be unpinned and pinned again for the next
     // saves. The pinned total stays at the high-water mark the cache already reached.
     bool keep = false;  // QW_POOL_KEEP=1
-    // QW_POOL_ARENA=malloc|noncoherent|huge (default noncoherent)
+    // QW_POOL_ARENA=malloc|noncoherent (default noncoherent)
     static PoolOptions from_env();
     static const char *name(Arena a);
 };
@@ -73,10 +73,8 @@ private:
     struct Arena {
         uint8_t *base = nullptr;
         std::vector<int> free;  // unit indices
-        size_t map_bytes = 0;   // hugepage arenas: the mapping (registered with HIP), else 0 (hipHostMalloc)
     };
     std::unique_ptr<Arena> new_arena();  // without the lock
-    bool map_arena(Arena &a, size_t bytes) const;
     void free_arena(Arena &a) const;           // without the lock
     void add_arena(std::unique_ptr<Arena> a);  // with the lock held
     void want(size_t n);                       // with the lock held

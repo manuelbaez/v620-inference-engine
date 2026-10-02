@@ -1,7 +1,6 @@
 #include "engine/pinned_pool.hpp"
 
 #include <hip/hip_runtime.h>
-#include <sys/mman.h>
 
 #include <algorithm>
 #include <chrono>
@@ -16,7 +15,6 @@ namespace {
 constexpr double SLOW_ARENA_S = 0.5;  // pinning or freeing an arena slower than this is logged
 constexpr double IDLE_S = 1.5;        // the standing reserve is topped up after this long without a get()
 constexpr int STANDING_GAP_MS = 200;  // ... one arena per this: pins hold the process's memory-map lock
-constexpr size_t HUGE_PAGE = size_t(2) << 20;
 
 double since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -30,14 +28,13 @@ PoolOptions PoolOptions::from_env() {
     if (const char *a = std::getenv("QW_POOL_ARENA")) {
         const std::string v = a;
         if (v == "malloc") o.arena = Arena::HostMalloc;
-        else if (v == "huge") o.arena = Arena::Huge;
-        else if (v != "noncoherent") log("QW_POOL_ARENA=%s is not malloc, noncoherent or huge; using noncoherent", a);
+        else if (v != "noncoherent") log("QW_POOL_ARENA=%s is not malloc or noncoherent; using noncoherent", a);
     }
     return o;
 }
 
 const char *PoolOptions::name(Arena a) {
-    return a == Arena::Huge ? "huge pages" : a == Arena::NonCoherent ? "non-coherent" : "hipHostMalloc";
+    return a == Arena::NonCoherent ? "non-coherent" : "hipHostMalloc";
 }
 
 PinnedPool::PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt)
@@ -57,27 +54,6 @@ PinnedPool::~PinnedPool() {
     for (auto &a : retired_) free_arena(*a);
 }
 
-// An arena as a 2 MB-aligned anonymous mapping, advised for huge pages and registered with HIP. False (nothing
-// left behind) when the mapping or the registration fails; the caller then falls back to hipHostMalloc.
-bool PinnedPool::map_arena(Arena &a, size_t bytes) const {
-    const size_t len = (bytes + HUGE_PAGE - 1) / HUGE_PAGE * HUGE_PAGE;
-    void *m = mmap(nullptr, len + HUGE_PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (m == MAP_FAILED) return false;
-    auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(m) + HUGE_PAGE - 1) & ~(HUGE_PAGE - 1));
-    auto *end = base + len, *map_end = static_cast<uint8_t *>(m) + len + HUGE_PAGE;
-    if (base > m) munmap(m, size_t(base - static_cast<uint8_t *>(m)));  // the slack around the aligned range
-    if (map_end > end) munmap(end, size_t(map_end - end));
-    (void)madvise(base, len, MADV_HUGEPAGE);
-    if (hipHostRegister(base, len, hipHostRegisterPortable) != hipSuccess) {
-        (void)hipGetLastError();
-        munmap(base, len);
-        return false;
-    }
-    a.base = base;
-    a.map_bytes = len;
-    return true;
-}
-
 std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
     static std::mutex gate;  // shared by every pool (PoolOptions::serial)
     std::unique_lock<std::mutex> turn(gate, std::defer_lock);
@@ -86,9 +62,7 @@ std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
     auto a = std::make_unique<Arena>();
     CK(hipSetDevice(device_));
     const size_t bytes = unit_ * size_t(per_arena_);
-    if (opt_.arena == PoolOptions::Arena::Huge && map_arena(*a, bytes)) {
-        // mapped and registered
-    } else if (opt_.arena == PoolOptions::Arena::NonCoherent) {
+    if (opt_.arena == PoolOptions::Arena::NonCoherent) {
         void *p = nullptr;
         CK(hipHostMalloc(&p, bytes, hipHostMallocNonCoherent));
         a->base = static_cast<uint8_t *>(p);
@@ -102,21 +76,14 @@ std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
         ++stats_.pins;
         stats_.pin_s += s;
     }
-    if (s > SLOW_ARENA_S)
-        log("pinned pool (device %d): pinning a %.0f MB arena took %.2f s%s", device_, double(bytes) / 1e6, s,
-            a->map_bytes ? " (huge pages)" : "");
+    if (s > SLOW_ARENA_S) log("pinned pool (device %d): pinning a %.0f MB arena took %.2f s", device_, double(bytes) / 1e6, s);
     return a;
 }
 
 void PinnedPool::free_arena(Arena &a) const {
     const auto t0 = std::chrono::steady_clock::now();
     (void)hipSetDevice(device_);
-    if (a.map_bytes) {
-        (void)hipHostUnregister(a.base);
-        munmap(a.base, a.map_bytes);
-    } else {
-        (void)hipHostFree(a.base);
-    }
+    (void)hipHostFree(a.base);
     if (const double s = since(t0); s > SLOW_ARENA_S)
         log("pinned pool (device %d): freeing a %.0f MB arena took %.2f s", device_,
             double(unit_ * size_t(per_arena_)) / 1e6, s);

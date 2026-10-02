@@ -16,6 +16,7 @@ constexpr int FLAG_STRIDE = 16;  // uint32 per flag slot (64 bytes)
 constexpr long SPIN_LIMIT = 1L << 26;
 constexpr size_t BLOCK_BYTES = 64 * 1024;  // push payload per block
 constexpr int MAX_BLOCKS = 64;
+constexpr int PUSH2D_MIN_ROWS = 64;  // below this (decode's few rows) the row-block push stays: nothing to gain
 
 void ck(hipError_t e, const char *what) {
     if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled)
@@ -204,7 +205,7 @@ __global__ __launch_bounds__(256) void exchange_small_kernel(PushArgs pa, RecvAr
 
 Comm::Tuning Comm::Tuning::from_env() {
     Tuning t;
-    t.push2d = std::getenv("QW_COMM_PUSH2D") && std::atoi(std::getenv("QW_COMM_PUSH2D")) != 0;
+    if (const char *e = std::getenv("QW_COMM_PUSH2D")) t.push2d = std::atoi(e) != 0;
     return t;
 }
 
@@ -286,7 +287,7 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     static const size_t flat_min =
         std::getenv("QW_COMM_CONCURRENT_MAX") ? size_t(std::atol(std::getenv("QW_COMM_CONCURRENT_MAX"))) : 32768;
     const bool flat = flat_ok && rows > 1 && src_row_stride == row_bytes && bytes > flat_min;
-    pa.rows2d = tune_.push2d && !flat && rows > 1 && (row_bytes / 16) < 256;
+    pa.rows2d = tune_.push2d && !flat && rows >= PUSH2D_MIN_ROWS && (row_bytes / 16) < 256;
     pa.rows = flat ? 1 : rows;
     pa.row16 = (flat ? bytes : row_bytes) / 16;
     pa.src_row_stride = src_row_stride;

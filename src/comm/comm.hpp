@@ -53,7 +53,10 @@ public:
     // environment at construction; tests and benchmarks may change it between collectives (every rank must use the
     // same setting for a collective).
     struct Tuning {
-        bool push2d = false;  // QW_COMM_PUSH2D=1: strided or short rows pushed by all threads over a flat (row, column) range
+        // Strided or short rows of many rows (a prefill's reduce-scatter slices and tiny-row all-reduces) pushed by all
+        // threads over a flat (row, column) range: prefill +5.7% at 8k tokens, +7.6% at 16k, decode untouched
+        // (docs/DESIGN.md). QW_COMM_PUSH2D=0 turns it off.
+        bool push2d = true;
         static Tuning from_env();
     };
     void set_tuning(const Tuning &t) { tune_ = t; }
