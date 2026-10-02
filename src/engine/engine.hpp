@@ -56,6 +56,8 @@ public:
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
     int prefill_chunk() const { return opt_.prefill_chunk; }
+    // QW_PREFILL_PIPELINE at construction; tests and benchmarks may change it between prefills
+    void set_prefill_pipeline(bool on) { pipeline_ = on; }
     // Empties a slot (its state is zeroed lazily by the next prefill/decode).
     void slot_reset(int slot);
 
@@ -324,12 +326,23 @@ private:
         bool all_logits = false;         // (one segment)
         bool transfer = false;           // accumulate the GDN transfer (CacheBlend experiment; one segment)
         const int32_t *rope3 = nullptr;  // (t, h, w) rotary positions [T][3] of the chunk (multimodal RoPE; one segment)
+        const float *emb = nullptr;      // [T][H] the chunk's embeddings and fp16 PLE rows (host; read at the job's start)
+        const uint16_t *ple = nullptr;
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16
+    // QW_PREFILL_PIPELINE=1: the next chunk's embeddings and PLE rows are prepared into these on a helper thread
+    // while the GPUs run the current chunk (they depend on the tokens only), instead of between the two
+    std::vector<float> pemb2_;
+    std::vector<uint16_t> pple2_;
+    bool pipeline_ = false;
     std::vector<float> plogits_;  // [T][VOCAB] when all_logits
     std::vector<std::vector<float>> seg_logits_;  // [segments][VOCAB]: after each segment's last row
-    // prefill host side: embeddings and PLE rows of `chunk` (positions from the slot's length) at row0
+    // prefill host side: embeddings and PLE rows of `chunk` into emb / ple at row0. `len` is the slot's length at the
+    // chunk's start and `hist` its last tokens (the n-gram context): explicit, so that the next chunk's can be
+    // prepared before this one is committed. Reads the tokens, the tables and the hasher only.
+    void prefill_inputs(int64_t len, const std::vector<int32_t> &hist, const std::vector<int32_t> &chunk, int row0,
+                        const std::vector<EmbedSpan> &embeds, float *emb, uint16_t *ple) const;
     void prefill_inputs(int slot, const std::vector<int32_t> &chunk, int row0, const std::vector<EmbedSpan> &embeds);
     void prefill_commit(int slot, const std::vector<int32_t> &chunk);  // the slot's host state after its rows
     struct DecodeJob {

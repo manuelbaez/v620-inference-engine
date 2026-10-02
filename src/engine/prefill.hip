@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <vector>
 
 #include "core/common.hpp"
@@ -116,8 +117,8 @@ void Engine::run_prefill_rank(Rank &rk) {
     for (auto &m : mbs) {
         PrefillBuf &b = *m.b;
         for (int t = 0; t < m.T; ++t)
-            std::memcpy(b.h_emb + size_t(t) * SH, pemb_.data() + size_t(m.row0 + t) * H + r * SH, SH * 4);
-        std::memcpy(b.h_ple, pple_.data() + size_t(m.row0) * H, size_t(m.T) * H * 2);
+            std::memcpy(b.h_emb + size_t(t) * SH, pjob_.emb + size_t(m.row0 + t) * H + r * SH, SH * 4);
+        std::memcpy(b.h_ple, pjob_.ple + size_t(m.row0) * H, size_t(m.T) * H * 2);
         CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(m.T) * SH * 4, hipMemcpyHostToDevice, m.s));
         CK(hipMemcpyAsync(b.ple_e, b.h_ple, size_t(m.T) * H * 2, hipMemcpyHostToDevice, m.s));
         m.comm->set_base(r, *m.seq_base, m.s);
@@ -413,28 +414,33 @@ void Engine::run_prefill_rank(Rank &rk) {
 void Engine::prefill_inputs(int slot, const std::vector<int32_t> &chunk, int row0,
                             const std::vector<EmbedSpan> &embeds) {
     const SlotHost &sh = slots_[size_t(slot)];
+    prefill_inputs(sh.len, sh.hist, chunk, row0, embeds, pemb_.data(), pple_.data());
+}
+
+void Engine::prefill_inputs(int64_t len, const std::vector<int32_t> &hist, const std::vector<int32_t> &chunk, int row0,
+                            const std::vector<EmbedSpan> &embeds, float *pemb, uint16_t *pple) const {
     const int T = int(chunk.size());
     for (int t = 0; t < T; ++t) {
         const int32_t tok = chunk[size_t(t)];
         QW_CHECK(tok < VOCAB, "token out of range");
         if (tok < 0) continue;  // a vision token: its row comes from `embeds`
-        for (int j = 0; j < H; ++j) pemb_[size_t(row0 + t) * H + j] = bf16_to_f32(embed_[size_t(tok) * H + j]);
+        for (int j = 0; j < H; ++j) pemb[size_t(row0 + t) * H + j] = bf16_to_f32(embed_[size_t(tok) * H + j]);
     }
     int64_t covered = 0;
-    const int64_t c_start = sh.len;
+    const int64_t c_start = len;
     for (const EmbedSpan &sp : embeds) {
         const int64_t a = std::max(sp.pos, c_start), b = std::min(sp.pos + sp.n, c_start + T);
         for (int64_t p = a; p < b; ++p)
-            std::memcpy(&pemb_[size_t(row0 + p - c_start) * H], sp.rows + size_t(p - sp.pos) * H, H * 4);
+            std::memcpy(&pemb[size_t(row0 + p - c_start) * H], sp.rows + size_t(p - sp.pos) * H, H * 4);
         covered += std::max<int64_t>(0, b - a);
     }
     QW_CHECK(covered == std::count_if(chunk.begin(), chunk.end(), [](int32_t t) { return t < 0; }),
              "prefill: vision tokens without embeddings (or embeddings over text tokens)");
-    auto ids = hasher_.ids_for(sh.hist, chunk);
+    auto ids = hasher_.ids_for(hist, chunk);
     std::vector<float> e(H);
     for (int t = 0; t < T; ++t) {
         ple_->gather(ids[size_t(t)], e.data());
-        for (int j = 0; j < H; ++j) pple_[size_t(row0 + t) * H + j] = f32_to_f16(e[size_t(j)]);
+        for (int j = 0; j < H; ++j) pple[size_t(row0 + t) * H + j] = f32_to_f16(e[size_t(j)]);
     }
 }
 
@@ -480,22 +486,46 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
     double t_inputs = 0, t_job = 0, t_after = 0;
     int chunks = 0;
     const auto t_begin = clk::now();
-    for (size_t c0 = 0; c0 < tokens.size(); c0 += size_t(opt_.prefill_chunk)) {
-        const int T = int(std::min<size_t>(size_t(opt_.prefill_chunk), tokens.size() - c0));
+    std::vector<float> *emb_cur = &pemb_, *emb_next = &pemb2_;
+    std::vector<uint16_t> *ple_cur = &pple_, *ple_next = &pple2_;
+    std::future<void> next_ready;  // the helper thread preparing the next chunk's inputs (QW_PREFILL_PIPELINE)
+    const size_t chunk_size = size_t(opt_.prefill_chunk);
+    for (size_t c0 = 0; c0 < tokens.size(); c0 += chunk_size) {
+        const int T = int(std::min<size_t>(chunk_size, tokens.size() - c0));
         std::vector<int32_t> chunk(tokens.begin() + ptrdiff_t(c0), tokens.begin() + ptrdiff_t(c0) + T);
         const auto t0 = clk::now();
-        pemb_.resize(size_t(T) * H);
-        pple_.resize(size_t(T) * H);
-        prefill_inputs(slot, chunk, 0, embeds);
+        if (next_ready.valid()) {
+            next_ready.get();  // prepared during the previous chunk's job
+        } else {
+            emb_cur->resize(size_t(T) * H);
+            ple_cur->resize(size_t(T) * H);
+            prefill_inputs(sh.len, sh.hist, chunk, 0, embeds, emb_cur->data(), ple_cur->data());
+        }
         const auto t1 = clk::now();
         PrefillSeg sg{slot, sh.len, T, 0, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}};
         for (const Capture &c : captures)
             if (c.pos > sh.len && c.pos <= sh.len + T) sg.captures.push_back(c);
         QW_CHECK(int(sg.captures.size()) <= MAX_CAPTURES, "prefill: too many captures in one chunk");
-        pjob_ = {{std::move(sg)}, T, all, blend_transfer_, rope3 ? rope3->data() + c0 * 3 : nullptr};
+        pjob_ = {{std::move(sg)}, T, all, blend_transfer_, rope3 ? rope3->data() + c0 * 3 : nullptr, emb_cur->data(),
+                 ple_cur->data()};
         if (all) plogits_.assign(size_t(T) * VOCAB, 0.f);
         seg_logits_[0].resize(VOCAB);
         job_ = Job::Prefill;
+        if (pipeline_ && c0 + chunk_size < tokens.size()) {
+            // the next chunk's rows, while the GPUs run this one: its context is this chunk's tokens appended to the
+            // slot's history (as prefill_commit will leave it), its position the slot's length plus this chunk
+            const size_t Tn = std::min<size_t>(chunk_size, tokens.size() - c0 - size_t(T));
+            std::vector<int32_t> next(tokens.begin() + ptrdiff_t(c0) + T, tokens.begin() + ptrdiff_t(c0) + T + ptrdiff_t(Tn));
+            std::vector<int32_t> hist = sh.hist;
+            hist.insert(hist.end(), chunk.end() - std::min<ptrdiff_t>(T, 32), chunk.end());
+            if (hist.size() > 32) hist.erase(hist.begin(), hist.end() - 32);
+            emb_next->resize(Tn * H);
+            ple_next->resize(Tn * H);
+            next_ready = std::async(std::launch::async, [this, len = sh.len + T, hist = std::move(hist), next = std::move(next),
+                                                         &embeds, e = emb_next->data(), p = ple_next->data()] {
+                prefill_inputs(len, hist, next, 0, embeds, e, p);
+            });
+        }
         dispatch();
         const auto t2 = clk::now();
         if (moe_stats_) collect_moe_balance();
@@ -503,6 +533,8 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
         prefill_commit(slot, chunk);
         if (all) all_logits->insert(all_logits->end(), plogits_.begin(), plogits_.end());
         if (after_chunk) after_chunk(sh.len);
+        std::swap(emb_cur, emb_next);
+        std::swap(ple_cur, ple_next);
         t_inputs += ms(t0, t1);
         t_job += ms(t1, t2);
         t_after += ms(t2, clk::now());
@@ -538,6 +570,8 @@ const std::vector<std::vector<float>> &Engine::prefill_batch(const std::vector<S
     pple_.resize(size_t(T) * H);
     PrefillJob job;
     job.T = T;
+    job.emb = pemb_.data();
+    job.ple = pple_.data();
     int row = 0;
     for (const Segment &g : segs) {
         prefill_inputs(g.slot, g.tokens, row, {});

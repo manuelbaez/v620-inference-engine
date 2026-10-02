@@ -2,7 +2,9 @@
 // settings, alternating in one process (each run builds a new Session, so the pinned pools start empty, as after a
 // restart; a freed Session gives its arenas back). Measures what the saves cost the prefill: the same prompt with no
 // store at all is the floor.
-//   cold_prefill_bench [--tokens N=65536] [--reps R=2] [--host-gb G=48] [--configs name,name,...]
+//   cold_prefill_bench [--tokens N=65536] [--reps R=2] [--host-gb G=48] [--hog-gb H=0] [--configs name,name,...]
+// --hog-gb H holds H GB of locked memory during the runs, so that pinning has to find pages in a nearly full host, as
+// on the production box (the PLE table, the cache and the ZFS ARC), instead of in an empty one.
 // Configs (environment of the run): nostore (QW_HOST_CACHE_GB=0), then settings of the store over today's
 // defaults: old, noncoherent, huge, ahead2, ahead4, pairs, pairs+check, huge+ahead2, noncoherent+ahead2,
 // all (huge + ahead2 + pairs), nc+pairs (noncoherent + ahead2 + pairs).
@@ -13,6 +15,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
+
 #include <map>
 #include <string>
 #include <vector>
@@ -46,6 +50,26 @@ static std::vector<int32_t> conversation(int n, uint32_t seed) {
     return v;
 }
 
+// locked memory that takes the host's free pages for the length of the runs
+struct Hog {
+    std::vector<std::pair<void *, size_t>> maps;
+    void take(double gb) {
+        size_t left = size_t(gb * 1e9);
+        while (left) {
+            const size_t n = std::min<size_t>(left, size_t(1) << 30);
+            void *p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) fail("hog: mmap");
+            std::memset(p, 1, n);
+            if (mlock(p, n) != 0) log("hog: mlock of %zu MB failed (RLIMIT_MEMLOCK?); the pages are held unlocked", n >> 20);
+            maps.push_back({p, n});
+            left -= n;
+        }
+    }
+    ~Hog() {
+        for (auto &[p, n] : maps) munmap(p, n);
+    }
+};
+
 struct Config {
     std::string name;
     std::map<std::string, std::string> env;
@@ -78,13 +102,14 @@ static std::vector<Config> all_configs(double host_gb) {
 int main(int argc, char **argv) {
     try {
         int tokens = 65536, reps = 2;
-        double host_gb = 48;
+        double host_gb = 48, hog_gb = 0;
         std::string only;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--tokens" && i + 1 < argc) tokens = std::atoi(argv[++i]);
             else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
             else if (a == "--host-gb" && i + 1 < argc) host_gb = std::atof(argv[++i]);
+            else if (a == "--hog-gb" && i + 1 < argc) hog_gb = std::atof(argv[++i]);
             else if (a == "--configs" && i + 1 < argc) only = argv[++i];
         }
         EngineOptions opt;
@@ -93,6 +118,8 @@ int main(int argc, char **argv) {
         opt.prefill_chunk = std::getenv("QW_PREFILL_CHUNK") ? std::atoi(std::getenv("QW_PREFILL_CHUNK")) : 4096;
         Engine e(opt);
         unsetenv("QW_DISK_CACHE_DIR");
+        Hog hog;
+        if (hog_gb > 0) hog.take(hog_gb);
         std::vector<Config> cfgs = all_configs(host_gb);
         if (!only.empty()) {
             std::vector<Config> keep;
@@ -101,8 +128,8 @@ int main(int argc, char **argv) {
             cfgs = keep;
         }
         const auto prompt = conversation(tokens, 5);
-        std::printf("prompt %d tokens, chunk %d, cache budget %.0f GB, %d reps (order alternates)\n", tokens,
-                    e.prefill_chunk(), host_gb, reps);
+        std::printf("prompt %d tokens, chunk %d, cache budget %.0f GB, %.0f GB of locked memory held, %d reps (order alternates)\n",
+                    tokens, e.prefill_chunk(), host_gb, hog_gb, reps);
         std::printf("%-20s %8s %8s | %6s %8s | %6s %8s | %8s %6s\n", "config", "seconds", "tok/s", "pins", "pin s", "waits",
                     "wait s", "RAM GB", "pairs!");
         std::map<std::string, std::vector<double>> times;
@@ -132,14 +159,16 @@ int main(int argc, char **argv) {
                 std::fflush(stdout);
             }
         };
-        // a throw-away run: kernels, clocks and the allocator are warm for the first measured one
-        {
-            Config w{"warm", {{"QW_HOST_CACHE_GB", "0"}}};
+        // throw-away runs: kernels and clocks are warm, and every kind of arena has been pinned once (the first pin
+        // of a process costs ~0.7 s, which would land on whichever configuration runs first)
+        for (const char *kind : {"malloc", "noncoherent", "huge"}) {
             const auto small = conversation(8192, 9);
             for (const char *k : KNOBS) unsetenv(k);
-            setenv("QW_HOST_CACHE_GB", "0", 1);
-            Session s(e);
+            setenv("QW_HOST_CACHE_GB", "4", 1);
+            setenv("QW_POOL_ARENA", kind, 1);
             e.slot_reset(0);
+            Session s(e);
+            s.set_boundary_token(BOUNDARY);
             const int slot = s.acquire(small, 16);
             s.set_prompt(slot, small);
             s.release(slot);
