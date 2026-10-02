@@ -23,13 +23,13 @@
 namespace qw {
 
 struct PoolOptions {
-    // How an arena is made. HostMalloc: hipHostMalloc with default flags (today's; on some stacks coherent,
-    // fine-grained memory that the GPU reads slowly). NonCoherent: hipHostMalloc with hipHostMallocNonCoherent
-    // (cached host memory). Huge: an anonymous mapping advised for transparent huge pages and registered with
-    // hipHostRegister: 2 MB pages cost the kernel 4-7x less to pin (mlock of 256 MB: 0.15-0.26 s with 4 KB pages,
-    // 0.03-0.05 s with huge pages, on the production host).
+    // How an arena is made. HostMalloc: hipHostMalloc with default flags (coherent, fine-grained memory on this
+    // stack). NonCoherent (the default): hipHostMalloc with hipHostMallocNonCoherent, cached host memory: the usual
+    // choice for staging buffers filled and read between explicit stream syncs, and half the pin cost of the default
+    // flags on the bad days. Huge: an anonymous mapping advised for transparent huge pages and registered with
+    // hipHostRegister: slower than both on this host (compaction fails: 39% of huge-page faults fall back).
     enum class Arena { HostMalloc, NonCoherent, Huge };
-    Arena arena = Arena::HostMalloc;
+    Arena arena = Arena::NonCoherent;
     // One arena is pinned at a time in the whole process (a gate shared by every pool): pins hold the process's
     // memory-map lock, so overlapping ones make each other, and every thread that maps memory, wait longer.
     bool serial = false;  // QW_POOL_SERIAL=1
@@ -38,7 +38,7 @@ struct PoolOptions {
     // budget evicts whole conversations, whose arenas would otherwise be unpinned and pinned again for the next
     // saves. The pinned total stays at the high-water mark the cache already reached.
     bool keep = false;  // QW_POOL_KEEP=1
-    // QW_POOL_ARENA=malloc|noncoherent|huge
+    // QW_POOL_ARENA=malloc|noncoherent|huge (default noncoherent)
     static PoolOptions from_env();
     static const char *name(Arena a);
 };

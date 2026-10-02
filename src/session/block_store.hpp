@@ -35,7 +35,7 @@ public:
     static constexpr int BLOCK = 256;
 
     // disk_dir empty: no disk tier. Environment: QW_LOAD_THREADS, QW_POOL_ARENA (see PoolOptions),
-    // QW_KV_PAIRS=1 keeps one copy of the KV of each replica group of ranks (they are identical: half the pinned
+    // QW_KV_PAIRS (default 1) keeps one copy of the KV of each replica group of ranks (they are identical: half the pinned
     // memory and half the device-to-host traffic of a block; the files stay as they were, four buffers, and a read
     // into shared buffers skips the replicas'), QW_KV_PAIR_CHECK=N exports the replicas of every Nth shared block
     // as well and counts the ones that differ (a check of the identity, off by default).
@@ -154,7 +154,7 @@ private:
     size_t ram_budget_, disk_budget_;
     size_t ram_bytes_ = 0, disk_bytes_ = 0;
     int load_threads_ = 1;
-    bool kv_pairs_ = false;  // one KV buffer per replica group (QW_KV_PAIRS)
+    bool kv_pairs_ = true;   // one KV buffer per replica group (QW_KV_PAIRS=0: one per rank)
     int kv_copies_ = RANKS;  // KV buffers a block holds: RANKS, or one per replica group
     int pair_check_ = 0;     // QW_KV_PAIR_CHECK
     uint64_t pair_checked_ = 0;

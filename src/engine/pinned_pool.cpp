@@ -29,9 +29,9 @@ PoolOptions PoolOptions::from_env() {
     if (const char *t = std::getenv("QW_POOL_KEEP")) o.keep = std::atoi(t) != 0;
     if (const char *a = std::getenv("QW_POOL_ARENA")) {
         const std::string v = a;
-        if (v == "noncoherent") o.arena = Arena::NonCoherent;
+        if (v == "malloc") o.arena = Arena::HostMalloc;
         else if (v == "huge") o.arena = Arena::Huge;
-        else if (v != "malloc") log("QW_POOL_ARENA=%s is not malloc, noncoherent or huge; using malloc", a);
+        else if (v != "noncoherent") log("QW_POOL_ARENA=%s is not malloc, noncoherent or huge; using noncoherent", a);
     }
     return o;
 }

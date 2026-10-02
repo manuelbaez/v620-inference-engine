@@ -206,7 +206,7 @@ private:
     size_t vision_bytes_ = 0, vision_budget_ = 0;
     std::unordered_map<uint64_t, uint64_t> seen_chunks_;  // chunk hash -> last prompt that had it
     int64_t min_gap_ = 1024;          // tokens between snapshots (and the least a saved prefix holds)
-    int reserve_ahead_ = 0;           // chunks of saves whose pinned memory is taken ahead; 0: the whole prefill (QW_RESERVE_AHEAD)
+    int reserve_ahead_ = 2;           // chunks of saves whose pinned memory is taken ahead; 0: the whole prefill (QW_RESERVE_AHEAD)
     std::vector<int> row_slot_;       // slot of each row of the last decode
     std::vector<StepOut> out_;
     bool single_ = false;  // last op on slot 0 was a single-slot step (sample() reads that row)
