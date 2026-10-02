@@ -162,6 +162,8 @@ int main(int argc, char **argv) {
                 QW_CHECK(slot >= 0, "no slot");
                 // a standing reserve is pinned in the background at construction: a server has had it for hours, so
                 // wait until the pools stop pinning before the clock starts
+                if (std::getenv("QW_POOL_RESERVE_GB"))  // the pools start refilling after 1.5 s without a get()
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
                 for (int waited = 0, prev = -1; waited < 180; ++waited) {
                     const int pins = int(s.cache_stats().pins);
                     if (pins == prev) break;
