@@ -84,6 +84,14 @@ pool3)
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
     run churn_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 4 --host-gb 6 \
         --configs nostore,old,keep,ahead2+pairs,ahead2+pairs+keep
+    # the standing reserve (the Session waits for it before the clock starts, as a server's first request would)
+    run reserve_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 4 --host-gb 48 \
+        --configs nostore,old,ahead2+pairs,reserve10+nc+pairs
+    ;;
+all)  # the stages after pool2, most valuable first
+    "$0" compute "$OUT/compute"
+    "$0" stall "$OUT/stall"
+    "$0" pool3 "$OUT/pool3"
     ;;
 stall)
     export QW_PLE_DIR=$FP8
@@ -120,7 +128,7 @@ compute)
         env QW_COMM_PUSH2D=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
     ;;
 *)
-    echo "usage: $0 correctness|pool|pool2|pool3|stall|compute [outdir]"
+    echo "usage: $0 correctness|pool|pool2|pool3|stall|compute|all [outdir]"
     exit 2
     ;;
 esac
