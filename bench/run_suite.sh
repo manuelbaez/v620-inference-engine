@@ -84,6 +84,10 @@ compute)
         run comm_default_$rep 1500 env QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
         run comm_variants_$rep 1500 env QW_COMM_PUSH2D=1 QW_COMM_VECRECV=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
     done
+    for rep in 1 2; do  # decode with the collective variants: the 2D push also serves multi-row decode collectives
+        run decode_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_COMM_VECRECV=0 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
+        run decode_push2d_$rep 1500 env QW_COMM_PUSH2D=1 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
+    done
     run kernel_trace 2400 rocprofv3 --kernel-trace --stats --output-format csv -d "$OUT/trace" -o chunk -- \
         env QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
     run determinism_default 2400 env QW_PREFILL_CHUNK=4096 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 \
