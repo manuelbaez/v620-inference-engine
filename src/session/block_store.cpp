@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include "core/common.hpp"
 #include "core/config.hpp"
@@ -549,6 +550,22 @@ void BlockStore::reserve(size_t blocks, size_t snapshots) {
         if (!kv_pairs_ || cfg::kv_primary(r) == r) kv_pool_[size_t(r)]->reserve(blocks + KV_LOW_WATER);
         snap_pool_[size_t(r)]->reserve(snapshots + SNAP_LOW_WATER);
     }
+}
+
+void BlockStore::wait_reserve(double seconds) {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto ready = [&] {
+        for (int r = 0; r < RANKS; ++r)
+            if (!kv_pool_[size_t(r)]->standing_ready() || !snap_pool_[size_t(r)]->standing_ready()) return false;
+        return true;
+    };
+    bool had = false;
+    for (int r = 0; r < RANKS; ++r) had = had || !kv_pool_[size_t(r)]->standing_ready() || !snap_pool_[size_t(r)]->standing_ready();
+    if (!had) return;  // none configured, or already there
+    while (!ready() && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < seconds)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    log("prefix cache: pinned reserve %s after %.1f s (%.1f GB pinned)", ready() ? "ready" : "not ready",
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), double(pinned_bytes()) / 1e9);
 }
 
 void BlockStore::flush() {

@@ -73,6 +73,9 @@ public:
     // (call before a prefill whose saves will need it).
     void reserve(size_t blocks, size_t snapshots);
     void flush();  // waits for the disk writes
+    // Waits (at most `seconds`) for the pools to pin the standing reserve (QW_POOL_RESERVE_GB), so that the first
+    // request after a start finds it there; returns at once without one. Logs how long it took.
+    void wait_reserve(double seconds);
 
     struct Stats {
         uint64_t hits = 0, tokens_restored = 0, snapshots_saved = 0;

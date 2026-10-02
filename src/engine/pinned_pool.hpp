@@ -66,6 +66,7 @@ public:
     void put(uint8_t *p);
     size_t unit_bytes() const { return unit_; }
     size_t allocated_bytes() const;  // arenas held
+    bool standing_ready() const;     // the standing reserve is in place (or there is none)
     PoolStats stats() const;
 
 private:
@@ -84,7 +85,8 @@ private:
     size_t unit_;
     int per_arena_, device_;
     size_t standing_;
-    std::chrono::steady_clock::time_point last_get_ = std::chrono::steady_clock::now();
+    // (starts as if the pool had been quiet for a while: the first fill of the standing reserve need not wait)
+    std::chrono::steady_clock::time_point last_get_ = std::chrono::steady_clock::now() - std::chrono::seconds(60);
     PoolOptions opt_;
     mutable std::mutex mu_;
     std::condition_variable cv_, ready_cv_;

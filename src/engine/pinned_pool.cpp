@@ -235,6 +235,11 @@ void PinnedPool::put(uint8_t *p) {
     fail("PinnedPool::put: foreign pointer");
 }
 
+bool PinnedPool::standing_ready() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return free_units_ >= standing_;
+}
+
 size_t PinnedPool::allocated_bytes() const {
     std::lock_guard<std::mutex> lk(mu_);
     return arenas_.size() * unit_ * size_t(per_arena_);

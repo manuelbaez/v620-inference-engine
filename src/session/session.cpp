@@ -20,6 +20,7 @@ Session::Session(Engine &e)
         const char *dir = std::getenv("QW_DISK_CACHE_DIR");
         const char *dgb = std::getenv("QW_DISK_CACHE_GB");
         store_ = std::make_unique<BlockStore>(e_, budget, dir ? dir : "", size_t((dgb ? std::atof(dgb) : 200.0) * 1e9));
+        store_->wait_reserve(30);  // the first request after a start (llama-swap sends it the moment /health is up)
     }
     if (const char *g = std::getenv("QW_SNAP_MIN_GAP")) min_gap_ = std::max<int64_t>(1, std::atoll(g));
     if (const char *a = std::getenv("QW_RESERVE_AHEAD")) reserve_ahead_ = std::max(0, std::atoi(a));
