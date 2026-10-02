@@ -145,7 +145,7 @@ int main(int argc, char **argv) {
             cfgs = keep;
         }
         const auto prompt = conversation(tokens, 5);
-        std::printf("prompt %d tokens, chunk %d, cache budget %.0f GB, %.0f GB of locked memory held, %d reps (order alternates)\n",
+        std::printf("prompt %d tokens, chunk %d, cache budget %.0f GB, %.0f GB of locked memory held, %d reps (starting point rotates, every other repetition reversed)\n",
                     tokens, e.prefill_chunk(), host_gb, hog_gb, reps);
         std::printf("%-20s %8s %8s %7s %6s | %6s %8s | %6s %8s | %8s %6s\n", "config", "seconds", "tok/s", "kJ", "avg W", "pins", "pin s",
                     "waits", "wait s", "RAM GB", "pairs!");
@@ -208,7 +208,10 @@ int main(int argc, char **argv) {
             s.release(slot);
         }
         for (int rep = 0; rep < reps; ++rep) {
+            // the host's memory state drifts over a run (reclaim settles as the page cache gives way), so each repetition
+            // starts somewhere else in the list, and every other one runs it backwards
             std::vector<Config> order = cfgs;
+            if (!order.empty()) std::rotate(order.begin(), order.begin() + ptrdiff_t(size_t(rep) * order.size() / size_t(reps) % order.size()), order.end());
             if (rep % 2) std::reverse(order.begin(), order.end());
             for (const Config &c : order) run(c, true);
         }
