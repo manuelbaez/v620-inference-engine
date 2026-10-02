@@ -8,7 +8,7 @@
 #                (64k tokens, then 100k for the main candidates; ~50 min)
 #   pool2        the store settings again with the pool's final semantics and the combinations (~35 min)
 #   pool3        a cache at its budget: arenas given back and pinned again, or kept (~15 min)
-#   pool4        the 100k-token cold prefill again: pins one at a time, a standing reserve (~25 min)
+#   pool4        the 100k-token cold prefill again: the defaults, pins one at a time, a standing reserve (~30 min)
 #   stall        pins while the GPUs compute, and decode steps timed while arenas are pinned (~10 min)
 #   compute      the collective variant end to end, decode and determinism with it, the prefill input pipeline,
 #                chunk size, the MoE balance, long context and a kernel trace of one chunk (~50 min)
@@ -90,11 +90,12 @@ pool3)
         --configs nostore,old,ahead2+pairs,reserve10+nc+pairs
     ;;
 pool4)
-    # production's long cold prompts: the defaults leave +5.5% over no store at 100k tokens (pool2); pins one at a time
-    # and a standing reserve (the Session waits for it) are the candidates for the rest
+    # production's long cold prompts: ahead2+pairs left +5.5% over no store at 100k tokens (pool2). nc+pairs is the
+    # code's defaults (non-coherent arenas, 2 chunks ahead, pairs); pins one at a time and a standing reserve (the
+    # Session waits for it) are the candidates for the rest
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
-    run cold_100k_more 7200 $B/cold_prefill_bench --tokens 100000 --reps 3 --host-gb 64 \
-        --configs nostore,ahead2+pairs,serial+ahead2+pairs,reserve10+nc+pairs
+    run cold_100k_more 9000 $B/cold_prefill_bench --tokens 100000 --reps 3 --host-gb 64 \
+        --configs nostore,nc+pairs,ahead2+pairs,serial+ahead2+pairs,reserve10+nc+pairs
     ;;
 all)  # the stages after pool2, most valuable first
     "$0" compute "$OUT/compute"
