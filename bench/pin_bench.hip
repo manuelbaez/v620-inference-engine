@@ -3,12 +3,16 @@
 // snapshot pool per rank) pin at the same time, which took 0.7-9 s per 256 MB arena on the production host
 // (2026-10-02) where mmap + mlock of the same size takes 0.03-0.26 s.
 //   pin_bench [arena_mb=256] [rounds=4]
-// For each way to get pinned memory and each number of threads: per-arena latency and aggregate GB/s. Then every
-// way's memory is used from every device (host -> device -> host copy), to check it works there and at what speed.
+// For each way to get pinned memory and each number of threads: per-arena latency and aggregate GB/s, and the
+// latency of a small mmap + touch + munmap on another thread meanwhile (the probe): if pinning holds the process's
+// memory-map lock, every thread that maps or faults memory waits for it, which stalls the engine's other threads.
+// Then every way's memory is used from every device (host -> device -> host copy), to check it works there and at
+// what speed.
 #include <hip/hip_runtime.h>
 #include <sys/mman.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -103,7 +107,8 @@ int main(int argc, char **argv) {
             CK(hipHostFree(w));
         }
         std::printf("%d device(s); arenas of %zu MB, %d rounds per thread\n", ndev, mb, rounds);
-        std::printf("%-46s %8s %10s %10s %10s %10s\n", "way", "threads", "mean s", "max s", "wall s", "GB/s total");
+        std::printf("%-46s %8s %10s %10s %10s %10s | %9s %9s %9s\n", "way", "threads", "mean s", "max s", "wall s",
+                    "GB/s total", "probe max", "probe p99", "probe mean");
         const Way ways[] = {Way::HostMalloc, Way::HostMallocNonCoherent, Way::Map4K, Way::MapHuge, Way::MapHugePopulate};
         std::vector<int> thread_counts{1};
         if (ndev > 1) thread_counts.push_back(ndev);
@@ -112,6 +117,21 @@ int main(int argc, char **argv) {
             for (int threads : thread_counts) {
                 std::vector<std::vector<double>> lat;
                 lat.resize(size_t(threads));
+                // the probe: how long a small map + first touch + unmap takes while the others pin
+                std::atomic<bool> stop{false};
+                std::vector<double> probe;
+                std::thread prober([&] {
+                    while (!stop.load()) {
+                        const double a = now();
+                        void *m = mmap(nullptr, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                        if (m != MAP_FAILED) {
+                            *static_cast<volatile char *>(m) = 1;
+                            munmap(m, 65536);
+                        }
+                        probe.push_back(now() - a);
+                        std::this_thread::sleep_for(std::chrono::microseconds(200));
+                    }
+                });
                 const double t0 = now();
                 std::vector<std::thread> th;
                 for (int t = 0; t < threads; ++t)
@@ -125,6 +145,13 @@ int main(int argc, char **argv) {
                         }
                     });
                 for (auto &x : th) x.join();
+                stop = true;
+                prober.join();
+                std::sort(probe.begin(), probe.end());
+                const double probe_max = probe.empty() ? 0 : probe.back();
+                const double probe_p99 = probe.empty() ? 0 : probe[size_t(double(probe.size() - 1) * 0.99)];
+                double probe_sum = 0;
+                for (double d : probe) probe_sum += d;
                 const double wall = now() - t0;
                 double sum = 0, mx = 0;
                 size_t n = 0;
@@ -137,8 +164,9 @@ int main(int argc, char **argv) {
                     for (double d : v) s += d;
                     pin_wall = std::max(pin_wall, s);
                 }
-                std::printf("%-46s %8d %10.3f %10.3f %10.3f %10.2f\n", name_of(w), threads, sum / double(n), mx, wall,
-                            double(n) * double(bytes) / 1e9 / pin_wall);
+                std::printf("%-46s %8d %10.3f %10.3f %10.3f %10.2f | %7.1f ms %7.1f ms %7.3f ms\n", name_of(w), threads,
+                            sum / double(n), mx, wall, double(n) * double(bytes) / 1e9 / pin_wall, probe_max * 1e3,
+                            probe_p99 * 1e3, probe.empty() ? 0.0 : probe_sum / double(probe.size()) * 1e3);
                 std::fflush(stdout);
             }
 

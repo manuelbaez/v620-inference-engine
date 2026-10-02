@@ -59,9 +59,9 @@ pool)
     run comm_engine 900 $B/comm_bench engine 200
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
     run cold_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 2 --host-gb 48 \
-        --configs nostore,old,noncoherent,huge,ahead2,pairs,pairs+check,all,nc+pairs
+        --configs nostore,old,noncoherent,huge,ahead2,pairs,pairs+check,reserve16,reserve16+ahead2,reserve10+pairs
     run cold_100k 5400 $B/cold_prefill_bench --tokens 100000 --reps 2 --host-gb 64 \
-        --configs nostore,old,all,nc+pairs
+        --configs nostore,old,reserve16+ahead2,reserve10+pairs
     ;;
 compute)
     export QW_PLE_DIR=$FP8

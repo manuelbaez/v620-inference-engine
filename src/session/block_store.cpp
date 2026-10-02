@@ -40,18 +40,31 @@ uint64_t BlockStore::key(uint64_t parent, const int32_t *t, size_t n) {
 
 BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir, size_t disk_budget)
     : e_(e), ram_budget_(ram_budget), disk_budget_(disk_budget) {
-    const PoolOptions po = PoolOptions::from_env();
-    for (int r = 0; r < RANKS; ++r) {
-        kv_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(e_.kv_rank_bytes(BLOCK), KV_ARENA_UNITS, e_.rank_device(r), 0, po);
-        snap_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r), 0, po);
-    }
-    nodes_[ROOT] = Node{};
     if (const char *t = std::getenv("QW_LOAD_THREADS")) load_threads_ = std::max(1, std::atoi(t));
     if (const char *t = std::getenv("QW_KV_PAIRS")) kv_pairs_ = std::atoi(t) != 0;
     if (const char *t = std::getenv("QW_KV_PAIR_CHECK")) pair_check_ = std::max(0, std::atoi(t));
     kv_copies_ = kv_pairs_ ? RANKS / cfg::KV_REPLICAS : RANKS;
+    // QW_POOL_RESERVE_GB: pinned memory kept free ahead of the saves (the pools top it up in the background after
+    // every take, and start by pinning it). Pinning an arena means reclaiming pages first (a host whose NUMA nodes
+    // are full of page cache and ARC: direct reclaim and failing compaction), 0.5-9 s per 256 MB, so a prefill that
+    // grows the cache waits for it unless the memory was pinned before. Split 60:40 between blocks and snapshots
+    // (what a prefill makes), evenly over the ranks that hold a copy.
+    double reserve_gb = 0;
+    if (const char *t = std::getenv("QW_POOL_RESERVE_GB")) reserve_gb = std::max(0.0, std::atof(t));
+    const size_t kv_unit = e_.kv_rank_bytes(BLOCK), snap_unit = Engine::recurrent_rank_bytes();
+    const size_t kv_low = size_t(reserve_gb * 1e9 * 0.6 / kv_copies_ / double(kv_unit));
+    const size_t snap_low = size_t(reserve_gb * 1e9 * 0.4 / RANKS / double(snap_unit));
+    const PoolOptions po = PoolOptions::from_env();
+    for (int r = 0; r < RANKS; ++r) {
+        const bool kv_rank = !kv_pairs_ || cfg::kv_primary(r) == r;
+        kv_pool_[size_t(r)] =
+            std::make_unique<PinnedPool>(kv_unit, KV_ARENA_UNITS, e_.rank_device(r), kv_rank ? kv_low : 0, po);
+        snap_pool_[size_t(r)] =
+            std::make_unique<PinnedPool>(snap_unit, SNAP_ARENA_UNITS, e_.rank_device(r), snap_low, po);
+        if (kv_rank && kv_low) kv_pool_[size_t(r)]->reserve(kv_low);
+        if (snap_low) snap_pool_[size_t(r)]->reserve(snap_low);
+    }
+    nodes_[ROOT] = Node{};
     if (!disk_dir.empty()) {
         disk_ = std::make_unique<DiskTier>(disk_dir, e_.state_layout_id());
         load_index();

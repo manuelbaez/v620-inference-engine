@@ -21,6 +21,7 @@
 
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "core/common.hpp"
@@ -77,7 +78,7 @@ struct Config {
     std::map<std::string, std::string> env;
 };
 
-static const char *KNOBS[] = {"QW_POOL_ARENA", "QW_RESERVE_AHEAD", "QW_KV_PAIRS", "QW_KV_PAIR_CHECK"};
+static const char *KNOBS[] = {"QW_POOL_ARENA", "QW_RESERVE_AHEAD", "QW_KV_PAIRS", "QW_KV_PAIR_CHECK", "QW_POOL_RESERVE_GB"};
 
 static std::vector<Config> all_configs(double host_gb) {
     const std::string gb = std::to_string(host_gb);
@@ -98,6 +99,11 @@ static std::vector<Config> all_configs(double host_gb) {
     store("noncoherent+ahead2", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}});
     store("all", {{"QW_POOL_ARENA", "huge"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     store("nc+pairs", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
+    // a standing pinned reserve (QW_POOL_RESERVE_GB): the pools pin it at construction and keep it topped up, so the
+    // runs start when it is in place (the bench waits for the pools' pins first, as a server would have long since)
+    store("reserve16", {{"QW_POOL_RESERVE_GB", "16"}});
+    store("reserve16+ahead2", {{"QW_POOL_RESERVE_GB", "16"}, {"QW_RESERVE_AHEAD", "2"}});
+    store("reserve10+pairs", {{"QW_POOL_RESERVE_GB", "10"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     return c;
 }
 
@@ -147,6 +153,14 @@ int main(int argc, char **argv) {
                 s.set_boundary_token(BOUNDARY);
                 const int slot = s.acquire(prompt, 16);
                 QW_CHECK(slot >= 0, "no slot");
+                // a standing reserve is pinned in the background at construction: a server has had it for hours, so
+                // wait until the pools stop pinning before the clock starts
+                for (int waited = 0, prev = -1; waited < 180; ++waited) {
+                    const int pins = int(s.cache_stats().pins);
+                    if (pins == prev) break;
+                    prev = pins;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                }
                 const double t0 = now();
                 s.set_prompt(slot, prompt);
                 secs = now() - t0;
