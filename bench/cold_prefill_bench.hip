@@ -80,7 +80,12 @@ struct Config {
     std::map<std::string, std::string> env;
 };
 
-static const char *KNOBS[] = {"QW_POOL_ARENA", "QW_RESERVE_AHEAD", "QW_KV_PAIRS", "QW_KV_PAIR_CHECK", "QW_POOL_RESERVE_GB", "QW_POOL_SERIAL", "QW_POOL_KEEP"};
+// every switch of the store, with the value that is the behavior of 2026-10-01 (the code's defaults may differ from it
+// since: a configuration names only what it changes, and everything else is set to this)
+static const std::map<std::string, std::string> BASE = {{"QW_POOL_ARENA", "malloc"}, {"QW_RESERVE_AHEAD", "0"},
+                                                        {"QW_KV_PAIRS", "0"},        {"QW_KV_PAIR_CHECK", "0"},
+                                                        {"QW_POOL_RESERVE_GB", "0"}, {"QW_POOL_SERIAL", "0"},
+                                                        {"QW_POOL_KEEP", "0"}};
 
 static std::vector<Config> all_configs(double host_gb) {
     const std::string gb = std::to_string(host_gb);
@@ -155,7 +160,7 @@ int main(int argc, char **argv) {
         PowerMeter meter;
         if (!meter.available()) std::printf("(no GPU power sensors found: energy columns read 0)\n");
         auto run = [&](const Config &c, bool report) {
-            for (const char *k : KNOBS) unsetenv(k);
+            for (const auto &[k, v] : BASE) setenv(k.c_str(), v.c_str(), 1);
             unsetenv("QW_HOST_CACHE_GB");
             for (const auto &[k, v] : c.env) setenv(k.c_str(), v.c_str(), 1);
             e.slot_reset(0);
@@ -169,8 +174,8 @@ int main(int argc, char **argv) {
                 QW_CHECK(slot >= 0, "no slot");
                 // a standing reserve is pinned in the background at construction: a server has had it for hours, so
                 // wait until the pools stop pinning before the clock starts
-                if (std::getenv("QW_POOL_RESERVE_GB"))  // the pools start refilling after 1.5 s without a get()
-                    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+                if (c.env.count("QW_POOL_RESERVE_GB"))  // (the Session also waits for the reserve before it returns)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
                 for (int waited = 0, prev = -1; waited < 180; ++waited) {
                     const int pins = int(s.cache_stats().pins);
                     if (pins == prev) break;
@@ -199,7 +204,7 @@ int main(int argc, char **argv) {
         // of a process costs ~0.7 s, which would land on whichever configuration runs first)
         for (const char *kind : {"malloc", "noncoherent", "huge"}) {
             const auto small = conversation(8192, 9);
-            for (const char *k : KNOBS) unsetenv(k);
+            for (const auto &[k, v] : BASE) setenv(k.c_str(), v.c_str(), 1);
             setenv("QW_HOST_CACHE_GB", "4", 1);
             setenv("QW_POOL_ARENA", kind, 1);
             e.slot_reset(0);
