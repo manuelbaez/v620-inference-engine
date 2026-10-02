@@ -716,6 +716,15 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          capture: -10% of snapshot bytes at no measured cost; hold writes back and keep one per
          >= 4,096 tokens plus chain ends: -55% for ~0.05 s of extra prefill per request); byte
          shuffle + zstd-1 (-41% together with the pairs); a daily write cap
+   - [ ] prefill and TTFT in production (measured 2026-10-02, section "Prefill and time to first token
+         in production"): ordinary prefills run at the benchmark speed since the 10-01 deploy (1-8k
+         fresh tokens: p50 1,869 tok/s; TTFT p50 0.53 s, p90 2.3 s). What is left: disk loads (23% of
+         the TTFT time; the SSD move), cold long prefills limited by pinned-memory allocation (105k
+         tokens: 104.5 s against ~62 s, 51 arena pins of 0.5-9.3 s; a hypothesis that needs an A/B on
+         the dev box) and the compute side (collectives 42% of GPU time at 8k, not byte-bound). Open,
+         in order: per-request timing in the request log; huge-page arenas, a per-chunk reserve and
+         rank pairs in RAM; one GPU window for chunk size, micro-batches, MoE imbalance and a
+         long-context profile
 
 ## Disk-tier loads and host memory (analysis 2026-10-01)
 
@@ -942,6 +951,125 @@ most the held-back snapshots; the RAM tier serves them meanwhile.
 
 Rejected: lossy encodings (fp8 KV, int8 snapshots): a cache hit would give
 different outputs from a miss, and the accuracy rule keeps lossy off.
+
+## Prefill and time to first token in production (measured 2026-10-02)
+
+Question: what can lower TTFT or raise prompt throughput. From the production
+log (`journalctl -t qw`, 09-25 to 10-02: 975 requests with a TTFT, 1,275
+ten-second stats windows), the cache directory and read-only probes of the
+host. The GPUs belong to production, so there is no new GPU profile: the
+compute-side items are candidates to measure, not results.
+
+**Reading the log.** A request line has prompt, cached, generated, TTFT and
+decode speed; fresh = prompt - cached is what was prefilled. The stats lines
+average over 10 s, so their "prompt tok/s" understates the speed while a
+prefill runs. A per-request speed (fresh / TTFT) is taken from requests that
+did not overlap a disk load or another request's prefill (start = log time -
+TTFT - decode time, give or take 1 s).
+
+**Where it stands.** Requests with 1-8k fresh tokens, no load, no overlap:
+
+| period | n | rate p25 / p50 / p75 (tok/s) | under 450 tok/s |
+|---|---|---|---|
+| bf16 table (before 09-28 00:31) | 51 | 398 / 808 / 1,563 | 25% |
+| fp8, before the 10-01 19:11 deploy | 174 | 797 / 1,563 / 1,760 | 14% |
+| fp8, `qw-engine:15822e2` (10-01 19:11 on) | 32 | 1,755 / 1,869 / 2,042 | 3% |
+
+Ordinary prefills now run at the benchmark speed (~1,900-2,200 tok/s); the slow
+tail went away with that deploy (the pool fix and the scheduler fixes; the log
+cannot say which, and the sample is small and the traffic lighter). Since the
+deploy: 183 requests, TTFT p50 0.53 s, p75 1.5, p90 2.3, p99 46, 346 s in all.
+Where those 346 s went: disk loads 23% (an 81k-token restore from the HDDs:
+46 s), one cold 105k-token prompt 30% (104.5 s), waiting behind another
+prefill 10%, everything else 37%.
+
+**Context length costs little up to 100k.** Clean requests with 1-16k fresh
+tokens, per fresh token (p25 of each context bin): 0.51 ms at no context
+(1,965 tok/s) plus 0.16 ms per 100k tokens of context: 1,500 tok/s at 100k,
+1,290 at 170k. So the QSA indexer and attention are not what limits a typical
+agent turn. The medians of the bins above 100k are much worse (1.0 ms/token at
+100-130k, 1.6 at 130k+, p75 2.3): not attention arithmetic but the slow tail of
+the pre-deploy engine and the next finding.
+
+**A cold long prefill is limited by pinned-memory allocation** (consistent with
+the log, not yet proven by an A/B). 10-02 20:56, 104,856 tokens, nothing cached,
+nothing else running: 104.5 s (1,003 tok/s); the fit above gives ~62 s. The log
+has 51 arena pins slower than 0.5 s in that window (13.1 GB; latency mean 2.8 s,
+max 9.3 s, growing as they queued): the pool delivered ~126 MB/s, while a
+prefill at full speed makes ~200 MB/s of new blocks and snapshots that need
+pinned buffers (21.8 MB per 256 tokens, 126 MB per 4k chunk). It happens while
+the RAM tier grows (an empty tier after a restart, or a burst past what
+evictions free; at the budget evicted buffers are reused, except those the disk
+writer still holds). Measured on the host: `hipHostMalloc` takes 0.7-1.5 s per
+256 MB arena at best and several seconds with the four ranks' KV and snapshot
+pools pinning at once; in the same container `mmap` + `mlock` of 256 MB takes
+0.15-0.26 s with 4 KB pages and 0.03-0.05 s with 2 MB pages (`MADV_HUGEPAGE`;
+THP is in `madvise` mode); the IOMMU is in passthrough (`iommu=pt`), so DMA
+translation is not it. On a workstation with THP always on and one GPU every
+allocation variant takes 10 ms, so a local microbenchmark cannot show it; the
+test needs the dev box with four GPUs. No effect on other requests' decoding was
+found (since the deploy 0 of 39 decode windows over 100 ms/step; windows with a
+pin event: median 31 ms against 25).
+
+Options: (a) arenas from `mmap` + `MADV_HUGEPAGE` + `hipHostRegister` (expected
+4-7x cheaper); (b) reserve per chunk, two chunks ahead, instead of the whole
+prompt at once (49 pins started together for 105k tokens), and keep emptied
+arenas and a standing reserve; (c) store the replicated rank pairs once in RAM
+too (see "Disk-tier write volume": -26% of the pinned bytes and half the D2H
+export); (d) pin the budget at start-up in the background (the memory is
+committed early). Expected: a cold 100k prompt in ~60 s instead of ~104 s, and a
+faster refill of the cache after every restart. Test: the same 100k prefill with
+a pre-pinned pool against today's, on the dev box.
+
+**Checked and not worth it** (same log and the cache directory):
+
+| idea | what the data says |
+|---|---|
+| Re-render the previous generation identically so the next turn does not prefill it | 272 requests continue an earlier prompt; the previous generation explains at most 7% of the fresh tokens (0.19 of 2.80 M), and it needs the reasoning echoed by the client or kept by the server (a prompt change) |
+| Finer snapshots, so a diverging request resumes closer | 45 prompt pairs share >= 1,024 tokens: 29 diverge exactly at a snapshot; what is re-prefilled although cached is 1% of the shared tokens (8 s in all) |
+| Faster restore import | median 12 ms for slow and fast requests alike; a fully cached 105-141k-token prompt answers in 0.12-0.28 s, which bounds render + tokenize + scheduling |
+| Decoders alongside | 1,382 against 1,563 tok/s (median, 0.75-1.5 decoders against none): -12% |
+
+**Compute side: candidates, each needs a GPU window.** The 8k-token profile
+(2026-09-25) has collectives at 42% of GPU time, QSA attention 19%, GEMMs 12%,
+MoE 12%, GDN scan 5%; there is none at 4k chunks or long contexts. The
+collectives are not byte-bound: a chunk receives ~0.95 MB per token per rank
+(19.4 KB per row per layer: two all-gathers and two reduce-scatters of 3.8 KB,
+the HC all-reduces), ~3.9 GB per 4,096-token chunk, 1.9 GB/s at 2,000 tok/s,
+against 14-25 GB/s for a kernel push between a pair; a chunk has ~800 of them
+(8 per layer per micro-batch), and the notes' 10.6 MB all-reduce in 4.1 ms is
+3.9 GB/s per rank.
+
+1. The in-engine rate of the large gathers and reduce-scatters (`test_comm`
+   sweep at 2-16 MB; block count; store width). A push serves one destination at
+   a time with a system fence after each, and the receiver then copies the
+   payload once more out of the uncached staging buffer. Ceiling ~35 of the 42
+   points; realistic 10-20% of prefill.
+2. MoE load imbalance under expert parallelism: max/mean tokens per rank per
+   layer from the routing counts. Ranks wait for the slowest at the next
+   collective, which the profile books as collective time. Above 1.2, a
+   per-layer expert permutation is exact and costs nothing at run time.
+3. Chunk and piece size: interleaved pieces are 2,048 tokens while others
+   decode (the chunk is 4,096): the rate at 1k/2k/4k/8k for the production
+   shapes (the notes only have 8k against 4k, +2%).
+4. Three or four micro-batches instead of two.
+5. The host between chunks (embedding conversion, PLE gather, the saves): ~1-3%
+   by estimate.
+6. The QSA attention kernel (19% at 8k, +31% per token at 100k).
+7. SDMA for the big payloads (frees the CUs; SDMA wedged a rank once).
+
+**Plan, by value for effort:**
+
+1. Per-request timing in the request log line (queue, load, pinned-buffer wait,
+   restore, prefill, first token): no GPU needed, and it makes the pinning
+   finding provable in production.
+2. The SSD for the disk tier with the rank pairs stored once ("Disk-tier write
+   volume"): disk loads were 23% of the TTFT time since the deploy.
+3. The pool changes (a)-(c), A/B on the dev box.
+4. One GPU window for the compute candidates: `prefill_bench` at chunk
+   1k/2k/4k/8k with and without micro-batches; a context option for
+   `prefill_bench` (prefill N tokens, then time a chunk); `rocprofv3` of one 4k
+   chunk at 60k context; routing counts per rank per layer.
 
 ## Vision: where image time goes (2026-10-01)
 

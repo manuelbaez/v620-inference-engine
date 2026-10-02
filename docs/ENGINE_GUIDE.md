@@ -490,6 +490,13 @@ fetches that row's full logits (~1 row in 10,000 in real text).
   the margin also covers a disk-tier load (up to ~9 GB taken before the budget
   is enforced). A kill empties the RAM tier, so the next requests load from
   the disk tier. Inside the engine's container `/proc/meminfo` is the host's.
+- **Pinned host memory is slow to make:** `hipHostMalloc` of a 256 MB arena took
+  0.7-1.5 s on the production host (2-9 s with the four ranks' pools pinning at
+  once), against 0.03-0.26 s for `mmap` + `mlock` of the same size (THP in
+  `madvise` mode: 2 MB pages are 4-7x faster). A prefill makes ~200 MB/s of cache
+  data to pin, so a cache that is still growing can throttle a long cold prefill
+  (105k tokens: 104.5 s against ~62 s). Size reserves ahead of the demand and keep
+  arenas. Not reproducible on a workstation with THP always on.
 - **Readiness:** the engine reports ready (and the server answers `/health`)
   only after the table is in RAM; before, a cold start served requests while
   rows still came from disk (warmup 28-35 s instead of ~5 s).
@@ -505,6 +512,7 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 | plain decode (no drafts) | ~67 tok/s (14.7 ms/step) |
 | 4 concurrent requests | ~231 tok/s aggregate |
 | prefill | ~2,050-2,200 tok/s |
+| prefill in production (1-8k fresh tokens, 2026-10-01 on) | p50 1,869 tok/s; ~1,500 at 100k tokens of context; a cold 105k-token prompt 1,003 tok/s (pinned-memory allocation, DESIGN.md "Prefill and time to first token in production") |
 | startup (warm) | ~120 s with the bf16 table (~60 s with int8; the weights themselves ~33-45 s, loaded in parallel) |
 | accuracy vs fp32 reference with the original PLE table | 0.050 mean \|Δlogprob\| (production's fp8 table; 0.044 with bf16) |
 | tasks (int4 / int8 table) | GSM8K 94.8 / 94.6%, MMLU 86.6 / 86.0%, ARC-Challenge 97.2 / 97.2% (no significant difference) |
