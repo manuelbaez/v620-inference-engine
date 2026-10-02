@@ -11,7 +11,8 @@
 // defaults (see all_configs() for the list: old, noncoherent, huge, ahead2, ahead4, pairs, pairs+check, nc+ahead2,
 // ahead2+pairs, nc+pairs, the reserve and serial ones).
 // QW_PREFILL_CHUNK (default 4096, as in production) sets the chunk, QW_PLE_DIR the PLE table (production: ples_fp8). Prints per run: seconds, tok/s, the pools'
-// arenas pinned and the time that took, saves that waited for an arena and for how long, RAM held by the cache.
+// arenas pinned and the time that took, saves that waited for an arena and for how long, RAM held by the cache,
+// and the GPUs' energy for the run (kJ, from the cards' power sensors; the cache exists to save energy).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "power_meter.hpp"
 #include "core/common.hpp"
 #include "engine/engine.hpp"
 #include "session/session.hpp"
@@ -145,15 +147,18 @@ int main(int argc, char **argv) {
         const auto prompt = conversation(tokens, 5);
         std::printf("prompt %d tokens, chunk %d, cache budget %.0f GB, %.0f GB of locked memory held, %d reps (order alternates)\n",
                     tokens, e.prefill_chunk(), host_gb, hog_gb, reps);
-        std::printf("%-20s %8s %8s | %6s %8s | %6s %8s | %8s %6s\n", "config", "seconds", "tok/s", "pins", "pin s", "waits",
-                    "wait s", "RAM GB", "pairs!");
-        std::map<std::string, std::vector<double>> times;
+        std::printf("%-20s %8s %8s %7s %6s | %6s %8s | %6s %8s | %8s %6s\n", "config", "seconds", "tok/s", "kJ", "avg W", "pins", "pin s",
+                    "waits", "wait s", "RAM GB", "pairs!");
+        std::map<std::string, std::vector<double>> times, energies;
+        PowerMeter meter;
+        if (!meter.available()) std::printf("(no GPU power sensors found: energy columns read 0)\n");
         auto run = [&](const Config &c, bool report) {
             for (const char *k : KNOBS) unsetenv(k);
             unsetenv("QW_HOST_CACHE_GB");
             for (const auto &[k, v] : c.env) setenv(k.c_str(), v.c_str(), 1);
             e.slot_reset(0);
             double secs;
+            PowerMeter::Result energy;
             BlockStore::Stats st;
             {
                 Session s(e);
@@ -170,17 +175,21 @@ int main(int argc, char **argv) {
                     prev = pins;
                     std::this_thread::sleep_for(std::chrono::milliseconds(1500));
                 }
+                meter.start();
                 const double t0 = now();
                 s.set_prompt(slot, prompt);
                 secs = now() - t0;
+                energy = meter.stop();
                 st = s.cache_stats();
                 s.release(slot);
             }  // the store's arenas are given back here, outside the timing
             if (report) {
                 times[c.name].push_back(secs);
-                std::printf("%-20s %8.2f %8.0f | %6llu %8.2f | %6llu %8.2f | %8.1f %6llu\n", c.name.c_str(), secs,
-                            double(tokens) / secs, (unsigned long long)st.pins, st.pin_s, (unsigned long long)st.pin_waits,
-                            st.pin_wait_s, double(st.ram_bytes) / 1e9, (unsigned long long)st.pair_mismatches);
+                energies[c.name].push_back(energy.kilojoules);
+                std::printf("%-20s %8.2f %8.0f %7.1f %6.0f | %6llu %8.2f | %6llu %8.2f | %8.1f %6llu\n", c.name.c_str(), secs,
+                            double(tokens) / secs, energy.kilojoules, energy.avg_w, (unsigned long long)st.pins, st.pin_s,
+                            (unsigned long long)st.pin_waits, st.pin_wait_s, double(st.ram_bytes) / 1e9,
+                            (unsigned long long)st.pair_mismatches);
                 std::fflush(stdout);
             }
         };
@@ -215,10 +224,15 @@ int main(int argc, char **argv) {
             for (double t : v) s += t;
             return s / double(v.size());
         };
+        auto mean_kj = [&](const std::string &n) {
+            double sum = 0;
+            for (double e : energies[n]) sum += e;
+            return energies[n].empty() ? 0.0 : sum / double(energies[n].size());
+        };
         const double base = stat("nostore", 3), old = stat("old", 3);
         for (const Config &c : cfgs)
-            std::printf("  %-22s %7.2f / %7.2f / %7.2f s   mean %+6.1f%% vs nostore  %+6.1f%% vs old   (median %+6.1f%% vs nostore)\n",
-                        c.name.c_str(), stat(c.name, 0), stat(c.name, 1), stat(c.name, 2),
+            std::printf("  %-22s %7.2f / %7.2f / %7.2f s %6.1f kJ  mean %+6.1f%% vs nostore  %+6.1f%% vs old   (median %+6.1f%% vs nostore)\n",
+                        c.name.c_str(), stat(c.name, 0), stat(c.name, 1), stat(c.name, 2), mean_kj(c.name),
                         base > 0 ? 100.0 * (stat(c.name, 3) / base - 1) : 0.0, old > 0 ? 100.0 * (stat(c.name, 3) / old - 1) : 0.0,
                         stat("nostore", 1) > 0 ? 100.0 * (stat(c.name, 1) / stat("nostore", 1) - 1) : 0.0);
         return 0;
