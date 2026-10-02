@@ -65,6 +65,7 @@ pool)
     ;;
 compute)
     export QW_PLE_DIR=$FP8
+    run prefill_pipeline_exact 1500 $B/test_prefill_pipeline
     for c in 1024 2048 4096 8192; do
         run chunk_$c 1500 env QW_PROFILE=1 QW_PREFILL_CHUNK=$c $B/prefill_bench --reps 3 2048 8192 16384
     done
@@ -75,6 +76,10 @@ compute)
     run ctx_60k 2400 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 3 4096 8192
     run ctx_120k 3600 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 120000 --reps 2 4096 8192
     run moe_balance_ctx60k 2400 env QW_MOE_STATS=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
+    for rep in 1 2; do
+        run pipeline_off_$rep 1500 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
+        run pipeline_on_$rep 1500 env QW_PROFILE=1 QW_PREFILL_PIPELINE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
+    done
     for rep in 1 2; do
         run comm_default_$rep 1500 env QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
         run comm_variants_$rep 1500 env QW_COMM_PUSH2D=1 QW_COMM_VECRECV=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
