@@ -8,8 +8,8 @@
 #                (64k tokens, then 100k for the main candidates; ~50 min)
 #   pool2        the store settings again with the pool's final semantics and the combinations (~35 min)
 #   stall        pins while the GPUs compute, and decode steps timed while arenas are pinned (~10 min)
-#   compute      prefill speed by chunk size, at long context, the MoE balance, micro-batches off, the comm
-#                variants end to end, a kernel trace of one chunk, and the determinism check (~60 min)
+#   compute      the collective variant end to end, decode and determinism with it, the prefill input pipeline,
+#                chunk size, the MoE balance, long context and a kernel trace of one chunk (~50 min)
 #
 # Run it from the build tree's parent (~/inference-engine). It never touches production: stop it first
 # (/home/server/qw-tools/prod-idle-unload.sh) and bring production back afterwards (prod-smoke.sh).
@@ -83,36 +83,33 @@ stall)
     run decode_stall 1800 $B/decode_stall_bench --steps 500 --threads 8
     ;;
 compute)
+    # most valuable first, so that a window cut short still has the answers that decide defaults
     export QW_PLE_DIR=$FP8
     run prefill_pipeline_exact 1500 $B/test_prefill_pipeline
-    for c in 1024 2048 4096 8192; do
-        run chunk_$c 1500 env QW_PROFILE=1 QW_PREFILL_CHUNK=$c $B/prefill_bench --reps 3 2048 8192 16384
+    for rep in 1 2; do  # the 2D push of the big collectives, end to end (bit-identical results; chunk 4096 as in production)
+        run comm_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
+        run comm_push2d_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
     done
-    run chunk_4096_nosplit 1500 env QW_PROFILE=1 QW_NO_SPLIT=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
-    run moe_balance 1500 env QW_MOE_STATS=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 2 8192 16384
-    run ctx_0 1500 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 4096 8192
-    run ctx_30k 2400 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 30000 --reps 3 4096 8192
-    run ctx_60k 2400 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 3 4096 8192
-    run ctx_120k 3600 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 120000 --reps 2 4096 8192
-    run moe_balance_ctx60k 2400 env QW_MOE_STATS=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
-    for rep in 1 2; do
-        run pipeline_off_$rep 1500 env QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
-        run pipeline_on_$rep 1500 env QW_PROFILE=1 QW_PREFILL_PIPELINE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
-    done
-    for rep in 1 2; do
-        run comm_default_$rep 1500 env QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
-        run comm_variants_$rep 1500 env QW_COMM_PUSH2D=1 QW_COMM_VECRECV=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
-    done
-    for rep in 1 2; do  # decode with the collective variants: the 2D push also serves multi-row decode collectives
-        run decode_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_COMM_VECRECV=0 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
+    for rep in 1 2; do  # decode with and without it: the 2D push also serves multi-row decode collectives
+        run decode_plain_$rep 1500 env QW_COMM_PUSH2D=0 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
         run decode_push2d_$rep 1500 env QW_COMM_PUSH2D=1 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
     done
-    run kernel_trace 2400 rocprofv3 --kernel-trace --stats --output-format csv -d "$OUT/trace" -o chunk -- \
-        env QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
-    run determinism_default 2400 env QW_PREFILL_CHUNK=4096 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 \
+    # the determinism check (a mismatch between repeats of a greedy run means wrong arithmetic), with the variant on
+    run determinism_push2d 2400 env QW_COMM_PUSH2D=1 QW_PREFILL_CHUNK=4096 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 \
         --gen 256 --k 5 --repeat 6
-    run determinism_variants 2400 env QW_COMM_PUSH2D=1 QW_COMM_VECRECV=1 QW_PREFILL_CHUNK=4096 $B/test_speculative \
-        --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 --gen 256 --k 5 --repeat 6
+    run determinism_plain 2400 env QW_COMM_PUSH2D=0 QW_PREFILL_CHUNK=4096 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 \
+        --gen 256 --k 5 --repeat 6
+    for rep in 1 2; do  # the next chunk's host inputs prepared while the GPUs run this one
+        run pipeline_off_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
+        run pipeline_on_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_PIPELINE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
+    done
+    for c in 2048 4096 8192; do  # chunk (and so piece) size
+        run chunk_$c 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=$c $B/prefill_bench --reps 3 2048 8192 16384
+    done
+    run moe_balance 1500 env QW_COMM_PUSH2D=1 QW_MOE_STATS=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 2 16384
+    run ctx_60k 2400 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_MOE_STATS=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 2 4096 8192
+    run kernel_trace 2400 rocprofv3 --kernel-trace --stats --output-format csv -d "$OUT/trace" -o chunk -- \
+        env QW_COMM_PUSH2D=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
     ;;
 *)
     echo "usage: $0 correctness|pool|pool2|stall|compute [outdir]"
