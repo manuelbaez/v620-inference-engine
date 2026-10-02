@@ -34,7 +34,11 @@ class BlockStore {
 public:
     static constexpr int BLOCK = 256;
 
-    // disk_dir empty: no disk tier.
+    // disk_dir empty: no disk tier. Environment: QW_LOAD_THREADS, QW_POOL_ARENA (see PoolOptions),
+    // QW_KV_PAIRS=1 keeps one copy of the KV of each replica group of ranks (they are identical: half the pinned
+    // memory and half the device-to-host traffic of a block; the files stay as they were, four buffers, and a read
+    // into shared buffers skips the replicas'), QW_KV_PAIR_CHECK=N exports the replicas of every Nth shared block
+    // as well and counts the ones that differ (a check of the identity, off by default).
     BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir, size_t disk_budget);
     ~BlockStore();
     BlockStore(const BlockStore &) = delete;
@@ -73,6 +77,11 @@ public:
     struct Stats {
         uint64_t hits = 0, tokens_restored = 0, snapshots_saved = 0;
         size_t ram_bytes = 0, disk_bytes = 0, blocks = 0, snapshots = 0;
+        // the pinned pools, summed: arenas pinned and the time that took (background threads), and the saves and
+        // loads that had to wait for an arena (callers' time)
+        uint64_t pins = 0, pin_waits = 0;
+        double pin_s = 0, pin_wait_s = 0;
+        uint64_t pair_mismatches = 0;  // QW_KV_PAIR_CHECK: replicas that differed from their group's first rank
     };
     Stats stats() const;
 
@@ -97,6 +106,9 @@ private:
     static uint64_t key(uint64_t parent, const int32_t *t, size_t n);
 
     std::shared_ptr<Payload> alloc(bool snap);
+    size_t kv_bytes() const { return kv_pool_[0]->unit_bytes() * size_t(kv_copies_); }    // RAM of a block's KV
+    size_t snap_bytes() const { return snap_pool_[0]->unit_bytes() * size_t(RANKS); }     // ... of a snapshot's state
+    void check_pairs(int slot, int64_t pos, int64_t n, const Node &nd);
     size_t ram_size(const Node &nd) const;
     const Node *find(uint64_t k) const;
     // The node for tokens [pos, pos + n) after `parent`, if stored.
@@ -139,6 +151,10 @@ private:
     size_t ram_budget_, disk_budget_;
     size_t ram_bytes_ = 0, disk_bytes_ = 0;
     int load_threads_ = 1;
+    bool kv_pairs_ = false;  // one KV buffer per replica group (QW_KV_PAIRS)
+    int kv_copies_ = RANKS;  // KV buffers a block holds: RANKS, or one per replica group
+    int pair_check_ = 0;     // QW_KV_PAIR_CHECK
+    uint64_t pair_checked_ = 0;
     std::array<std::unique_ptr<PinnedPool>, RANKS> kv_pool_, snap_pool_;
     std::unordered_map<uint64_t, Node> nodes_;
     uint64_t clock_ = 0;

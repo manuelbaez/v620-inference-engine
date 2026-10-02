@@ -83,10 +83,20 @@ void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_
     const std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(from), prompt.begin() + ptrdiff_t(to));
     drop_snapshots_after(slot, from);
     const auto caps = plan_captures(prompt, from, to);
-    if (store_) {  // pin the saves' memory while the GPUs prefill
-        const size_t n = size_t(to), chunks = size_t((int64_t(n) - from + e_.prefill_chunk() - 1) / e_.prefill_chunk());
-        store_->reserve((n - size_t(from)) / BlockStore::BLOCK + 2 * (caps.size() + chunks), caps.size() + chunks);
-    }
+    // Pins the memory the saves of positions (pos, end] will need, in the background, while the GPUs prefill: the
+    // next reserve_ahead_ chunks (QW_RESERVE_AHEAD), or 0: everything up to `to` at once. All at once starts every
+    // arena of a long prompt together (105k tokens: 51 pins of 0.5-9 s, 2026-10-02) and holds memory for saves that a
+    // cancelled request never makes; a window keeps the first buffers early and the rest in step with the prefill.
+    const int64_t chunk = e_.prefill_chunk();
+    auto reserve_saves = [&](int64_t pos) {
+        const int64_t end = reserve_ahead_ > 0 ? std::min<int64_t>(to, pos + int64_t(reserve_ahead_) * chunk) : to;
+        if (!store_ || end <= pos) return;
+        size_t ncaps = 0;
+        for (const auto &c : caps) ncaps += c.pos > pos && c.pos <= end;
+        const size_t chunks = size_t((end - pos + chunk - 1) / chunk);
+        store_->reserve(size_t(end - pos) / BlockStore::BLOCK + 2 * (ncaps + chunks), ncaps + chunks);
+    };
+    reserve_saves(from);
     const auto embeds = vision_embeds(from);
     size_t next = 0;
     e_.prefill(
@@ -100,6 +110,7 @@ void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_
             // to the store at the prompt's end and every prefill chunk, not at every piece
             const bool keep = pos == int64_t(prompt.size()) || pos % e_.prefill_chunk() == 0;
             if (store_ && keep && pos >= min_gap_) store_->save(slot, idx, hist, &snaps_[size_t(idx)].logits);
+            if (reserve_ahead_ > 0) reserve_saves(pos);
         },
         caps, embeds);
     reserved_.clear();

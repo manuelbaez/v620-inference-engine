@@ -1,7 +1,8 @@
 // Pinned pool alone (one HIP device): units are distinct and keep what is
 // written to them while other threads get and put, emptied arenas are given
 // back by the pool's own thread (not inside put()), and the pool grows again
-// after that.
+// after that. Run for both kinds of arena (hipHostMalloc, and huge-page
+// mappings registered with HIP), whose units must also work as DMA targets.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -26,20 +27,15 @@ static double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-int main() {
-    // a deadlock must end the test, not hang the box: abort() under a debugger shows every thread
-    std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(std::getenv("QW_TEST_TIMEOUT") ? std::atoi(std::getenv("QW_TEST_TIMEOUT")) : 120));
-        std::fprintf(stderr, "test_pinned_pool: timed out (a deadlock?)\n");
-        std::abort();
-    }).detach();
+static int run(const char *label, PoolOptions opt) {
+    std::printf("--- %s\n", label);
+    int fails = 0;
     try {
-        int fails = 0;
         auto check = [&](bool ok, const char *what) {
             if (!ok) std::printf("FAIL: %s\n", what);
             fails += !ok;
         };
-        PinnedPool pool(UNIT, PER_ARENA, 0, 2);
+        PinnedPool pool(UNIT, PER_ARENA, 0, 2, opt);
         const size_t arena = UNIT * PER_ARENA;
 
         // 1. 100 units are distinct and keep their contents
@@ -69,6 +65,28 @@ int main() {
         std::printf("peak %zu MB pinned, %zu MB after putting all back; slowest put() %.2f ms\n", peak >> 20,
                     pool.allocated_bytes() >> 20, worst_put);
         check(pool.allocated_bytes() <= 3 * arena, "emptied arenas are given back (a spare stays)");
+
+        // 2b. units are DMA targets: a round trip through a device buffer keeps the bytes
+        {
+            uint8_t *dev = nullptr;
+            CK(hipMalloc(reinterpret_cast<void **>(&dev), UNIT));
+            uint8_t *u = pool.get();
+            for (size_t i = 0; i < UNIT; ++i) u[i] = uint8_t(i * 131 + 7);
+            CK(hipMemcpy(dev, u, UNIT, hipMemcpyHostToDevice));
+            std::fill(u, u + UNIT, uint8_t(0));
+            CK(hipMemcpy(u, dev, UNIT, hipMemcpyDeviceToHost));
+            bool same = true;
+            for (size_t i = 0; i < UNIT; ++i) same = same && u[i] == uint8_t(i * 131 + 7);
+            check(same, "a unit survives a host -> device -> host copy");
+            pool.put(u);
+            CK(hipFree(dev));
+        }
+        {
+            const PoolStats st = pool.stats();
+            std::printf("stats: %llu arenas pinned in %.3f s, %llu waits (%.3f s)\n", (unsigned long long)st.pins,
+                        st.pin_s, (unsigned long long)st.waits, st.wait_s);
+            check(st.pins > 0, "the pool counts the arenas it pinned");
+        }
 
         // 3. the pool grows again
         uint8_t *again = pool.get();
@@ -109,10 +127,26 @@ int main() {
         for (int i = 0; i < 500 && pool.allocated_bytes() > 3 * arena; ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         check(pool.allocated_bytes() <= 3 * arena, "everything but a spare is given back after the stress");
-        std::printf("%s\n", fails ? "FAILED" : "all ok");
-        return fails ? 1 : 0;
     } catch (const std::exception &ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());
         return 1;
     }
+    return fails;
+}
+
+int main() {
+    // a deadlock must end the test, not hang the box: abort() under a debugger shows every thread
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(std::getenv("QW_TEST_TIMEOUT") ? std::atoi(std::getenv("QW_TEST_TIMEOUT")) : 120));
+        std::fprintf(stderr, "test_pinned_pool: timed out (a deadlock?)\n");
+        std::abort();
+    }).detach();
+    int fails = 0;
+    for (auto kind : {PoolOptions::Arena::HostMalloc, PoolOptions::Arena::NonCoherent, PoolOptions::Arena::Huge}) {
+        PoolOptions o;
+        o.arena = kind;
+        fails += run(PoolOptions::name(kind), o);
+    }
+    std::printf("%s\n", fails ? "FAILED" : "all ok");
+    return fails ? 1 : 0;
 }

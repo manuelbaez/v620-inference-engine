@@ -48,6 +48,18 @@ public:
     int device(int rank) const { return dev_[size_t(rank)]; }
     size_t slot_bytes() const { return slot_; }
 
+    // Kernel variants for the big (prefill) payloads. Both give bit-identical results to the plain kernels (the
+    // sums are taken in the same order); they differ in how many threads a copy keeps busy. Read from the
+    // environment at construction; tests and benchmarks may change them between collectives (every rank must use
+    // the same setting for a collective).
+    struct Tuning {
+        bool push2d = false;   // QW_COMM_PUSH2D=1: strided rows pushed by all threads over a flat (row, column) range
+        bool vecrecv = false;  // QW_COMM_VECRECV=1: reductions read 16 bytes per thread and slot
+        static Tuning from_env();
+    };
+    void set_tuning(const Tuning &t) { tune_ = t; }
+    const Tuning &tuning() const { return tune_; }
+
     // Sets rank r's sequence base (enqueued on s, from pinned memory).
     void set_base(int r, uint32_t base, hipStream_t s);
     // Adds delta to rank r's sequence base on the device (enqueued on s): for
@@ -81,6 +93,7 @@ private:
 
     std::array<int, RANKS> dev_{};
     size_t slot_ = 0;
+    Tuning tune_;
     // Per rank: recv[parity][src][slot_] and flags[parity][src] (64 B apart),
     // both uncached, owned by that rank's device.
     std::array<uint8_t *, RANKS> recv_{};

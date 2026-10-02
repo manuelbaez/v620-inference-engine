@@ -178,7 +178,13 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
         ok = read_all(f, l.data(), l.size() * 4);
         if (logits) *logits = std::move(l);
     }
-    for (int r = 0; ok && r < RANKS; ++r) ok = read_all(f, bufs[size_t(r)], rank_bytes);
+    for (int r = 0; ok && r < RANKS; ++r) {
+        // a buffer that an earlier rank already took is a replica's (the KV of a replica group is identical): its
+        // bytes in the file are skipped, not read again
+        bool shared = false;
+        for (int q = 0; q < r; ++q) shared = shared || bufs[size_t(q)] == bufs[size_t(r)];
+        ok = shared ? std::fseek(f, long(rank_bytes), SEEK_CUR) == 0 : read_all(f, bufs[size_t(r)], rank_bytes);
+    }
     std::fclose(f);
     if (!ok) {
         log("disk tier: %s is unreadable", p.c_str());

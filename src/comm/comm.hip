@@ -36,6 +36,7 @@ struct PushArgs {
     uint32_t k;
     int rank;
     int concurrent;
+    int rows2d;  // strided rows: all threads copy a flat range of (row, column) pairs, not row by row
 };
 
 // grid.x = blocks. All blocks serve one destination at a time, in an order
@@ -60,6 +61,17 @@ __device__ void push_body(const PushArgs &a, int block) {
         if (a.rows == 1) {
             const uint4 *s0 = reinterpret_cast<const uint4 *>(src);
             for (int c = blk * blockDim.x + threadIdx.x; c < row16; c += nblk * blockDim.x) dst[c] = s0[c];
+        } else if (a.rows2d) {
+            // Strided rows (a reduce-scatter's slice of every row): a row is 80-300 uint4, so a loop over rows
+            // keeps most of a block's 256 threads idle. One flat index over (row, column) pairs keeps them all busy
+            // (32-bit divisions: the 64-bit ones are emulated).
+            const int total = a.rows * row16;
+            const int stride16 = int(a.src_row_stride / 16);
+            const uint4 *s0 = reinterpret_cast<const uint4 *>(src);
+            for (int i = blk * int(blockDim.x) + int(threadIdx.x); i < total; i += nblk * int(blockDim.x)) {
+                const int row = i / row16, c = i - row * row16;
+                dst[i] = s0[row * stride16 + c];
+            }
         } else {  // 32-bit row loop: 64-bit divisions are emulated
             for (int row = blk; row < a.rows; row += nblk) {
                 const uint4 *s0 = reinterpret_cast<const uint4 *>(src + size_t(row) * a.src_row_stride);
@@ -95,6 +107,7 @@ struct RecvArgs {
     uint32_t k;
     int op;
     int wait;  // poll the flags here (else a preceding wait kernel did)
+    int vec;   // reduce 8 fp16 (4 fp32) per thread with 16-byte loads (the sums and their order are the same)
     int rank;
     void *dst;
     uint32_t *err;  // shared by all ranks (coherent host memory)
@@ -139,7 +152,21 @@ __device__ void recv_body(const RecvArgs &a, int blk, int nblk) {
     __syncthreads();
     const size_t stride = size_t(nblk) * blockDim.x;
     const size_t start = blk * size_t(blockDim.x) + threadIdx.x;
-    if (a.op == 0) {  // sum fp32 -> fp32, same layout
+    if (a.op == 0 && a.vec) {  // sum fp32 -> fp32: 4 floats per thread
+        const size_t n = size_t(a.rows) * a.row_bytes / 16;
+        const float4 *s0 = reinterpret_cast<const float4 *>(slots);
+        float4 *dst = static_cast<float4 *>(a.dst);
+        const size_t qs = a.slot / 16;
+        for (size_t i = start; i < n; i += stride) {
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+            for (int q = 0; q < RANKS; ++q) {
+                const float4 x = s0[q * qs + i];
+                v.x += x.x, v.y += x.y, v.z += x.z, v.w += x.w;
+            }
+            dst[i] = v;
+        }
+    } else if (a.op == 0) {  // sum fp32 -> fp32, same layout
         const size_t n = size_t(a.rows) * a.row_bytes / 4;
         const float *s0 = reinterpret_cast<const float *>(slots);
         float *dst = static_cast<float *>(a.dst);
@@ -149,6 +176,26 @@ __device__ void recv_body(const RecvArgs &a, int blk, int nblk) {
 #pragma unroll
             for (int q = 0; q < RANKS; ++q) v += s0[q * qs + i];
             dst[i] = v;
+        }
+    } else if (a.op == 1 && a.vec) {  // sum fp16 -> fp32: 8 halves per thread, one 16-byte load per slot
+        const size_t n = size_t(a.rows) * a.row_bytes / 16;
+        const uint4 *s0 = reinterpret_cast<const uint4 *>(slots);
+        float4 *dst = static_cast<float4 *>(a.dst);
+        const size_t qs = a.slot / 16;
+        for (size_t i = start; i < n; i += stride) {
+            float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int q = 0; q < RANKS; ++q) {
+                const uint4 x = s0[q * qs + i];
+                const uint32_t w[4] = {x.x, x.y, x.z, x.w};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    v[2 * j] += __half2float(__ushort_as_half(ushort(w[j] & 0xffffu)));
+                    v[2 * j + 1] += __half2float(__ushort_as_half(ushort(w[j] >> 16)));
+                }
+            }
+            dst[2 * i] = make_float4(v[0], v[1], v[2], v[3]);
+            dst[2 * i + 1] = make_float4(v[4], v[5], v[6], v[7]);
         }
     } else if (a.op == 1) {  // sum fp16 -> fp32
         const size_t n = size_t(a.rows) * a.row_bytes / 2;
@@ -190,7 +237,15 @@ __global__ __launch_bounds__(256) void exchange_small_kernel(PushArgs pa, RecvAr
 
 }  // namespace
 
-Comm::Comm(const std::array<int, RANKS> &devices, size_t slot_bytes) : dev_(devices), slot_(slot_bytes) {
+Comm::Tuning Comm::Tuning::from_env() {
+    Tuning t;
+    t.push2d = std::getenv("QW_COMM_PUSH2D") && std::atoi(std::getenv("QW_COMM_PUSH2D")) != 0;
+    t.vecrecv = std::getenv("QW_COMM_VECRECV") && std::atoi(std::getenv("QW_COMM_VECRECV")) != 0;
+    return t;
+}
+
+Comm::Comm(const std::array<int, RANKS> &devices, size_t slot_bytes)
+    : dev_(devices), slot_(slot_bytes), tune_(Tuning::from_env()) {
     QW_CHECK(slot_ % 16 == 0, "comm: slot size must be a multiple of 16");
     for (int r = 0; r < RANKS; ++r) {
         ck(hipSetDevice(dev_[size_t(r)]), "set device");
@@ -267,6 +322,7 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     static const size_t flat_min =
         std::getenv("QW_COMM_CONCURRENT_MAX") ? size_t(std::atol(std::getenv("QW_COMM_CONCURRENT_MAX"))) : 32768;
     const bool flat = flat_ok && rows > 1 && src_row_stride == row_bytes && bytes > flat_min;
+    pa.rows2d = tune_.push2d && !flat && rows > 1 && (row_bytes / 16) < 256;
     pa.rows = flat ? 1 : rows;
     pa.row16 = (flat ? bytes : row_bytes) / 16;
     pa.src_row_stride = src_row_stride;
@@ -299,6 +355,9 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     ra.rank = r;
     ra.dst = dst;
     ra.err = err_;
+    // (16-byte reads need 16-byte aligned destinations)
+    ra.vec = tune_.vecrecv && !pa.concurrent && (op == SUM_F16 || op == SUM_F32) &&
+             (reinterpret_cast<uintptr_t>(dst) & 15) == 0 && (bytes % 16) == 0;  // (decode's small payloads stay as they are)
     static const size_t recv_bytes =
         std::getenv("QW_COMM_RECV_BYTES") ? size_t(std::atol(std::getenv("QW_COMM_RECV_BYTES"))) : 65536;
     const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS + recv_bytes - 1) / recv_bytes)));

@@ -176,6 +176,9 @@ public:
     // per QSA layer (+ MTP) K and V (fp16 [n][256]), raw indexer keys (fp32
     // [n][128]) and the compressed keys of the groups the range completes
     // (fp16 [n/4][128]).
+    // export_kv skips a rank whose buffer is null, and a rank that shares its buffer with the first rank of its KV
+    // group (cfg::kv_primary): the ranks of a group hold identical KV, so a store keeps one copy per group.
+    // import_kv reads every rank's buffer (replicas may point at the same one).
     size_t kv_rank_bytes(int64_t n) const;
     void export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst);
     void import_kv(int slot, int64_t p0, int64_t n, const RankBufs &src);
@@ -261,6 +264,21 @@ private:
     uint32_t record_batch(Rank &rk, int M, int kind);
     void stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos, bool embeddings = true);
     void dispatch();  // run the current job on every rank and wait
+
+    // QW_MOE_STATS: how evenly a prefill chunk's routed-expert work spreads over the ranks. Expert parallelism
+    // makes every rank wait for the busiest one at the next collective, so the sum over layers of the busiest
+    // rank's tiles against the mean's is the factor the MoE phase (and the waiting) grows by.
+    // moe_counts_[r]: pinned [micro-batch][layer][EXP_L] tokens routed to each of rank r's experts, filled by the
+    // rank's prefill job; collect_moe_balance() sums them after the chunk, log_moe_balance() reports and resets.
+    std::array<int32_t *, RANKS> moe_counts_{};
+    struct MoeBalance {
+        int chunks = 0;
+        double max_tiles = 0, mean_tiles = 0, max_pairs = 0, mean_pairs = 0;  // summed over layers and micro-batches
+        std::vector<double> layer_max, layer_mean;                            // tiles per layer, summed over chunks
+    } moe_bal_;
+    bool moe_stats_ = false;
+    void collect_moe_balance();
+    void log_moe_balance();
 
     EngineOptions opt_;
     SafeTensors st_;               // checkpoint, mapped only while loading

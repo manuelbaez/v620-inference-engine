@@ -1,10 +1,15 @@
-// Prefill speed by prompt size: each size prefilled 3 times into an empty
-// slot (after the load-time warm-up), best time reported.
-//   prefill_bench 300 2000 8192
+// Prefill speed by prompt size: each size prefilled R times (default 3) into a slot, after the load-time warm-up;
+// best time reported.
+//   prefill_bench [--ctx N] [--reps R] sizes...        e.g. prefill_bench 300 2000 8192
+// QW_PREFILL_CHUNK sets the chunk (default 8192), QW_PLE_DIR the PLE table (default int4; production: ples_fp8). With --ctx N the slot already holds N tokens (prefilled first,
+// not timed), so the timed tokens attend to a long context, as the fresh part of an agent turn does.
+// QW_PROFILE adds the engine's split of each prefill (host inputs, jobs, after_chunk); QW_MOE_STATS the balance of
+// the routed experts over the ranks.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "core/common.hpp"
@@ -12,23 +17,41 @@
 
 using namespace qw;
 
+static std::vector<int32_t> soup(int n, int seed) {
+    std::vector<int32_t> v(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) v[size_t(i)] = 100 + ((i + seed) * 7919) % 30000;
+    return v;
+}
+
 int main(int argc, char **argv) {
     try {
-        EngineOptions opt;
-        opt.slot_tokens = {32768};
-        Engine e(opt);
+        int ctx = 0, reps = 3;
+        std::vector<int> sizes;
         for (int a = 1; a < argc; ++a) {
-            const int n = std::atoi(argv[a]);
-            std::vector<int32_t> toks(static_cast<size_t>(n));
-            for (int i = 0; i < n; ++i) toks[size_t(i)] = 100 + (i * 7919) % 30000;
+            const std::string s = argv[a];
+            if (s == "--ctx" && a + 1 < argc) ctx = std::atoi(argv[++a]);
+            else if (s == "--reps" && a + 1 < argc) reps = std::atoi(argv[++a]);
+            else sizes.push_back(std::atoi(argv[a]));
+        }
+        const int biggest = sizes.empty() ? 0 : *std::max_element(sizes.begin(), sizes.end());
+        EngineOptions opt;
+        opt.slot_tokens = {std::max(32768, ctx + biggest + 64)};
+        if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;  // production runs ples_fp8
+        if (const char *c = std::getenv("QW_PREFILL_CHUNK")) opt.prefill_chunk = std::atoi(c);
+        Engine e(opt);
+        const std::vector<int32_t> context = soup(ctx, 1);
+        for (int n : sizes) {
+            const std::vector<int32_t> toks = soup(n, 7);
             double best = 1e9;
-            for (int rep = 0; rep < 3; ++rep) {
+            for (int rep = 0; rep < reps; ++rep) {
                 e.slot_reset(0);
+                if (ctx) e.prefill(0, context);
                 const auto t0 = std::chrono::steady_clock::now();
                 e.prefill(0, toks);
                 best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
             }
-            std::printf("prefill %6d tokens: %.3f s, %.0f tok/s\n", n, best, n / best);
+            std::printf("prefill %6d tokens after %6d of context, chunk %d: %.3f s, %.0f tok/s\n", n, ctx,
+                        e.prefill_chunk(), best, n / best);
         }
         return 0;
     } catch (const std::exception &ex) {

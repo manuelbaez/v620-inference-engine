@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 
 #include "core/common.hpp"
 #include "core/config.hpp"
@@ -16,11 +17,12 @@ constexpr size_t KV_LOW_WATER = 8, SNAP_LOW_WATER = 2;  // free units kept ahead
 }  // namespace
 
 struct BlockStore::Payload {
-    Engine::RankBufs p{};
+    Engine::RankBufs p{};  // every rank's buffer; a replica's may be its group's first rank's (QW_KV_PAIRS)
     std::array<PinnedPool *, RANKS> pools{};
+    std::array<bool, RANKS> own{};  // the buffers taken from a pool, to be returned to it
     ~Payload() {
         for (int r = 0; r < RANKS; ++r)
-            if (p[size_t(r)]) pools[size_t(r)]->put(p[size_t(r)]);
+            if (own[size_t(r)]) pools[size_t(r)]->put(p[size_t(r)]);
     }
 };
 
@@ -38,14 +40,18 @@ uint64_t BlockStore::key(uint64_t parent, const int32_t *t, size_t n) {
 
 BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir, size_t disk_budget)
     : e_(e), ram_budget_(ram_budget), disk_budget_(disk_budget) {
+    const PoolOptions po = PoolOptions::from_env();
     for (int r = 0; r < RANKS; ++r) {
         kv_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(e_.kv_rank_bytes(BLOCK), KV_ARENA_UNITS, e_.rank_device(r), 0);
+            std::make_unique<PinnedPool>(e_.kv_rank_bytes(BLOCK), KV_ARENA_UNITS, e_.rank_device(r), 0, po);
         snap_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r), 0);
+            std::make_unique<PinnedPool>(Engine::recurrent_rank_bytes(), SNAP_ARENA_UNITS, e_.rank_device(r), 0, po);
     }
     nodes_[ROOT] = Node{};
     if (const char *t = std::getenv("QW_LOAD_THREADS")) load_threads_ = std::max(1, std::atoi(t));
+    if (const char *t = std::getenv("QW_KV_PAIRS")) kv_pairs_ = std::atoi(t) != 0;
+    if (const char *t = std::getenv("QW_KV_PAIR_CHECK")) pair_check_ = std::max(0, std::atoi(t));
+    kv_copies_ = kv_pairs_ ? RANKS / cfg::KV_REPLICAS : RANKS;
     if (!disk_dir.empty()) {
         disk_ = std::make_unique<DiskTier>(disk_dir, e_.state_layout_id());
         load_index();
@@ -127,17 +133,44 @@ void BlockStore::load_index() {
 std::shared_ptr<BlockStore::Payload> BlockStore::alloc(bool snap) {
     auto pl = std::make_shared<Payload>();
     for (int r = 0; r < RANKS; ++r) {
+        if (!snap && kv_pairs_ && cfg::kv_primary(r) != r) {  // a replica: its group's first rank's buffer
+            pl->p[size_t(r)] = pl->p[size_t(cfg::kv_primary(r))];
+            continue;
+        }
         PinnedPool *pool = snap ? snap_pool_[size_t(r)].get() : kv_pool_[size_t(r)].get();
         pl->pools[size_t(r)] = pool;
         pl->p[size_t(r)] = pool->get();
+        pl->own[size_t(r)] = true;
     }
     return pl;
 }
 
+// QW_KV_PAIR_CHECK: exports the replicas of a block that is stored once per group, from the slot, and compares them
+// with the copy kept (the primaries' buffers). The identity is by design, and holds in every block of the
+// production cache; this finds out if a change of the layout or a card ever breaks it.
+void BlockStore::check_pairs(int slot, int64_t pos, int64_t n, const Node &nd) {
+    const size_t bytes = e_.kv_rank_bytes(n);
+    Engine::RankBufs probe{};
+    std::vector<std::vector<uint8_t>> scratch(RANKS);
+    for (int r = 0; r < RANKS; ++r)
+        if (cfg::kv_primary(r) != r) {
+            scratch[size_t(r)].resize(bytes);
+            probe[size_t(r)] = scratch[size_t(r)].data();
+        }
+    e_.export_kv(slot, pos, n, probe);
+    e_.host_copies_wait();
+    for (int r = 0; r < RANKS; ++r)
+        if (probe[size_t(r)] && std::memcmp(probe[size_t(r)], nd.kv->p[size_t(cfg::kv_primary(r))], bytes) != 0) {
+            ++stats_.pair_mismatches;
+            log("prefix cache: KV of rank %d differs from rank %d at position %lld", r, cfg::kv_primary(r),
+                (long long)pos);
+        }
+}
+
 size_t BlockStore::ram_size(const Node &nd) const {
     size_t b = 0;
-    if (nd.kv) b += kv_pool_[0]->unit_bytes() * RANKS;
-    if (nd.snap) b += snap_pool_[0]->unit_bytes() * RANKS + nd.logits.size() * 4;
+    if (nd.kv) b += kv_bytes();
+    if (nd.snap) b += snap_bytes() + nd.logits.size() * 4;
     return b;
 }
 
@@ -191,7 +224,7 @@ bool BlockStore::ensure_kv(Node &nd, uint64_t k) {
     auto pl = alloc(false);
     if (!disk_->read(k, false, pl->p, e_.kv_rank_bytes(int64_t(nd.tokens.size())), nullptr)) return false;
     nd.kv = std::move(pl);
-    ram_bytes_ += kv_pool_[0]->unit_bytes() * RANKS;
+    ram_bytes_ += kv_bytes();
     return true;
 }
 
@@ -203,7 +236,7 @@ bool BlockStore::ensure_snap(Node &nd, uint64_t k) {
     if (!disk_->read(k, true, pl->p, Engine::recurrent_rank_bytes(), &logits)) return false;
     nd.snap = std::move(pl);
     nd.logits = std::move(logits);
-    ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + nd.logits.size() * 4;
+    ram_bytes_ += snap_bytes() + nd.logits.size() * 4;
     return true;
 }
 
@@ -215,13 +248,13 @@ std::vector<BlockStore::Load::Item> BlockStore::missing(const Hit &h, size_t *by
         if (!nd.kv && nd.kv_disk) {
             const size_t rb = e_.kv_rank_bytes(int64_t(nd.tokens.size()));
             items.push_back({k, false, nullptr, rb, {}});
-            *bytes += rb * RANKS;
+            *bytes += rb * size_t(kv_copies_);  // what a read takes: a shared buffer is read once
         }
     }
     const Node &target = nodes_.at(h.node);
     if (!target.snap && target.snap_disk) {
         items.push_back({h.node, true, nullptr, Engine::recurrent_rank_bytes(), {}});
-        *bytes += Engine::recurrent_rank_bytes() * RANKS;
+        *bytes += Engine::recurrent_rank_bytes() * size_t(RANKS);
     }
     return items;
 }
@@ -297,10 +330,10 @@ void BlockStore::finish_load() {
         if (it.snap && !n.snap) {
             n.snap = std::move(it.pl);
             n.logits = std::move(it.logits);
-            ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + n.logits.size() * 4;
+            ram_bytes_ += snap_bytes() + n.logits.size() * 4;
         } else if (!it.snap && !n.kv) {
             n.kv = std::move(it.pl);
-            ram_bytes_ += kv_pool_[0]->unit_bytes() * RANKS;
+            ram_bytes_ += kv_bytes();
         }
     }
     load_.reset();
@@ -366,7 +399,7 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
             nd.tokens.assign(tokens.begin() + ptrdiff_t(pos), tokens.begin() + ptrdiff_t(pos) + ptrdiff_t(len));
             nd.kv = alloc(false);
             e_.export_kv(slot, pos, int64_t(len), nd.kv->p);
-            ram_bytes_ += kv_pool_[0]->unit_bytes() * RANKS;
+            ram_bytes_ += kv_bytes();
             nodes_.at(h).children.push_back(k);
             fresh.push_back(k);
         }
@@ -382,11 +415,17 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
         target.has_snap = true;
         if (logits) target.logits = *logits;
         target.snap_logits = logits != nullptr;
-        ram_bytes_ += snap_pool_[0]->unit_bytes() * RANKS + target.logits.size() * 4;
+        ram_bytes_ += snap_bytes() + target.logits.size() * 4;
         ++stats_.snapshots_saved;
     }
     const auto t1 = std::chrono::steady_clock::now();
     e_.host_copies_wait();
+    if (kv_pairs_ && pair_check_ > 0)
+        for (uint64_t k : fresh)
+            if (++pair_checked_ % uint64_t(pair_check_) == 0) {
+                const Node &nd = nodes_.at(k);
+                check_pairs(slot, nd.start, int64_t(nd.tokens.size()), nd);
+            }
     if (trace)
         log("prefix cache: saved %lld tokens (%zu new blocks%s): enqueue %.1f ms, copies %.1f ms", (long long)n,
             fresh.size(), new_snap ? ", snapshot" : "", std::chrono::duration<double, std::milli>(t1 - t0).count(),
@@ -496,7 +535,7 @@ void BlockStore::enforce_budgets() {
 
 void BlockStore::reserve(size_t blocks, size_t snapshots) {
     for (int r = 0; r < RANKS; ++r) {
-        kv_pool_[size_t(r)]->reserve(blocks + KV_LOW_WATER);
+        if (!kv_pairs_ || cfg::kv_primary(r) == r) kv_pool_[size_t(r)]->reserve(blocks + KV_LOW_WATER);
         snap_pool_[size_t(r)]->reserve(snapshots + SNAP_LOW_WATER);
     }
 }
@@ -514,6 +553,14 @@ BlockStore::Stats BlockStore::stats() const {
         ++s.blocks;
         s.snapshots += nd.has_snap;
     }
+    for (int r = 0; r < RANKS; ++r)
+        for (const PinnedPool *pool : {kv_pool_[size_t(r)].get(), snap_pool_[size_t(r)].get()}) {
+            const PoolStats ps = pool->stats();
+            s.pins += ps.pins;
+            s.pin_waits += ps.waits;
+            s.pin_s += ps.pin_s;
+            s.pin_wait_s += ps.wait_s;
+        }
     return s;
 }
 

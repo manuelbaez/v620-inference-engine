@@ -45,6 +45,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     pen_.resize(opt_.slot_tokens.size());
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
+    moe_stats_ = std::getenv("QW_MOE_STATS") != nullptr;
 
     for (int r = 0; r < RANKS; ++r) ranks_.push_back(std::make_unique<Rank>());
     // The ranks load in parallel, each on its own thread with its own pool
@@ -166,6 +167,8 @@ Engine::~Engine() {
     }
     cv_.notify_all();
     for (auto &t : threads_) t.join();
+    for (int32_t *c : moe_counts_)
+        if (c) (void)hipHostFree(c);
     if (embed_) (void)hipHostFree(embed_);
 }
 

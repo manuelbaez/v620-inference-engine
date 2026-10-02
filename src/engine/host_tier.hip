@@ -44,6 +44,10 @@ void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
     const KvLayout lay(n);
     const hipMemcpyKind d2h = hipMemcpyDeviceToHost;
     for (size_t r = 0; r < ranks_.size(); ++r) {
+        // a rank without a buffer is skipped, and so is a replica whose buffer is its group's first rank's: that
+        // rank writes it (the group's KV is identical)
+        const size_t first = size_t(cfg::kv_primary(int(r)));
+        if (!dst[r] || (first != r && dst[r] == dst[first])) continue;
         Rank &rk = *ranks_[r];
         CK(hipSetDevice(rk.dev));
         uint8_t *p = dst[r];

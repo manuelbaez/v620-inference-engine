@@ -23,6 +23,12 @@ constexpr int GDN_PROJ_L = GDN_QKV_L + GDN_VL * GDN_DIM + 2 * GDN_VL;  // 4120: 
 constexpr size_t GDN_STATE = size_t(GDN_VL) * GDN_DIM * GDN_DIM;       // floats per layer per sequence
 
 constexpr int QH_L = Q_HEADS / RANKS;  // 6 local q heads (1 kv head)
+// Each KV head lives on KV_REPLICAS cards (2 KV heads on 4): the ranks of a group compute the same K, V and
+// indexer keys from the same inputs, so their KV is byte-identical (checked on the prefix cache's blocks).
+// kv_primary(r) is the first rank of r's group.
+static_assert(RANKS % KV_HEADS == 0, "KV heads must divide the ranks");
+constexpr int KV_REPLICAS = RANKS / KV_HEADS;
+constexpr int kv_primary(int r) { return r - r % KV_REPLICAS; }
 constexpr int QSA_PROJ_L = QH_L * 2 * HEAD_DIM + 2 * HEAD_DIM + (IDX_HEADS + 1) * IDX_DIM;  // 4224
 
 constexpr int EXP_L = N_EXPERTS / RANKS;  // 128 local experts

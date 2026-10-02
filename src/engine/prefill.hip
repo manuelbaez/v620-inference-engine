@@ -47,6 +47,7 @@ void Engine::run_prefill_rank(Rank &rk) {
     static const bool no_split = std::getenv("QW_NO_SPLIT") != nullptr;
     const auto t_start = std::chrono::steady_clock::now();
     const int r = rk.r;
+    if (moe_stats_ && !moe_counts_[size_t(r)]) moe_counts_[size_t(r)] = pinned<int32_t>(size_t(2) * (N_LAYERS + 1) * EXP_L);
     const auto &segs = pjob_.segs;
     const int T = pjob_.T;
     for (const PrefillSeg &sg : segs)
@@ -258,6 +259,9 @@ void Engine::run_prefill_rank(Rank &rk) {
         gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.logits, N_EXPERTS, false);
         CK(hipMemsetAsync(b.counts, 0, EXP_L * 4, s));
         gpu::moe_route_T(b.logits, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s);
+        if (moe_stats_)  // this micro-batch's tokens per local expert (read after the job, see collect_moe_balance)
+            CK(hipMemcpyAsync(moe_counts_[size_t(r)] + (size_t(&m != &mbs[0]) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
+                              b.counts, EXP_L * 4, hipMemcpyDeviceToHost, s));
         gpu::moe_scatter_T(b.tok_e, b.counts, T, b.offsets, b.fill, b.tok_slot, b.pair_tok, s);
         static const bool int8_experts = std::getenv("QW_INT8_EXPERTS") != nullptr;
         gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.counts, b.offsets, b.pair_tok, b.bin, T, b.tiles,
@@ -468,12 +472,22 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
         }
     }
     seg_logits_.resize(1);
+    // QW_PROFILE: where the wall time of a prefill goes: the host side before each chunk (embedding and PLE rows,
+    // the GPUs idle), the chunk's job, and the caller's after_chunk (the prefix cache's saves, the GPUs idle again)
+    static const bool profile = std::getenv("QW_PROFILE") != nullptr;
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    double t_inputs = 0, t_job = 0, t_after = 0;
+    int chunks = 0;
+    const auto t_begin = clk::now();
     for (size_t c0 = 0; c0 < tokens.size(); c0 += size_t(opt_.prefill_chunk)) {
         const int T = int(std::min<size_t>(size_t(opt_.prefill_chunk), tokens.size() - c0));
         std::vector<int32_t> chunk(tokens.begin() + ptrdiff_t(c0), tokens.begin() + ptrdiff_t(c0) + T);
+        const auto t0 = clk::now();
         pemb_.resize(size_t(T) * H);
         pple_.resize(size_t(T) * H);
         prefill_inputs(slot, chunk, 0, embeds);
+        const auto t1 = clk::now();
         PrefillSeg sg{slot, sh.len, T, 0, sh.reset, mtp_ && sh.pend_valid && sh.len > 0, {}};
         for (const Capture &c : captures)
             if (c.pos > sh.len && c.pos <= sh.len + T) sg.captures.push_back(c);
@@ -483,12 +497,22 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
         seg_logits_[0].resize(VOCAB);
         job_ = Job::Prefill;
         dispatch();
+        const auto t2 = clk::now();
+        if (moe_stats_) collect_moe_balance();
         if (!all) std::swap(logits_, seg_logits_[0]);
         prefill_commit(slot, chunk);
         if (all) all_logits->insert(all_logits->end(), plogits_.begin(), plogits_.end());
         if (after_chunk) after_chunk(sh.len);
+        t_inputs += ms(t0, t1);
+        t_job += ms(t1, t2);
+        t_after += ms(t2, clk::now());
+        ++chunks;
     }
     if (all) std::copy(all_logits->end() - VOCAB, all_logits->end(), logits_.begin());
+    if (profile && chunks)
+        log("prefill %zu tokens in %.0f ms (%d chunks): host inputs %.0f ms, jobs %.0f ms, after_chunk %.0f ms",
+            tokens.size(), ms(t_begin, clk::now()), chunks, t_inputs, t_job, t_after);
+    if (moe_stats_) log_moe_balance();
     return logits_;
 }
 

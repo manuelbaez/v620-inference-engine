@@ -46,7 +46,9 @@ public:
     // alive until then. Returns the file's size.
     size_t write(const Meta &m, std::vector<float> logits, const Engine::RankBufs &bufs, size_t rank_bytes,
                  std::shared_ptr<const void> keep);
-    // Reads a file's payload into bufs (and its logits); waits for a queued write of it first.
+    // Reads a file's payload into bufs (and its logits); waits for a queued write of it first. A buffer that
+    // several ranks share (a store that keeps one KV copy per replica group) is read once: the file's bytes for
+    // the later ranks are skipped.
     bool read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size_t rank_bytes, std::vector<float> *logits);
     void remove(uint64_t hash, bool snap);
     // Blocks until queued writes are on disk.
