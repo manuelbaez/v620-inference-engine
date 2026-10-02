@@ -48,13 +48,12 @@ public:
     int device(int rank) const { return dev_[size_t(rank)]; }
     size_t slot_bytes() const { return slot_; }
 
-    // Kernel variants for the big (prefill) payloads. Both give bit-identical results to the plain kernels (the
-    // sums are taken in the same order); they differ in how many threads a copy keeps busy. Read from the
-    // environment at construction; tests and benchmarks may change them between collectives (every rank must use
-    // the same setting for a collective).
+    // Kernel variants for the big (prefill) payloads. The 2D push gives bit-identical results to the plain kernels (the
+    // sums are taken in the same order) and differs only in how many threads a copy keeps busy. Read from the
+    // environment at construction; tests and benchmarks may change it between collectives (every rank must use the
+    // same setting for a collective).
     struct Tuning {
-        bool push2d = false;   // QW_COMM_PUSH2D=1: strided rows pushed by all threads over a flat (row, column) range
-        bool vecrecv = false;  // QW_COMM_VECRECV=1: reductions read 16 bytes per thread and slot
+        bool push2d = false;  // QW_COMM_PUSH2D=1: strided or short rows pushed by all threads over a flat (row, column) range
         static Tuning from_env();
     };
     void set_tuning(const Tuning &t) { tune_ = t; }

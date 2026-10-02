@@ -23,6 +23,7 @@ double since(std::chrono::steady_clock::time_point t0) {
 
 PoolOptions PoolOptions::from_env() {
     PoolOptions o;
+    if (const char *t = std::getenv("QW_POOL_SERIAL")) o.serial = std::atoi(t) != 0;
     if (const char *a = std::getenv("QW_POOL_ARENA")) {
         const std::string v = a;
         if (v == "noncoherent") o.arena = Arena::NonCoherent;
@@ -75,6 +76,9 @@ bool PinnedPool::map_arena(Arena &a, size_t bytes) const {
 }
 
 std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
+    static std::mutex gate;  // shared by every pool (PoolOptions::serial)
+    std::unique_lock<std::mutex> turn(gate, std::defer_lock);
+    if (opt_.serial) turn.lock();
     const auto t0 = std::chrono::steady_clock::now();
     auto a = std::make_unique<Arena>();
     CK(hipSetDevice(device_));

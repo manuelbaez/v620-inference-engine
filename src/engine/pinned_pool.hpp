@@ -29,6 +29,9 @@ struct PoolOptions {
     // 0.03-0.05 s with huge pages, on the production host).
     enum class Arena { HostMalloc, NonCoherent, Huge };
     Arena arena = Arena::HostMalloc;
+    // One arena is pinned at a time in the whole process (a gate shared by every pool): pins hold the process's
+    // memory-map lock, so overlapping ones make each other, and every thread that maps memory, wait longer.
+    bool serial = false;  // QW_POOL_SERIAL=1
     // QW_POOL_ARENA=malloc|noncoherent|huge
     static PoolOptions from_env();
     static const char *name(Arena a);

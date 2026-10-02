@@ -2,7 +2,10 @@
 // hundred MB, one allocating thread per pool, every pool on its own device. The pools of one engine (a KV and a
 // snapshot pool per rank) pin at the same time, which took 0.7-9 s per 256 MB arena on the production host
 // (2026-10-02) where mmap + mlock of the same size takes 0.03-0.26 s.
-//   pin_bench [arena_mb=256] [rounds=4]
+//   pin_bench [arena_mb=256] [rounds=4] [--busy]
+// --busy keeps every GPU running compute kernels (back-to-back ~50 ms launches filling all CUs, as a prefill chunk
+// does for ~2 s) while the arenas are pinned: mapping new host pages into a GPU's address space may have to wait
+// for the work in flight, which would make pins during a prefill as slow as the prefill's kernels.
 // For each way to get pinned memory and each number of threads: per-arena latency and aggregate GB/s, and the
 // latency of a small mmap + touch + munmap on another thread meanwhile (the probe): if pinning holds the process's
 // memory-map lock, every thread that maps or faults memory waits for it, which stalls the engine's other threads.
@@ -40,6 +43,14 @@ static double now() {
 #endif
 
 constexpr size_t HUGE_PAGE = size_t(2) << 20;
+
+// a compute kernel that occupies every CU for about `iters` fused multiply-adds per thread
+__global__ void burn(float *out, int iters) {
+    float x = float(threadIdx.x) * 1e-3f + 1.0f;
+#pragma unroll 4
+    for (int i = 0; i < iters; ++i) x = x * 1.0000001f + 0.5f;
+    if (x == 1234.5f) out[blockIdx.x] = x;  // never true: keeps the loop alive
+}
 
 enum class Way { HostMalloc, HostMallocNonCoherent, Map4K, MapHuge, MapHugePopulate };
 static const char *name_of(Way w) {
@@ -93,8 +104,17 @@ static void give(Way w, Mem &m) {
 
 int main(int argc, char **argv) {
     try {
-        const size_t mb = argc > 1 ? size_t(std::atoi(argv[1])) : 256;
-        const int rounds = argc > 2 ? std::atoi(argv[2]) : 4;
+        size_t mb = 256;
+        int rounds = 4;
+        bool busy = false;
+        {
+            int pos = 0;
+            for (int i = 1; i < argc; ++i) {
+                if (std::string(argv[i]) == "--busy") busy = true;
+                else if (pos++ == 0) mb = size_t(std::atoi(argv[i]));
+                else rounds = std::atoi(argv[i]);
+            }
+        }
         int ndev = 0;
         CK(hipGetDeviceCount(&ndev));
         const size_t bytes = mb << 20;
@@ -106,7 +126,42 @@ int main(int argc, char **argv) {
             CK(hipHostMalloc(&w, size_t(2) << 20, 0));
             CK(hipHostFree(w));
         }
-        std::printf("%d device(s); arenas of %zu MB, %d rounds per thread\n", ndev, mb, rounds);
+        // --busy: one thread per device keeps its GPU computing
+        std::atomic<bool> burning{false}, burn_stop{false};
+        std::vector<std::thread> burners;
+        if (busy) {
+            for (int d = 0; d < ndev; ++d)
+                burners.emplace_back([&, d] {
+                    CK(hipSetDevice(d));
+                    hipDeviceProp_t prop;
+                    CK(hipGetDeviceProperties(&prop, d));
+                    float *sink = nullptr;
+                    CK(hipMalloc(&sink, 4096 * sizeof(float)));
+                    hipStream_t st;
+                    CK(hipStreamCreate(&st));
+                    int iters = 1 << 20;  // tuned below to ~50 ms per launch
+                    for (int tune = 0; tune < 6; ++tune) {
+                        const double a = now();
+                        burn<<<prop.multiProcessorCount * 8, 256, 0, st>>>(sink, iters);
+                        CK(hipStreamSynchronize(st));
+                        const double t = now() - a;
+                        if (t > 0.03 && t < 0.08) break;
+                        iters = int(double(iters) * 0.05 / std::max(t, 1e-4));
+                    }
+                    burning = true;
+                    while (!burn_stop.load()) {
+                        burn<<<prop.multiProcessorCount * 8, 256, 0, st>>>(sink, iters);
+                        burn<<<prop.multiProcessorCount * 8, 256, 0, st>>>(sink, iters);  // keep the queue non-empty
+                        CK(hipStreamSynchronize(st));
+                    }
+                    CK(hipStreamDestroy(st));
+                    CK(hipFree(sink));
+                });
+            while (!burning.load()) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        std::printf("%d device(s)%s; arenas of %zu MB, %d rounds per thread\n", ndev,
+                    busy ? ", every GPU busy with compute kernels" : "", mb, rounds);
         std::printf("%-46s %8s %10s %10s %10s %10s | %9s %9s %9s\n", "way", "threads", "mean s", "max s", "wall s",
                     "GB/s total", "probe max", "probe p99", "probe mean");
         const Way ways[] = {Way::HostMalloc, Way::HostMallocNonCoherent, Way::Map4K, Way::MapHuge, Way::MapHugePopulate};
@@ -170,6 +225,8 @@ int main(int argc, char **argv) {
                 std::fflush(stdout);
             }
 
+        burn_stop = true;
+        for (auto &t : burners) t.join();
         std::printf("\neach way's memory: CPU write/read GB/s, then from every device 64 MB host -> device / device -> host GB/s\n");
         for (Way w : ways) {
             std::printf("%-46s", name_of(w));

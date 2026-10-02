@@ -52,10 +52,11 @@ int main() {
         Comm comm({0, 1, 2, 3}, 32u << 20);
         constexpr int H = cfg::H, SHARD = cfg::SH, DPAD = 328;
         const int row_sets[] = {256, 640, 2048};
-        const Comm::Tuning variants[] = {{false, false}, {true, false}, {false, true}, {true, true}};
-        const char *vname[] = {"plain", "push2d", "vecrecv", "both"};
+        const Comm::Tuning variants[] = {{false}, {true}};
+        const char *vname[] = {"plain", "push2d"};
+        constexpr int NVAR = 2;
         // results[variant][rank]: every output of every op and rows, concatenated as raw bytes
-        std::vector<std::vector<std::vector<uint8_t>>> results(4, std::vector<std::vector<uint8_t>>(RANKS));
+        std::vector<std::vector<std::vector<uint8_t>>> results(NVAR, std::vector<std::vector<uint8_t>>(RANKS));
         Barrier bar(RANKS);
         auto rank_fn = [&](int r) {
             CK(hipSetDevice(comm.device(r)));
@@ -75,7 +76,7 @@ int main() {
             CK(hipMemcpy(d16, h.data(), h.size() * 2, hipMemcpyHostToDevice));
             CK(hipMemcpy(d32, f.data(), f.size() * 4, hipMemcpyHostToDevice));
             uint32_t k = 0;
-            for (int v = 0; v < 4; ++v) {
+            for (int v = 0; v < NVAR; ++v) {
                 bar.wait();
                 if (r == 0) comm.set_tuning(variants[v]);
                 bar.wait();
@@ -112,7 +113,7 @@ int main() {
         for (auto &t : th) t.join();
         QW_CHECK(comm.error() == 0, "a receive timed out");
         int fails = 0;
-        for (int v = 1; v < 4; ++v)
+        for (int v = 1; v < NVAR; ++v)
             for (int r = 0; r < RANKS; ++r) {
                 const bool same = results[size_t(v)][size_t(r)] == results[0][size_t(r)];
                 std::printf("%-8s rank %d: %zu bytes %s\n", vname[v], r, results[size_t(v)][size_t(r)].size(),

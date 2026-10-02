@@ -72,8 +72,7 @@ static void engine_mode(int iters) {
         const char *name;
         Comm::Tuning t;
     };
-    const Variant variants[] = {{"plain", {false, false}}, {"push2d", {true, false}}, {"vecrecv", {false, true}},
-                                {"both", {true, true}}};
+    const Variant variants[] = {{"plain", {false}}, {"push2d", {true}}};
     const size_t nops = std::size(ops), nrows = std::size(row_sets), nvar = std::size(variants);
     // ms[variant][rank][rows index * nops + op]
     std::vector<std::vector<std::vector<double>>> ms(nvar, std::vector<std::vector<double>>(RANKS, std::vector<double>(nops * nrows, 0.0)));

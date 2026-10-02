@@ -129,7 +129,7 @@ qw_gpu_program(qw_vision_pos_eval tools/qw_vision_pos_eval.hip)
 qw_gpu_program(qw_calibrate tools/qw_calibrate.hip)
 set_target_properties(qw_gpu_cli PROPERTIES OUTPUT_NAME qw_gpu)
 
-foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_bench prefill_bench cold_prefill_bench comm_bench pin_bench)
+foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_bench prefill_bench cold_prefill_bench comm_bench pin_bench decode_stall_bench)
   qw_gpu_program(${b} bench/${b}.hip)
 endforeach()
 qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)

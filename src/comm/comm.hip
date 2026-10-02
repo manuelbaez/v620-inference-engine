@@ -107,7 +107,6 @@ struct RecvArgs {
     uint32_t k;
     int op;
     int wait;  // poll the flags here (else a preceding wait kernel did)
-    int vec;   // reduce 8 fp16 (4 fp32) per thread with 16-byte loads (the sums and their order are the same)
     int rank;
     void *dst;
     uint32_t *err;  // shared by all ranks (coherent host memory)
@@ -152,21 +151,7 @@ __device__ void recv_body(const RecvArgs &a, int blk, int nblk) {
     __syncthreads();
     const size_t stride = size_t(nblk) * blockDim.x;
     const size_t start = blk * size_t(blockDim.x) + threadIdx.x;
-    if (a.op == 0 && a.vec) {  // sum fp32 -> fp32: 4 floats per thread
-        const size_t n = size_t(a.rows) * a.row_bytes / 16;
-        const float4 *s0 = reinterpret_cast<const float4 *>(slots);
-        float4 *dst = static_cast<float4 *>(a.dst);
-        const size_t qs = a.slot / 16;
-        for (size_t i = start; i < n; i += stride) {
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-            for (int q = 0; q < RANKS; ++q) {
-                const float4 x = s0[q * qs + i];
-                v.x += x.x, v.y += x.y, v.z += x.z, v.w += x.w;
-            }
-            dst[i] = v;
-        }
-    } else if (a.op == 0) {  // sum fp32 -> fp32, same layout
+    if (a.op == 0) {  // sum fp32 -> fp32, same layout
         const size_t n = size_t(a.rows) * a.row_bytes / 4;
         const float *s0 = reinterpret_cast<const float *>(slots);
         float *dst = static_cast<float *>(a.dst);
@@ -176,26 +161,6 @@ __device__ void recv_body(const RecvArgs &a, int blk, int nblk) {
 #pragma unroll
             for (int q = 0; q < RANKS; ++q) v += s0[q * qs + i];
             dst[i] = v;
-        }
-    } else if (a.op == 1 && a.vec) {  // sum fp16 -> fp32: 8 halves per thread, one 16-byte load per slot
-        const size_t n = size_t(a.rows) * a.row_bytes / 16;
-        const uint4 *s0 = reinterpret_cast<const uint4 *>(slots);
-        float4 *dst = static_cast<float4 *>(a.dst);
-        const size_t qs = a.slot / 16;
-        for (size_t i = start; i < n; i += stride) {
-            float v[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-#pragma unroll
-            for (int q = 0; q < RANKS; ++q) {
-                const uint4 x = s0[q * qs + i];
-                const uint32_t w[4] = {x.x, x.y, x.z, x.w};
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    v[2 * j] += __half2float(__ushort_as_half(ushort(w[j] & 0xffffu)));
-                    v[2 * j + 1] += __half2float(__ushort_as_half(ushort(w[j] >> 16)));
-                }
-            }
-            dst[2 * i] = make_float4(v[0], v[1], v[2], v[3]);
-            dst[2 * i + 1] = make_float4(v[4], v[5], v[6], v[7]);
         }
     } else if (a.op == 1) {  // sum fp16 -> fp32
         const size_t n = size_t(a.rows) * a.row_bytes / 2;
@@ -240,7 +205,6 @@ __global__ __launch_bounds__(256) void exchange_small_kernel(PushArgs pa, RecvAr
 Comm::Tuning Comm::Tuning::from_env() {
     Tuning t;
     t.push2d = std::getenv("QW_COMM_PUSH2D") && std::atoi(std::getenv("QW_COMM_PUSH2D")) != 0;
-    t.vecrecv = std::getenv("QW_COMM_VECRECV") && std::atoi(std::getenv("QW_COMM_VECRECV")) != 0;
     return t;
 }
 
@@ -355,9 +319,6 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     ra.rank = r;
     ra.dst = dst;
     ra.err = err_;
-    // (16-byte reads need 16-byte aligned destinations)
-    ra.vec = tune_.vecrecv && !pa.concurrent && (op == SUM_F16 || op == SUM_F32) &&
-             (reinterpret_cast<uintptr_t>(dst) & 15) == 0 && (bytes % 16) == 0;  // (decode's small payloads stay as they are)
     static const size_t recv_bytes =
         std::getenv("QW_COMM_RECV_BYTES") ? size_t(std::atol(std::getenv("QW_COMM_RECV_BYTES"))) : 65536;
     const int rblocks = std::max(1, int(std::min<size_t>(256, (bytes * RANKS + recv_bytes - 1) / recv_bytes)));
