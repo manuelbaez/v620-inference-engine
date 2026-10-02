@@ -44,10 +44,10 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     if (const char *t = std::getenv("QW_KV_PAIRS")) kv_pairs_ = std::atoi(t) != 0;
     if (const char *t = std::getenv("QW_KV_PAIR_CHECK")) pair_check_ = std::max(0, std::atoi(t));
     kv_copies_ = kv_pairs_ ? RANKS / cfg::KV_REPLICAS : RANKS;
-    // QW_POOL_RESERVE_GB: pinned memory kept free ahead of the saves (the pools top it up in the background after
-    // every take, and start by pinning it). Pinning an arena means reclaiming pages first (a host whose NUMA nodes
-    // are full of page cache and ARC: direct reclaim and failing compaction), 0.5-9 s per 256 MB, so a prefill that
-    // grows the cache waits for it unless the memory was pinned before. Split 60:40 between blocks and snapshots
+    // QW_POOL_RESERVE_GB: pinned memory kept free for a burst of saves. The pools pin it a while after start and top it
+    // up one arena at a time after a quiet period, never while a prefill is taking buffers: pinning holds the
+    // process's memory-map lock and overlapping pins slow the prefill itself (a cold 64k-token prefill: 44.7 s with
+    // the whole prompt's arenas pinned at once, 33.9 s without a cache). Split 60:40 between blocks and snapshots
     // (what a prefill makes), evenly over the ranks that hold a copy.
     double reserve_gb = 0;
     if (const char *t = std::getenv("QW_POOL_RESERVE_GB")) reserve_gb = std::max(0.0, std::atof(t));
@@ -61,8 +61,6 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
             std::make_unique<PinnedPool>(kv_unit, KV_ARENA_UNITS, e_.rank_device(r), kv_rank ? kv_low : 0, po);
         snap_pool_[size_t(r)] =
             std::make_unique<PinnedPool>(snap_unit, SNAP_ARENA_UNITS, e_.rank_device(r), snap_low, po);
-        if (kv_rank && kv_low) kv_pool_[size_t(r)]->reserve(kv_low);
-        if (snap_low) snap_pool_[size_t(r)]->reserve(snap_low);
     }
     nodes_[ROOT] = Node{};
     if (!disk_dir.empty()) {

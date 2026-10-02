@@ -88,6 +88,25 @@ static int run(const char *label, PoolOptions opt) {
             check(st.pins > 0, "the pool counts the arenas it pinned");
         }
 
+        // 2c. a standing reserve: pinned a while after start, used up by a burst without any pinning meanwhile, and
+        // topped up again only after a quiet period
+        {
+            const size_t want_units = 40;
+            PinnedPool p2(UNIT, PER_ARENA, 0, want_units, opt);
+            for (int i = 0; i < 600 && p2.allocated_bytes() < want_units * UNIT; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            check(p2.allocated_bytes() >= want_units * UNIT, "the standing reserve is pinned after start");
+            const uint64_t pins0 = p2.stats().pins;
+            std::vector<uint8_t *> burst;
+            for (size_t i = 0; i < want_units; ++i) burst.push_back(p2.get());
+            check(p2.stats().pins == pins0, "a burst served from the reserve pins nothing meanwhile");
+            check(p2.stats().waits == 0, "... and waits for nothing");
+            for (int i = 0; i < 1000 && p2.allocated_bytes() < 2 * want_units * UNIT; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            check(p2.allocated_bytes() >= 2 * want_units * UNIT, "the reserve is topped up after the burst, once the pool is quiet");
+            for (uint8_t *u : burst) p2.put(u);
+        }
+
         // 3. the pool grows again
         uint8_t *again = pool.get();
         std::fill(again, again + UNIT, uint8_t(7));

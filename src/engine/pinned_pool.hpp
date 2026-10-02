@@ -11,6 +11,7 @@
 // Thread-safe.
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -46,8 +47,10 @@ struct PoolStats {
 
 class PinnedPool {
 public:
-    // device: made current while allocating an arena (NUMA placement).
-    PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t low_water, PoolOptions opt = {});
+    // device: made current while allocating an arena (NUMA placement). standing: free units kept ready for a burst of
+    // saves: topped up one arena at a time, only after the pool has had no get() for a while (a refill that ran during
+    // a long prefill would pin concurrently with its compute, which is what it is there to avoid).
+    PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt = {});
     ~PinnedPool();
     PinnedPool(const PinnedPool &) = delete;
     PinnedPool &operator=(const PinnedPool &) = delete;
@@ -75,7 +78,8 @@ private:
 
     size_t unit_;
     int per_arena_, device_;
-    size_t low_water_;
+    size_t standing_;
+    std::chrono::steady_clock::time_point last_get_ = std::chrono::steady_clock::now();
     PoolOptions opt_;
     mutable std::mutex mu_;
     std::condition_variable cv_, ready_cv_;

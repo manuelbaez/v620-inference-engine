@@ -6,6 +6,7 @@
 #                off and on (bit-exactness gates; ~20 min)
 #   pool         pinning and collective microbenchmarks, then the cold long prefill A/B of the store settings
 #                (64k tokens, then 100k for the main candidates; ~50 min)
+#   pool2        the store settings again with the pool's final semantics and the combinations (~35 min)
 #   stall        pins while the GPUs compute, and decode steps timed while arenas are pinned (~10 min)
 #   compute      prefill speed by chunk size, at long context, the MoE balance, micro-batches off, the comm
 #                variants end to end, a kernel trace of one chunk, and the determinism check (~60 min)
@@ -64,6 +65,13 @@ pool)
     run cold_100k 5400 $B/cold_prefill_bench --tokens 100000 --reps 2 --host-gb 64 \
         --configs nostore,old,reserve16+ahead2,reserve10+pairs
     ;;
+pool2)
+    export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
+    run cold_64k 6000 $B/cold_prefill_bench --tokens 65536 --reps 2 --host-gb 48 \
+        --configs nostore,old,ahead2,nc+ahead2,ahead2+pairs,nc+pairs,reserve10+pairs,reserve10+nc+pairs,serial+ahead2+pairs
+    run cold_100k 6000 $B/cold_prefill_bench --tokens 100000 --reps 2 --host-gb 64 \
+        --configs nostore,old,ahead2+pairs,nc+pairs,reserve10+nc+pairs
+    ;;
 stall)
     export QW_PLE_DIR=$FP8
     run pin_busy 900 $B/pin_bench 256 3 --busy
@@ -102,7 +110,7 @@ compute)
         --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 --gen 256 --k 5 --repeat 6
     ;;
 *)
-    echo "usage: $0 correctness|pool|stall|compute [outdir]"
+    echo "usage: $0 correctness|pool|pool2|stall|compute [outdir]"
     exit 2
     ;;
 esac

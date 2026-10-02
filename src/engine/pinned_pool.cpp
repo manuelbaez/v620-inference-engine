@@ -14,6 +14,8 @@ namespace qw {
 
 namespace {
 constexpr double SLOW_ARENA_S = 0.5;  // pinning or freeing an arena slower than this is logged
+constexpr double IDLE_S = 1.5;        // the standing reserve is topped up after this long without a get()
+constexpr int STANDING_GAP_MS = 200;  // ... one arena per this: pins hold the process's memory-map lock
 constexpr size_t HUGE_PAGE = size_t(2) << 20;
 
 double since(std::chrono::steady_clock::time_point t0) {
@@ -37,8 +39,8 @@ const char *PoolOptions::name(Arena a) {
     return a == Arena::Huge ? "huge pages" : a == Arena::NonCoherent ? "non-coherent" : "hipHostMalloc";
 }
 
-PinnedPool::PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t low_water, PoolOptions opt)
-    : unit_(unit_bytes), per_arena_(units_per_arena), device_(device), low_water_(low_water), opt_(opt) {
+PinnedPool::PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt)
+    : unit_(unit_bytes), per_arena_(units_per_arena), device_(device), standing_(standing), opt_(opt) {
     prefetch_ = std::thread([this] { prefetch_loop(); });
 }
 
@@ -137,9 +139,21 @@ void PinnedPool::reserve(size_t n) {
 }
 
 void PinnedPool::prefetch_loop() {
+    using clk = std::chrono::steady_clock;
     std::unique_lock<std::mutex> lk(mu_);
     for (;;) {
-        cv_.wait(lk, [&] { return stop_ || free_units_ < target_ || !retired_.empty(); });
+        // work due now: a reserve() or a starved get() (target_), arenas to unpin, or the standing reserve after a
+        // quiet period (checked again before every arena, so a get() pauses the refill)
+        const auto standing_due = [&] {
+            return free_units_ < standing_ && clk::now() >= last_get_ + std::chrono::duration_cast<clk::duration>(
+                                                                           std::chrono::duration<double>(IDLE_S));
+        };
+        while (!(stop_ || free_units_ < target_ || !retired_.empty() || standing_due())) {
+            if (free_units_ < standing_)
+                cv_.wait_until(lk, last_get_ + std::chrono::duration_cast<clk::duration>(std::chrono::duration<double>(IDLE_S)));
+            else
+                cv_.wait(lk);
+        }
         if (stop_) return;
         while (!retired_.empty()) {  // arenas put() gave up: unpin them off the callers' threads
             auto a = std::move(retired_.back());
@@ -148,7 +162,8 @@ void PinnedPool::prefetch_loop() {
             free_arena(*a);
             lk.lock();
         }
-        if (free_units_ >= target_) {  // units were put back meanwhile: nothing to pin
+        const bool standing = free_units_ >= target_ && standing_due();
+        if (free_units_ >= target_ && !standing) {  // units were put back meanwhile: nothing to pin
             target_ = 0;
             continue;
         }
@@ -160,6 +175,11 @@ void PinnedPool::prefetch_loop() {
         if (free_units_ >= target_) target_ = 0;
         busy_ = false;
         ready_cv_.notify_all();
+        if (standing && free_units_ < standing_) {  // a gentle refill: one arena, then a pause (lock released)
+            lk.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(STANDING_GAP_MS));
+            lk.lock();
+        }
     }
 }
 
@@ -183,7 +203,8 @@ uint8_t *PinnedPool::get() {
             const int i = a->free.back();
             a->free.pop_back();
             --free_units_;
-            want(low_water_);
+            last_get_ = std::chrono::steady_clock::now();
+            if (free_units_ < standing_) cv_.notify_all();  // the refill thread times the quiet period from here
             return a->base + size_t(i) * unit_;
         }
     fail("PinnedPool: free-unit count out of sync");
@@ -198,7 +219,7 @@ void PinnedPool::put(uint8_t *p) {
         ++free_units_;
         ready_cv_.notify_one();  // a caller waiting in get() can take it
         if (int(a.free.size()) == per_arena_ && ++empty_ > 1 &&
-            free_units_ - size_t(per_arena_) >= low_water_) {  // keep one empty arena as a spare
+            free_units_ - size_t(per_arena_) >= standing_) {  // keep one empty arena as a spare, and the standing reserve
             retired_.push_back(std::move(arenas_[k]));
             arenas_.erase(arenas_.begin() + ptrdiff_t(k));
             --empty_;

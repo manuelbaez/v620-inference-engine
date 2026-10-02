@@ -8,8 +8,8 @@
 // hog evicts it, and every token's gather becomes a disk read (the dev box's user has an 8 MB limit: do not use it
 // there; the slow pins reproduce there without it).
 // Configs (environment of the run): nostore (QW_HOST_CACHE_GB=0), then settings of the store over today's
-// defaults: old, noncoherent, huge, ahead2, ahead4, pairs, pairs+check, huge+ahead2, noncoherent+ahead2,
-// all (huge + ahead2 + pairs), nc+pairs (noncoherent + ahead2 + pairs).
+// defaults (see all_configs() for the list: old, noncoherent, huge, ahead2, ahead4, pairs, pairs+check, nc+ahead2,
+// ahead2+pairs, nc+pairs, the reserve and serial ones).
 // QW_PREFILL_CHUNK (default 4096, as in production) sets the chunk, QW_PLE_DIR the PLE table (production: ples_fp8). Prints per run: seconds, tok/s, the pools'
 // arenas pinned and the time that took, saves that waited for an arena and for how long, RAM held by the cache.
 #include <algorithm>
@@ -101,6 +101,10 @@ static std::vector<Config> all_configs(double host_gb) {
     store("nc+pairs", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     // a standing pinned reserve (QW_POOL_RESERVE_GB): the pools pin it at construction and keep it topped up, so the
     // runs start when it is in place (the bench waits for the pools' pins first, as a server would have long since)
+    store("ahead2+pairs", {{"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
+    store("nc+ahead2", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}});
+    store("reserve10+nc+pairs", {{"QW_POOL_RESERVE_GB", "10"}, {"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
+    store("serial+ahead2+pairs", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     store("serial", {{"QW_POOL_SERIAL", "1"}});
     store("serial+ahead2", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}});
     store("reserve16+serial", {{"QW_POOL_RESERVE_GB", "16"}, {"QW_POOL_SERIAL", "1"}});
