@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
             else if (a == "--configs" && i + 1 < argc) only = argv[++i];
         }
         EngineOptions opt;
-        opt.slot_tokens = {tokens + 512};
+        opt.slot_tokens = {(tokens + 512 + 255) / 256 * 256};  // slot sizes are multiples of 256
         if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;  // production runs ples_fp8
         opt.prefill_chunk = std::getenv("QW_PREFILL_CHUNK") ? std::atoi(std::getenv("QW_PREFILL_CHUNK")) : 4096;
         Engine e(opt);

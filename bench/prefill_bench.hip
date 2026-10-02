@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
         }
         const int biggest = sizes.empty() ? 0 : *std::max_element(sizes.begin(), sizes.end());
         EngineOptions opt;
-        opt.slot_tokens = {std::max(32768, ctx + biggest + 64)};
+        opt.slot_tokens = {(std::max(32768, ctx + biggest + 64) + 255) / 256 * 256};  // multiples of 256
         if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;  // production runs ples_fp8
         if (const char *c = std::getenv("QW_PREFILL_CHUNK")) opt.prefill_chunk = std::atoi(c);
         Engine e(opt);
