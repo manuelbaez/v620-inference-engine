@@ -260,11 +260,30 @@ from that.
    **captured inside prefill chunks without splitting them** (the GDN scan
    writes its state after a given token; small kernels copy the rings) at
    chat message starts (`<|im_start|>`) at least 1,024 tokens apart, at chunk
-   ends and at the prompt end. Pinned host memory comes from ~250 MB arenas
-   pinned in the background while the GPUs prefill (pinning on demand stalled
-   prefill 0.2-0.4 s; an arena took 0.7-1.5 s to pin on 2026-10-01 with the four
-   pools pinning at once), and unpinned by the pool's thread once empty (never in
-   the caller). The pool must serve several callers at once (the scheduler's
+   ends and at the prompt end. **The cache stays on even where saving costs
+   more than recomputing would** (the owner's decision, 2026-10-02: it saves
+   energy: a recompute runs the four GPUs at ~620 W for tens of seconds); the
+   work is making its saves and loads cheap, never switching it off.
+   **Replica sharing:** the 2 KV heads sit on 4 cards, so ranks (0,1) and (2,3)
+   hold byte-identical KV; a block keeps one buffer per pair in RAM (half the
+   pinned memory, half the device-to-host traffic, and a disk read into shared
+   buffers skips the replicas' bytes; the files keep four buffers).
+   **Pinned memory** comes from ~250 MB arenas. Pinning one means reclaiming
+   pages first on a host whose NUMA nodes are full of page cache and ARC, holds
+   the process's memory-map lock for the whole pin (every thread that maps or
+   faults memory waits: 45-350 ms on a quiet box, seconds under load) and
+   serializes with the other pins, so it costs the host's memory state: 0.05 s
+   per arena on a settled box, 0.5-1.5 s with the four ranks' pools pinning
+   together, 2-9 s seen in production; and the memory type matters too (default
+   `hipHostMalloc` is coherent, fine-grained memory; non-coherent is cached).
+   So: the saves of a long prefill reserve their buffers a window of chunks
+   ahead (not the whole prompt at once: that started every arena together),
+   an optional standing reserve is pinned at start (the server waits for it
+   before it reports ready) and topped up one arena at a time only after a quiet
+   period, never while a prefill takes buffers, and emptied arenas can be kept
+   instead of unpinned. Switches: `QW_RESERVE_AHEAD`, `QW_KV_PAIRS`,
+   `QW_POOL_ARENA`, `QW_POOL_RESERVE_GB`, `QW_POOL_KEEP`, `QW_POOL_SERIAL`
+   (section 4). The pool must serve several callers at once (the scheduler's
    saves and the disk-load threads): a caller that wakes to find the arena's
    units taken has to ask again, and a returned unit has to wake a waiting
    caller, or a request waits forever (found 2026-10-01). LRU eviction;

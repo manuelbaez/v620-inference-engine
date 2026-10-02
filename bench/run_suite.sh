@@ -102,6 +102,11 @@ compute)
     # most valuable first, so that a window cut short still has the answers that decide defaults
     export QW_PLE_DIR=$FP8
     run prefill_pipeline_exact 1500 $B/test_prefill_pipeline
+    # the settings meant to become defaults, through the tier tests (the earlier gate used huge-page arenas)
+    NEWDEF="QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1 QW_POOL_KEEP=1 QW_POOL_RESERVE_GB=4 QW_COMM_PUSH2D=1"
+    run gate_block_store 1500 env $NEWDEF $B/test_block_store
+    run gate_host_tier 1500 env $NEWDEF $B/test_host_tier
+    run gate_disk_load 1500 env $NEWDEF QW_LOAD_THREADS=2 $B/test_disk_load
     for rep in 1 2; do  # the 2D push of the big collectives, end to end (bit-identical results; chunk 4096 as in production)
         run comm_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
         run comm_push2d_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
