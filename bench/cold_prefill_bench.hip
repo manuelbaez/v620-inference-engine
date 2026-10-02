@@ -3,8 +3,10 @@
 // restart; a freed Session gives its arenas back). Measures what the saves cost the prefill: the same prompt with no
 // store at all is the floor.
 //   cold_prefill_bench [--tokens N=65536] [--reps R=2] [--host-gb G=48] [--hog-gb H=0] [--configs name,name,...]
-// --hog-gb H holds H GB of locked memory during the runs, so that pinning has to find pages in a nearly full host, as
-// on the production box (the PLE table, the cache and the ZFS ARC), instead of in an empty one.
+// --hog-gb H holds H GB of memory during the runs, so that pinning has to find pages in a nearly full host, as on
+// the production box. Only with the PLE table mlocked (ulimit -l unlimited): otherwise the table is page cache, the
+// hog evicts it, and every token's gather becomes a disk read (the dev box's user has an 8 MB limit: do not use it
+// there; the slow pins reproduce there without it).
 // Configs (environment of the run): nostore (QW_HOST_CACHE_GB=0), then settings of the store over today's
 // defaults: old, noncoherent, huge, ahead2, ahead4, pairs, pairs+check, huge+ahead2, noncoherent+ahead2,
 // all (huge + ahead2 + pairs), nc+pairs (noncoherent + ahead2 + pairs).

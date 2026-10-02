@@ -94,6 +94,14 @@ int main(int argc, char **argv) {
         int ndev = 0;
         CK(hipGetDeviceCount(&ndev));
         const size_t bytes = mb << 20;
+        // the first host allocation of a process initializes the runtime's host mappings (0.7 s on the 4-GPU box):
+        // pay it before the timings (the engine has paid it long before its first arena)
+        for (int d = 0; d < ndev; ++d) {
+            CK(hipSetDevice(d));
+            void *w = nullptr;
+            CK(hipHostMalloc(&w, size_t(2) << 20, 0));
+            CK(hipHostFree(w));
+        }
         std::printf("%d device(s); arenas of %zu MB, %d rounds per thread\n", ndev, mb, rounds);
         std::printf("%-46s %8s %10s %10s %10s %10s\n", "way", "threads", "mean s", "max s", "wall s", "GB/s total");
         const Way ways[] = {Way::HostMalloc, Way::HostMallocNonCoherent, Way::Map4K, Way::MapHuge, Way::MapHugePopulate};
