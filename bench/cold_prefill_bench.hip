@@ -201,16 +201,24 @@ int main(int argc, char **argv) {
             if (rep % 2) std::reverse(order.begin(), order.end());
             for (const Config &c : order) run(c, true);
         }
-        std::printf("\nmean seconds over %d reps (relative to nostore, and to old):\n", reps);
-        auto mean = [&](const std::string &n) {
+        std::printf("\nover %d reps: min / median / max seconds, and the mean against nostore and against old:\n", reps);
+        auto stat = [&](const std::string &n, int which) {  // 0 min, 1 median, 2 max, 3 mean
+            std::vector<double> v = times[n];
+            if (v.empty()) return 0.0;
+            std::sort(v.begin(), v.end());
+            if (which == 0) return v.front();
+            if (which == 1) return v[v.size() / 2];
+            if (which == 2) return v.back();
             double s = 0;
-            for (double t : times[n]) s += t;
-            return times[n].empty() ? 0.0 : s / double(times[n].size());
+            for (double t : v) s += t;
+            return s / double(v.size());
         };
-        const double base = mean("nostore"), old = mean("old");
+        const double base = stat("nostore", 3), old = stat("old", 3);
         for (const Config &c : cfgs)
-            std::printf("  %-20s %8.2f s  %+6.1f%% vs nostore  %+6.1f%% vs old\n", c.name.c_str(), mean(c.name),
-                        base > 0 ? 100.0 * (mean(c.name) / base - 1) : 0.0, old > 0 ? 100.0 * (mean(c.name) / old - 1) : 0.0);
+            std::printf("  %-22s %7.2f / %7.2f / %7.2f s   mean %+6.1f%% vs nostore  %+6.1f%% vs old   (median %+6.1f%% vs nostore)\n",
+                        c.name.c_str(), stat(c.name, 0), stat(c.name, 1), stat(c.name, 2),
+                        base > 0 ? 100.0 * (stat(c.name, 3) / base - 1) : 0.0, old > 0 ? 100.0 * (stat(c.name, 3) / old - 1) : 0.0,
+                        stat("nostore", 1) > 0 ? 100.0 * (stat(c.name, 1) / stat("nostore", 1) - 1) : 0.0);
         return 0;
     } catch (const std::exception &ex) {
         std::fprintf(stderr, "error: %s\n", ex.what());

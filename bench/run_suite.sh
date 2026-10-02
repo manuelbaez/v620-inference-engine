@@ -67,7 +67,9 @@ pool)
     ;;
 pool2)
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
-    run cold_64k 6000 $B/cold_prefill_bench --tokens 65536 --reps 2 --host-gb 48 \
+    # pin cost varies a lot between runs on this host (the same configuration took 64.7 s once and 35.3 s next: 173 s
+    # against 37 s of pinning), so three repetitions, and the spread is reported
+    run cold_64k 7200 $B/cold_prefill_bench --tokens 65536 --reps 3 --host-gb 48 \
         --configs nostore,old,ahead2,nc+ahead2,ahead2+pairs,nc+pairs,reserve10+pairs,reserve10+nc+pairs,serial+ahead2+pairs
     run cold_100k 6000 $B/cold_prefill_bench --tokens 100000 --reps 2 --host-gb 64 \
         --configs nostore,old,ahead2+pairs,nc+pairs,reserve10+nc+pairs
