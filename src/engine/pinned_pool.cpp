@@ -26,6 +26,7 @@ double since(std::chrono::steady_clock::time_point t0) {
 PoolOptions PoolOptions::from_env() {
     PoolOptions o;
     if (const char *t = std::getenv("QW_POOL_SERIAL")) o.serial = std::atoi(t) != 0;
+    if (const char *t = std::getenv("QW_POOL_KEEP")) o.keep = std::atoi(t) != 0;
     if (const char *a = std::getenv("QW_POOL_ARENA")) {
         const std::string v = a;
         if (v == "noncoherent") o.arena = Arena::NonCoherent;
@@ -218,13 +219,16 @@ void PinnedPool::put(uint8_t *p) {
         a.free.push_back(int((p - a.base) / ptrdiff_t(unit_)));
         ++free_units_;
         ready_cv_.notify_one();  // a caller waiting in get() can take it
-        if (int(a.free.size()) == per_arena_ && ++empty_ > 1 &&
-            free_units_ - size_t(per_arena_) >= standing_) {  // keep one empty arena as a spare, and the standing reserve
-            retired_.push_back(std::move(arenas_[k]));
-            arenas_.erase(arenas_.begin() + ptrdiff_t(k));
-            --empty_;
-            free_units_ -= size_t(per_arena_);
-            cv_.notify_all();
+        if (int(a.free.size()) == per_arena_) {  // the arena is empty now
+            ++empty_;
+            // keep one empty arena as a spare, and the standing reserve; give the rest back (unless arenas are kept)
+            if (!opt_.keep && empty_ > 1 && free_units_ - size_t(per_arena_) >= standing_) {
+                retired_.push_back(std::move(arenas_[k]));
+                arenas_.erase(arenas_.begin() + ptrdiff_t(k));
+                --empty_;
+                free_units_ -= size_t(per_arena_);
+                cv_.notify_all();
+            }
         }
         return;
     }

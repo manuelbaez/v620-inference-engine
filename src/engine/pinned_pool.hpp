@@ -33,6 +33,11 @@ struct PoolOptions {
     // One arena is pinned at a time in the whole process (a gate shared by every pool): pins hold the process's
     // memory-map lock, so overlapping ones make each other, and every thread that maps memory, wait longer.
     bool serial = false;  // QW_POOL_SERIAL=1
+    // Arenas are kept once pinned: no unpinning when one empties (put() would hand it to the pool's thread, and
+    // unmapping 256 MB holds the process's memory-map lock in write mode as much as pinning it does). A cache at its
+    // budget evicts whole conversations, whose arenas would otherwise be unpinned and pinned again for the next
+    // saves. The pinned total stays at the high-water mark the cache already reached.
+    bool keep = false;  // QW_POOL_KEEP=1
     // QW_POOL_ARENA=malloc|noncoherent|huge
     static PoolOptions from_env();
     static const char *name(Arena a);

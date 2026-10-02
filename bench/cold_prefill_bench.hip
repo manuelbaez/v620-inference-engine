@@ -80,7 +80,7 @@ struct Config {
     std::map<std::string, std::string> env;
 };
 
-static const char *KNOBS[] = {"QW_POOL_ARENA", "QW_RESERVE_AHEAD", "QW_KV_PAIRS", "QW_KV_PAIR_CHECK", "QW_POOL_RESERVE_GB", "QW_POOL_SERIAL"};
+static const char *KNOBS[] = {"QW_POOL_ARENA", "QW_RESERVE_AHEAD", "QW_KV_PAIRS", "QW_KV_PAIR_CHECK", "QW_POOL_RESERVE_GB", "QW_POOL_SERIAL", "QW_POOL_KEEP"};
 
 static std::vector<Config> all_configs(double host_gb) {
     const std::string gb = std::to_string(host_gb);
@@ -107,6 +107,8 @@ static std::vector<Config> all_configs(double host_gb) {
     store("nc+ahead2", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}});
     store("reserve10+nc+pairs", {{"QW_POOL_RESERVE_GB", "10"}, {"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     store("serial+ahead2+pairs", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
+    store("keep", {{"QW_POOL_KEEP", "1"}});
+    store("ahead2+pairs+keep", {{"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}, {"QW_POOL_KEEP", "1"}});
     store("serial", {{"QW_POOL_SERIAL", "1"}});
     store("serial+ahead2", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}});
     store("reserve16+serial", {{"QW_POOL_RESERVE_GB", "16"}, {"QW_POOL_SERIAL", "1"}});
