@@ -2,6 +2,7 @@
 // restoring a prompt's stored prefix into a slot, and snapshotting and saving
 // prefixes while prefilling.
 #include <algorithm>
+#include <chrono>
 
 #include "core/common.hpp"
 #include "session/chunker.hpp"
@@ -103,13 +104,13 @@ void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_
         slot, rest, nullptr,
         [&](int64_t pos) {
             for (; next < caps.size() && caps[next].pos <= pos; ++next)
-                store_->save(slot, caps[next].snap,
-                             std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(caps[next].pos)), nullptr);
+                save_to_store(slot, caps[next].snap,
+                              std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(caps[next].pos)), nullptr);
             hist.insert(hist.end(), prompt.begin() + ptrdiff_t(hist.size()), prompt.begin() + ptrdiff_t(pos));
             const int idx = save_snapshot(slot);
             // to the store at the prompt's end and every prefill chunk, not at every piece
             const bool keep = pos == int64_t(prompt.size()) || pos % e_.prefill_chunk() == 0;
-            if (store_ && keep && pos >= min_gap_) store_->save(slot, idx, hist, &snaps_[size_t(idx)].logits);
+            if (store_ && keep && pos >= min_gap_) save_to_store(slot, idx, hist, &snaps_[size_t(idx)].logits);
             if (reserve_ahead_ > 0) reserve_saves(pos);
         },
         caps, embeds);
@@ -154,18 +155,19 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
                         std::move(caps)});
     }
     if (store_) store_->reserve(blocks, snaps);  // pin the saves' memory while the GPUs prefill
+    const auto pass_start = std::chrono::steady_clock::now();
     const auto &logits = e_.prefill_batch(segs);
     for (size_t i = 0; i < pieces.size(); ++i) {  // what prefill_range does after a chunk, per segment
         const Piece &pc = pieces[i];
         SlotInfo &si = slots_[size_t(pc.slot)];
         const auto &prompt = si.pending;
         for (const Engine::Capture &c : segs[i].captures)
-            store_->save(pc.slot, c.snap, std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(c.pos)),
-                         nullptr);
+            save_to_store(pc.slot, c.snap, std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(c.pos)),
+                          nullptr);
         si.hist.insert(si.hist.end(), prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to));
         const int idx = save_snapshot(pc.slot, &logits[i]);
         const bool keep = pc.to == int64_t(prompt.size()) || pc.to % e_.prefill_chunk() == 0;
-        if (store_ && keep && pc.to >= min_gap_) store_->save(pc.slot, idx, si.hist, &snaps_[size_t(idx)].logits);
+        if (store_ && keep && pc.to >= min_gap_) save_to_store(pc.slot, idx, si.hist, &snaps_[size_t(idx)].logits);
     }
     reserved_.clear();
     std::vector<bool> finished(pieces.size());
@@ -178,6 +180,8 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
         si.pending.clear();
     }
     single_ = false;
+    const double pass_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - pass_start).count();
+    for (const Piece &pc : pieces) slots_[size_t(pc.slot)].timing.prefill_s += pass_s;  // the pass, in full for each
     for (const auto &[slot, max_tokens] : reqs) {
         bool d = slots_[size_t(slot)].pending.empty();
         for (size_t i = 0; i < pieces.size(); ++i)

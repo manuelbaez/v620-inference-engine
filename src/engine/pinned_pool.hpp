@@ -63,6 +63,9 @@ public:
     size_t allocated_bytes() const;  // arenas held
     bool standing_ready() const;     // the standing reserve is in place (or there is none)
     PoolStats stats() const;
+    // Seconds the calling thread has spent waiting in get() for an arena, over all pools (a request's saves read it
+    // before and after, to tell what they waited for).
+    static double thread_wait_s();
 
 private:
     struct Arena {

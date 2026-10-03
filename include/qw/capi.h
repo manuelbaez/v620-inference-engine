@@ -49,6 +49,13 @@ typedef struct qw_cache_stats {
     uint64_t prompt_tokens, reused_tokens, blend_candidate_tokens;
 } qw_cache_stats;
 int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out);
+/* Where the time of the request in `slot` went since its qw_begin_prompt (seconds): restoring from the caches,
+ * the prefill calls it was part of (a batched pass counts in full for each prompt in it; includes the saves), of
+ * which the saves to the prefix cache and of those the wait for pinned buffers. */
+typedef struct qw_slot_timing {
+    double restore_s, prefill_s, save_s, pin_wait_s;
+} qw_slot_timing;
+int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out);
 
 int qw_num_slots(qw_handle *h);
 int64_t qw_slot_capacity(qw_handle *h, int slot);

@@ -229,6 +229,18 @@ int qw_get_cache_stats(qw_handle *h, qw_cache_stats *out) {
     return 0;
 }
 
+int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out) {
+    return guarded(
+        h,
+        [&] {
+            if (slot < 0 || slot >= h->session->num_slots()) return -1;
+            const qw::Session::Timing t = h->session->slot_timing(slot);
+            *out = {t.restore_s, t.prefill_s, t.save_s, t.pin_wait_s};
+            return 0;
+        },
+        -1);
+}
+
 int qw_has_mtp(qw_handle *h) {
     return h->engine->has_mtp() ? 1 : 0;
 }

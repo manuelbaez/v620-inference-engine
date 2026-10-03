@@ -30,6 +30,9 @@ class FakeEngine:
     def cache_stats(self):
         return None
 
+    def slot_timing(self, slot):
+        return {"restore_s": 0.0, "prefill_s": 0.0, "save_s": 0.0, "pin_wait_s": 0.0}
+
     def acquire(self, tokens, max_new, media=None):
         fits = [i for i, c in enumerate(self.capacity) if not self.busy[i] and c >= len(tokens) + max_new]
         if not fits:

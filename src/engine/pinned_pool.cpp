@@ -150,6 +150,14 @@ void PinnedPool::prefetch_loop() {
     }
 }
 
+namespace {
+thread_local double t_wait_s = 0;
+}
+
+double PinnedPool::thread_wait_s() {
+    return t_wait_s;
+}
+
 uint8_t *PinnedPool::get() {
     std::unique_lock<std::mutex> lk(mu_);
     // Waits for an arena, or for a unit another thread puts back. A waiter that wakes to find the
@@ -163,6 +171,7 @@ uint8_t *PinnedPool::get() {
         }
         ++stats_.waits;
         stats_.wait_s += since(t0);
+        t_wait_s += since(t0);
     }
     for (auto &a : arenas_)
         if (!a->free.empty()) {

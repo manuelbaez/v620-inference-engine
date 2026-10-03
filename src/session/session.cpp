@@ -99,6 +99,14 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     return best;
 }
 
+void Session::save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits) {
+    Timing &t = slots_[size_t(slot)].timing;
+    Stopwatch save_time(&t.save_s);
+    const double waited = PinnedPool::thread_wait_s();
+    store_->save(slot, snap, tokens, logits);
+    t.pin_wait_s += PinnedPool::thread_wait_s() - waited;
+}
+
 void Session::release(int slot) {
     SlotInfo &si = slots_[size_t(slot)];
     si.busy = false;
@@ -119,6 +127,7 @@ bool Session::prefill_some(int slot, int64_t max_tokens) {
     if (si.pending.empty()) return true;
     const int64_t from = int64_t(si.hist.size()), n = int64_t(si.pending.size());
     media_ = si.pending_media.empty() ? nullptr : &si.pending_media;
+    Stopwatch prefill_time(&si.timing.prefill_s);
     try {
         prefill_range(slot, si.pending, max_tokens >= n - from ? n : from + std::max<int64_t>(1, max_tokens));
     } catch (...) {
@@ -141,6 +150,8 @@ int64_t Session::begin_keys(int slot, const std::vector<int32_t> &prompt) {
     QW_CHECK(!prompt.empty(), "empty prompt");
     QW_CHECK(int64_t(prompt.size()) <= e_.slot_capacity(slot), "prompt longer than the slot's KV capacity");
     SlotInfo &si = slots_[size_t(slot)];
+    si.timing = Timing{};
+    Stopwatch restore_time(&si.timing.restore_s);
     si.drafts_for = -1;
     si.accept = 0.8f;
     ++si.epoch;

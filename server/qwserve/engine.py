@@ -73,6 +73,10 @@ class CacheStats(ctypes.Structure):
         "prompt_tokens", "reused_tokens", "blend_candidate_tokens")]
 
 
+class SlotTiming(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_double) for name in ("restore_s", "prefill_s", "save_s", "pin_wait_s")]
+
+
 class Engine:
     """ctypes wrapper of the slot C API. Not thread-safe: only the scheduler
     thread calls it."""
@@ -109,6 +113,7 @@ class Engine:
             "qw_persist": (ctypes.c_int, [P]),
             "qw_set_boundary_token": (ctypes.c_int, [P, ctypes.c_int32]),
             "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
+            "qw_get_slot_timing": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(SlotTiming)]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
                                            I32P, I32P]),
@@ -254,6 +259,13 @@ class Engine:
         s = CacheStats()
         self._check(self.lib.qw_get_cache_stats(self.h, ctypes.byref(s)))
         return {name: getattr(s, name) for name, _ in CacheStats._fields_}
+
+    def slot_timing(self, slot):
+        """Seconds the request in `slot` spent restoring from the caches, in prefill calls, saving to the prefix
+        cache (part of the prefill) and waiting for pinned buffers (part of the saves) since begin_prompt."""
+        t = SlotTiming()
+        self._check(self.lib.qw_get_slot_timing(self.h, slot, ctypes.byref(t)))
+        return {name: getattr(t, name) for name, _ in SlotTiming._fields_}
 
     def persist(self):
         """Saves the slots' conversations to the disk prefix cache."""

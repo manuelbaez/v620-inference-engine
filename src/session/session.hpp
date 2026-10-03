@@ -29,6 +29,7 @@
 #include "engine/engine.hpp"
 #include "session/block_store.hpp"
 #include "session/sampling.hpp"
+#include "session/stopwatch.hpp"
 
 namespace qw {
 
@@ -72,6 +73,14 @@ public:
     // restores from RAM), so a long disk read never blocks other requests.
     bool prefetch(int slot, const std::vector<int32_t> &prompt, const std::vector<Media> &media = {});
     bool prefill_some(int slot, int64_t max_tokens);
+    // Where the time of the request now in `slot` went since its begin_prompt (seconds): restoring from the caches,
+    // the prefill calls it was part of (a batched pass counts in full for each prompt in it; includes the saves),
+    // of which the saves to the prefix cache (the store's export and queueing) and of those the wait for pinned
+    // buffers.
+    struct Timing {
+        double restore_s = 0, prefill_s = 0, save_s = 0, pin_wait_s = 0;
+    };
+    Timing slot_timing(int slot) const { return slots_[size_t(slot)].timing; }
     // prefill_some for several slots (slot, max_tokens) in one engine pass
     // (Engine::prefill_batch) when their pieces fit one prefill chunk and none
     // has media; otherwise one after the other. Returns, per slot, whether its
@@ -164,6 +173,7 @@ private:
         std::vector<Media> pending_media;
         std::vector<float> logits;  // after the prompt's last token (sample_prompt)
         uint64_t epoch = 0;         // bumped when hist is replaced (GPU penalty counts rebuild)
+        Timing timing;              // of the request in the slot (slot_timing)
     };
     // prefix cache (prefix_cache.cpp)
     bool restore_from_store(int slot, const std::vector<int32_t> &prompt, size_t slot_reuse, size_t &common);
@@ -177,6 +187,8 @@ private:
     int64_t begin_keys(int slot, const std::vector<int32_t> &prompt);
     // Returns the VRAM snapshot index; logits: after the slot's last token (default: the engine's)
     int save_snapshot(int slot, const std::vector<float> *logits = nullptr);
+    // store_->save, timed into the slot's Timing
+    void save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits);
     void set_prompt_logits(int slot, const std::vector<float> &l);  // the prompt's logits come from a cache
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     // vision (vision_cache.cpp): the prompt with its media tokens as content-derived ids, and the

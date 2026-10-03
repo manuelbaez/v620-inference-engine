@@ -67,7 +67,9 @@ class Request:
         self.rid = "-"           # request id for the logs (set by the API)
         self.t_arrive = time.time()
         self.keep = None    # buffers the engine reads while the prompt is prefilled
-        self.t_admit = self.t_first = None  # prefill start, first token (time.time())
+        self.t_admit = self.t_first = None  # slot taken, first token (time.time())
+        self.t_begin = None  # the prompt's cached part started to be restored (after any disk load)
+        self.timing = None   # the engine's slot_timing() at the first token: restore, prefill (saves, pin wait)
 
     def timings(self):
         """llama.cpp-style per-request timings (llama-swap's activity log reads these)."""
@@ -197,7 +199,25 @@ class Scheduler:
         decode = (f"{(r.generated - 1) / (now - r.t_first):.1f} tok/s"
                   if r.t_first and r.generated > 1 and now > r.t_first else "-")
         print(f"request {r.rid}: {reason}, prompt {len(r.prompt)} ({r.cached} cached), generated {r.generated}, "
-              f"ttft {ttft}, decode {decode}, slot {r.slot}", flush=True)
+              f"ttft {ttft}, decode {decode}, slot {r.slot}{self._phases(r)}", flush=True)
+
+    @staticmethod
+    def _phases(r):
+        """Where the time before the first token went, appended to the request line: waiting for a slot
+        (queue), the disk load of its cached prompt (load), restoring it (restore), the prefill calls of its
+        own (prefill, which includes the saves to the prefix cache and, in them, the wait for pinned
+        buffers) and the rest of the time from the start of the prefill to the first token, which others'
+        decode steps and prefills took (interleaved). The ttft above counts from the slot being taken."""
+        parts = [f"queue {r.t_admit - r.t_arrive:.2f} s"]
+        if r.t_begin is not None:
+            parts.append(f"load {r.t_begin - r.t_admit:.2f} s")
+        t = r.timing
+        if t and r.t_first and r.t_begin is not None:
+            inter = max(0.0, r.t_first - r.t_begin - t["restore_s"] - t["prefill_s"])
+            parts += [f"restore {t['restore_s']:.2f} s",
+                      f"prefill {t['prefill_s']:.2f} s (saves {t['save_s']:.2f} s, pin wait {t['pin_wait_s']:.2f} s)",
+                      f"interleaved {inter:.2f} s"]
+        return " | " + ", ".join(parts)
 
     def _stats(self, force=False):
         """The periodic stats line (like vLLM's): throughput since the last line and the queue."""
@@ -329,6 +349,7 @@ class Scheduler:
 
     def _begin(self, r):
         """Restores what the caches hold of r's prompt into its slot and queues the rest for prefill."""
+        r.t_begin = time.time()
         try:
             r.cached, r.keep = self.e.begin_prompt(r.slot, r.prompt, r.media)
             r.left = len(r.prompt) - r.cached
@@ -399,6 +420,7 @@ class Scheduler:
                     top = self.e.top_logprobs_prompt(r.slot, r.want_top) if r.want_top else None
                     tid, lp = self.e.sample_prompt(r.slot, r.sampling)
                     r.t_first = time.time()
+                    r.timing = self.e.slot_timing(r.slot)
                     r.keep = None
                 except Exception as ex:  # noqa: BLE001
                     r.emit("error", str(ex))

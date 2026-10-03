@@ -62,6 +62,9 @@ class FakeEngine:
     def cache_stats(self):
         return None
 
+    def slot_timing(self, slot):
+        return {"restore_s": 0.001, "prefill_s": 0.002, "save_s": 0.0005, "pin_wait_s": 0.0}
+
     def failure(self):
         return self.failed_with
 
