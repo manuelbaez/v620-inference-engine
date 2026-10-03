@@ -3,7 +3,10 @@
 // disk, scan() indexes the files, and reads from several threads at once (the
 // block store's load workers) are safe and correct, and a read into buffers that
 // ranks share (a store keeping one KV copy per replica group) skips the
-// replicas' bytes in the file.
+// replicas' bytes in the file; a block written from such buffers is a v2 file holding one buffer per group (and a
+// scan and read of it work, also into one buffer per rank).
+#include <sys/stat.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -127,6 +130,55 @@ int main() {
             }
             check(first, "the shared buffer holds the first rank's bytes (the replica's were skipped)");
             check(second, "the next group's buffer holds its own bytes (the skip lands on the right offset)");
+        }
+        // v2 blocks: buffers shared by the ranks of a group are written once per group
+        {
+            const size_t RB = RANK_BYTES;
+            std::vector<uint8_t> a(RB), b(RB);
+            for (size_t j = 0; j < RB; ++j) a[j] = pattern(70, j), b[j] = pattern(72, j);
+            auto keep = std::make_shared<int>(0);
+            Engine::RankBufs grouped_bufs;
+            grouped_bufs[0] = grouped_bufs[1] = a.data();
+            grouped_bufs[2] = grouped_bufs[3] = b.data();
+            DiskTier::Meta m;
+            m.hash = 7000;
+            m.parent = 7;
+            m.tokens.assign(256, 3);
+            const size_t v2_bytes = d.write(m, {}, grouped_bufs, RB, keep);
+            // the same block from four distinct buffers is a v1 file with a buffer per rank
+            std::vector<uint8_t> four(size_t(RANKS) * RB, 1);
+            Engine::RankBufs v1_bufs;
+            for (int r = 0; r < RANKS; ++r) v1_bufs[size_t(r)] = four.data() + size_t(r) * RB;
+            m.hash = 7001;
+            const size_t v1_bytes = d.write(m, {}, v1_bufs, RB, keep);
+            d.flush();
+            check(v1_bytes - v2_bytes == size_t(RANKS - RANKS / cfg::KV_REPLICAS) * RB, "a grouped block is smaller by the replicas' buffers");
+            struct stat st{};
+            char name[64];
+            std::snprintf(name, sizeof name, "%s/%016llx.qwb", dir.c_str(), 7000ull);
+            check(stat(name, &st) == 0 && size_t(st.st_size) == v2_bytes, "the v2 file's size is the size write() returned");
+            std::snprintf(name, sizeof name, "%s/%016llx.qwb", dir.c_str(), 7001ull);
+            check(stat(name, &st) == 0 && size_t(st.st_size) == v1_bytes, "distinct buffers still write a v1 file");
+            int found = 0;
+            for (const auto &mm : d.scan()) found += (mm.hash == 7000 || mm.hash == 7001) && mm.tokens.size() == 256;
+            check(found == 2, "scan indexes v2 and v1 blocks");
+
+            // read into grouped buffers, and into a buffer per rank (the replicas get their group's bytes)
+            std::vector<uint8_t> ra(RB, 0), rb(RB, 0);
+            Engine::RankBufs into_grouped;
+            into_grouped[0] = into_grouped[1] = ra.data();
+            into_grouped[2] = into_grouped[3] = rb.data();
+            check(d.read(7000, false, into_grouped, RB, nullptr), "a v2 block reads into grouped buffers");
+            check(ra == a && rb == b, "grouped buffers hold their group's bytes");
+            std::vector<uint8_t> out(size_t(RANKS) * RB, 0);
+            Engine::RankBufs into_four;
+            for (int r = 0; r < RANKS; ++r) into_four[size_t(r)] = out.data() + size_t(r) * RB;
+            check(d.read(7000, false, into_four, RB, nullptr), "a v2 block reads into a buffer per rank");
+            bool same = true;
+            for (size_t j = 0; j < RB; ++j)
+                same = same && out[j] == a[j] && out[RB + j] == a[j] && out[2 * RB + j] == b[j] && out[3 * RB + j] == b[j];
+            check(same, "every rank gets its group's bytes, replicas included");
+            check(d.read(7001, false, into_four, RB, nullptr) && out[0] == 1 && out[3 * RB + RB - 1] == 1, "a v1 block still reads");
         }
         d.flush();
         check(d.pending_bytes() == 0, "pending bytes are zero at the end");

@@ -5,7 +5,9 @@
 //
 // Files (native endian), written to a temporary name and renamed so a crash
 // never leaves a partial file:
-//   <hash>.qwb  a block:    Header, tokens int32[n], each rank's KV
+//   <hash>.qwb  a block:    Header, tokens int32[n], then the KV: "QWBLOCK2" files hold one buffer per replica group
+//               of ranks (the group's KV is identical: ranks 0 and 1, 2 and 3), "QWBLOCK1" files one per rank;
+//               both are read, and a block is written as v2 when the store keeps one buffer per group
 //   <hash>.qws  a snapshot: Header, logits float[nlogits], each rank's recurrent state
 #pragma once
 
@@ -42,13 +44,13 @@ public:
 
     // Every usable file in the directory (removes unusable ones).
     std::vector<Meta> scan();
-    // Queues a write of rank_bytes from each of bufs; `keep` holds the buffers
-    // alive until then. Returns the file's size.
+    // Queues a write of rank_bytes from each of bufs (a block whose replicas share their group's buffer is written
+    // once per group); `keep` holds the buffers alive until then. Returns the file's size.
     size_t write(const Meta &m, std::vector<float> logits, const Engine::RankBufs &bufs, size_t rank_bytes,
                  std::shared_ptr<const void> keep);
     // Reads a file's payload into bufs (and its logits); waits for a queued write of it first. A buffer that
-    // several ranks share (a store that keeps one KV copy per replica group) is read once: the file's bytes for
-    // the later ranks are skipped.
+    // several ranks share (a store that keeps one KV copy per replica group) is read once; into separate buffers,
+    // the replicas of a v2 block get a copy of their group's bytes.
     bool read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size_t rank_bytes, std::vector<float> *logits);
     void remove(uint64_t hash, bool snap);
     // Blocks until queued writes are on disk.

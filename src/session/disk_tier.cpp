@@ -9,6 +9,7 @@
 
 #include "core/common.hpp"
 #include "core/config.hpp"
+#include "core/shard.hpp"
 
 namespace qw {
 
@@ -25,6 +26,27 @@ struct Header {
 };
 constexpr char MAGIC_BLOCK[8] = {'Q', 'W', 'B', 'L', 'O', 'C', 'K', '1'};
 constexpr char MAGIC_SNAP[8] = {'Q', 'W', 'S', 'N', 'A', 'P', 'S', '1'};
+// v2 block: the KV of a replica group of ranks is identical, so the file holds one buffer per group (the first
+// rank's) instead of one per rank. v1 blocks (a buffer per rank) stay readable.
+constexpr char MAGIC_BLOCK2[8] = {'Q', 'W', 'B', 'L', 'O', 'C', 'K', '2'};
+constexpr int GROUPS = RANKS / cfg::KV_REPLICAS;
+
+bool is_primary(int r) {
+    return cfg::kv_primary(r) == r;
+}
+
+// Whether a block's buffers are one per group: every replica's is its group's first rank's (a store that keeps one
+// KV copy per group). Snapshots have no identical pairs.
+bool grouped(bool snap, const Engine::RankBufs &bufs) {
+    if (snap) return false;
+    for (int r = 0; r < RANKS; ++r)
+        if (!is_primary(r) && bufs[size_t(r)] != bufs[size_t(cfg::kv_primary(r))]) return false;
+    return true;
+}
+
+bool block_magic(const char *m) {
+    return std::memcmp(m, MAGIC_BLOCK, 8) == 0 || std::memcmp(m, MAGIC_BLOCK2, 8) == 0;
+}
 
 bool read_all(std::FILE *f, void *p, size_t n) {
     return std::fread(p, 1, n, f) == n;
@@ -72,8 +94,9 @@ std::vector<DiskTier::Meta> DiskTier::scan() {
         if (!f) continue;
         Header h{};
         Meta m;
-        bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, snap ? MAGIC_SNAP : MAGIC_BLOCK, 8) == 0 &&
-                  h.layout == layout_ && h.ranks == uint32_t(RANKS);
+        bool ok = read_all(f, &h, sizeof h) &&
+                  (snap ? std::memcmp(h.magic, MAGIC_SNAP, 8) == 0 : block_magic(h.magic)) && h.layout == layout_ &&
+                  h.ranks == uint32_t(RANKS);
         if (ok && !snap) {
             m.tokens.resize(size_t(h.ntok));
             ok = h.ntok > 0 && read_all(f, m.tokens.data(), m.tokens.size() * 4);
@@ -100,7 +123,8 @@ std::vector<DiskTier::Meta> DiskTier::scan() {
 
 size_t DiskTier::write(const Meta &m, std::vector<float> logits, const Engine::RankBufs &bufs, size_t rank_bytes,
                        std::shared_ptr<const void> keep) {
-    const size_t bytes = sizeof(Header) + m.tokens.size() * 4 + logits.size() * 4 + size_t(RANKS) * rank_bytes;
+    const size_t copies = grouped(m.snap, bufs) ? size_t(GROUPS) : size_t(RANKS);
+    const size_t bytes = sizeof(Header) + m.tokens.size() * 4 + logits.size() * 4 + copies * rank_bytes;
     std::lock_guard<std::mutex> lk(mu_);
     pending_.insert({m.hash, m.snap});
     pending_bytes_ += bytes;
@@ -138,7 +162,8 @@ bool DiskTier::write_file(const Job &j) {
         return false;
     }
     Header h{};
-    std::memcpy(h.magic, j.m.snap ? MAGIC_SNAP : MAGIC_BLOCK, 8);
+    const bool two = grouped(j.m.snap, j.bufs);
+    std::memcpy(h.magic, j.m.snap ? MAGIC_SNAP : two ? MAGIC_BLOCK2 : MAGIC_BLOCK, 8);
     h.layout = layout_;
     h.hash = j.m.hash;
     h.parent = j.m.parent;
@@ -148,7 +173,8 @@ bool DiskTier::write_file(const Job &j) {
     h.rank_bytes = j.rank_bytes;
     bool ok = write_all(f, &h, sizeof h) && write_all(f, j.m.tokens.data(), j.m.tokens.size() * 4) &&
               write_all(f, j.logits.data(), j.logits.size() * 4);
-    for (int r = 0; ok && r < RANKS; ++r) ok = write_all(f, j.bufs[size_t(r)], j.rank_bytes);
+    for (int r = 0; ok && r < RANKS; ++r)
+        if (!two || is_primary(r)) ok = write_all(f, j.bufs[size_t(r)], j.rank_bytes);
     ok = std::fclose(f) == 0 && ok;
     if (!ok || std::rename(tmp.c_str(), p.c_str()) != 0) {
         std::remove(tmp.c_str());
@@ -170,8 +196,9 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
     std::FILE *f = std::fopen(p.c_str(), "rb");
     if (!f) return false;
     Header h{};
-    bool ok = read_all(f, &h, sizeof h) && std::memcmp(h.magic, snap ? MAGIC_SNAP : MAGIC_BLOCK, 8) == 0 &&
+    bool ok = read_all(f, &h, sizeof h) && (snap ? std::memcmp(h.magic, MAGIC_SNAP, 8) == 0 : block_magic(h.magic)) &&
               h.layout == layout_ && h.hash == hash && h.rank_bytes == rank_bytes && h.ranks == uint32_t(RANKS);
+    const bool two = ok && !snap && std::memcmp(h.magic, MAGIC_BLOCK2, 8) == 0;
     ok = ok && std::fseek(f, long(h.ntok) * 4, SEEK_CUR) == 0;
     if (ok) {
         std::vector<float> l(h.nlogits);
@@ -179,6 +206,10 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
         if (logits) *logits = std::move(l);
     }
     for (int r = 0; ok && r < RANKS; ++r) {
+        if (two) {  // one buffer per group in the file: read for the first rank of each group
+            if (is_primary(r)) ok = read_all(f, bufs[size_t(r)], rank_bytes);
+            continue;
+        }
         // a buffer that an earlier rank already took is a replica's (the KV of a replica group is identical): its
         // bytes in the file are skipped, not read again
         bool shared = false;
@@ -186,6 +217,10 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
         ok = shared ? std::fseek(f, long(rank_bytes), SEEK_CUR) == 0 : read_all(f, bufs[size_t(r)], rank_bytes);
     }
     std::fclose(f);
+    if (ok && two)  // the caller's replicas have buffers of their own: they get the group's bytes
+        for (int r = 0; r < RANKS; ++r)
+            if (!is_primary(r) && bufs[size_t(r)] != bufs[size_t(cfg::kv_primary(r))])
+                std::memcpy(bufs[size_t(r)], bufs[size_t(cfg::kv_primary(r))], rank_bytes);
     if (!ok) {
         log("disk tier: %s is unreadable", p.c_str());
         return false;
