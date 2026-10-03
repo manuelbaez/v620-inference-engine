@@ -82,8 +82,14 @@ int main() {
                 const int64_t reused = s.set_prompt(slot, p);
                 const double dt = now() - t0;
                 std::vector<float> l = e.logits();
-                std::printf("%-3s %5zu tokens in slot %d: reused %5lld, %.3f s\n", name, p.size(), slot,
-                            (long long)reused, dt);
+                const Session::Timing tm = s.slot_timing(slot);
+                std::printf("%-3s %5zu tokens in slot %d: reused %5lld, %.3f s (restore %.3f, prefill %.3f, saves %.3f, pin wait %.3f)\n",
+                            name, p.size(), slot, (long long)reused, dt, tm.restore_s, tm.prefill_s, tm.save_s, tm.pin_wait_s);
+                // the timings add up: the prefill call includes its saves and they their pin wait, and nothing
+                // exceeds the wall time of the call
+                QW_CHECK(tm.save_s <= tm.prefill_s + 1e-3 && tm.pin_wait_s <= tm.save_s + 1e-3, "slot timing: parts exceed their whole");
+                QW_CHECK(tm.restore_s + tm.prefill_s <= dt + 1e-3, "slot timing: more than the call took");
+                QW_CHECK(reused == int64_t(p.size()) || tm.prefill_s > 0, "slot timing: a prefill with no prefill time");
                 return std::make_pair(reused, std::move(l));
             };
             const int slot1 = s.acquire(c1, 16);  // keep conversation 1's slot busy
