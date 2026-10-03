@@ -11,7 +11,7 @@
 // 2026-10-01 (BASE: the whole prompt's buffers reserved at once, one KV buffer per rank, default-flag arenas, no
 // standing reserve, pins in parallel, arenas given back) and names what it changes: old (nothing), noncoherent, ahead2,
 // ahead4, pairs, pairs+check, nc+ahead2, ahead2+pairs, nc+pairs (the code's defaults since 2026-10-02), and the
-// reserve, serial and keep ones (all_configs() has the list).
+// reserve and serial ones (all_configs() has the list).
 // QW_PREFILL_CHUNK (default 4096, as in production) sets the chunk, QW_PLE_DIR the PLE table (production: ples_fp8). Prints per run: seconds, tok/s, the pools'
 // arenas pinned and the time that took, saves that waited for an arena and for how long, RAM held by the cache,
 // and the GPUs' energy for the run (kJ, from the cards' power sensors; the cache exists to save energy).
@@ -86,8 +86,7 @@ struct Config {
 // since: a configuration names only what it changes, and everything else is set to this)
 static const std::map<std::string, std::string> BASE = {{"QW_POOL_ARENA", "malloc"}, {"QW_RESERVE_AHEAD", "0"},
                                                         {"QW_KV_PAIRS", "0"},        {"QW_KV_PAIR_CHECK", "0"},
-                                                        {"QW_POOL_RESERVE_GB", "0"}, {"QW_POOL_SERIAL", "0"},
-                                                        {"QW_POOL_KEEP", "0"}};
+                                                        {"QW_POOL_RESERVE_GB", "0"}, {"QW_POOL_SERIAL", "0"}};
 
 static std::vector<Config> all_configs(double host_gb) {
     const std::string gb = std::to_string(host_gb);
@@ -111,8 +110,6 @@ static std::vector<Config> all_configs(double host_gb) {
     store("nc+ahead2", {{"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}});
     store("reserve10+nc+pairs", {{"QW_POOL_RESERVE_GB", "10"}, {"QW_POOL_ARENA", "noncoherent"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
     store("serial+ahead2+pairs", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}});
-    store("keep", {{"QW_POOL_KEEP", "1"}});
-    store("ahead2+pairs+keep", {{"QW_RESERVE_AHEAD", "2"}, {"QW_KV_PAIRS", "1"}, {"QW_POOL_KEEP", "1"}});
     store("serial", {{"QW_POOL_SERIAL", "1"}});
     store("serial+ahead2", {{"QW_POOL_SERIAL", "1"}, {"QW_RESERVE_AHEAD", "2"}});
     store("reserve16+serial", {{"QW_POOL_RESERVE_GB", "16"}, {"QW_POOL_SERIAL", "1"}});

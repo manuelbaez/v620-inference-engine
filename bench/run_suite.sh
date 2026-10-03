@@ -7,7 +7,7 @@
 #   pool         pinning and collective microbenchmarks, then the cold long prefill A/B of the store settings
 #                (64k tokens, then 100k for the main candidates; ~50 min)
 #   pool2        the store settings again with the pool's final semantics and the combinations (~35 min)
-#   pool3        a cache at its budget: arenas given back and pinned again, or kept (~15 min)
+#   pool3        a cache at its budget (arenas given back and pinned again), and the standing reserve (~40 min)
 #   pool4        the 100k-token cold prefill again: the defaults, pins one at a time, a standing reserve (~30 min)
 #   stall        pins while the GPUs compute, and decode steps timed while arenas are pinned (~10 min)
 #   compute      the collective variant end to end, decode and determinism with it, the prefill input pipeline,
@@ -83,7 +83,7 @@ pool3)
     # either gives them back and pins new ones (churn) or keeps them
     export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
     run churn_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 4 --host-gb 6 \
-        --configs nostore,old,keep,ahead2+pairs,ahead2+pairs+keep
+        --configs nostore,old,ahead2+pairs
     # the standing reserve (the Session waits for it before the clock starts, as a server's first request would)
     run reserve_64k 5400 $B/cold_prefill_bench --tokens 65536 --reps 4 --host-gb 48 \
         --configs nostore,old,ahead2+pairs,reserve10+nc+pairs
@@ -102,6 +102,21 @@ all)  # the stages after pool2, most valuable first
     "$0" pool3 "$OUT/pool3"
     "$0" pool4 "$OUT/pool4"
     ;;
+final)  # the defaults as built, after a rebuild: the gates and the numbers the docs quote (~25 min)
+    export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
+    run f_pinned_pool 300 $B/test_pinned_pool
+    run f_comm_variants 600 $B/test_comm_variants
+    run f_pipeline_exact 1500 $B/test_prefill_pipeline
+    run f_block_store 1500 $B/test_block_store
+    run f_disk_load 1500 $B/test_disk_load
+    run f_decode 1500 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
+    run f_prefill 1500 env QW_PROFILE=1 $B/prefill_bench --reps 3 8192 16384
+    run f_determinism 2400 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 --gen 256 --k 5 --repeat 6
+    # real text for the MoE balance (routing depends on the tokens): the repo's docs and sources, tokenized
+    run f_text_ids 300 "$HOME/qwenv/bin/python" tools/text_tokens.py /mnt/llms/qwen3.8-flash-next-awq/tokenizer.json "$OUT/text_ids.txt" \
+        docs/ENGINE_GUIDE.md docs/DESIGN.md src/engine/prefill.hip src/engine/engine.hpp docs/MODEL.md
+    run f_moe_text 1500 env QW_MOE_STATS=1 QW_PROFILE=1 $B/prefill_bench --reps 1 --tokens-file "$OUT/text_ids.txt" 16384
+    ;;
 stall)
     export QW_PLE_DIR=$FP8
     run pin_busy 900 $B/pin_bench 256 3 --busy
@@ -112,13 +127,13 @@ compute)
     export QW_PLE_DIR=$FP8
     run prefill_pipeline_exact 1500 $B/test_prefill_pipeline
     # the settings meant to become defaults, through the tier tests
-    NEWDEF="QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1 QW_POOL_KEEP=1 QW_POOL_RESERVE_GB=4 QW_COMM_PUSH2D=1"
+    NEWDEF="QW_POOL_ARENA=noncoherent QW_RESERVE_AHEAD=2 QW_KV_PAIRS=1 QW_KV_PAIR_CHECK=1 QW_COMM_PUSH2D=1"
     run gate_block_store 1500 env $NEWDEF $B/test_block_store
     run gate_host_tier 1500 env $NEWDEF $B/test_host_tier
     run gate_disk_load 1500 env $NEWDEF QW_LOAD_THREADS=2 $B/test_disk_load
     for rep in 1 2; do  # the 2D push of the big collectives, end to end (bit-identical results; chunk 4096 as in production)
-        run comm_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
-        run comm_push2d_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
+        run comm_plain_$rep 1500 env QW_COMM_PUSH2D=0 QW_PREFILL_PIPELINE=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
+        run comm_push2d_$rep 1500 env QW_COMM_PUSH2D=1 QW_PREFILL_PIPELINE=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 8192 16384
     done
     for rep in 1 2; do  # decode with and without it: the 2D push also serves multi-row decode collectives
         run decode_plain_$rep 1500 env QW_COMM_PUSH2D=0 $B/test_batch_decode --a 760,6511,314,9338,369 --b 1,2,3,4,5,6,7,8 --gen 48
@@ -130,7 +145,7 @@ compute)
     run determinism_plain 2400 env QW_COMM_PUSH2D=0 QW_PREFILL_CHUNK=4096 $B/test_speculative --p 760,6511,314,9338,369 --p 1,2,3,4,5,6,7,8 \
         --gen 256 --k 5 --repeat 6
     for rep in 1 2; do  # the next chunk's host inputs prepared while the GPUs run this one
-        run pipeline_off_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
+        run pipeline_off_$rep 1500 env QW_COMM_PUSH2D=1 QW_PREFILL_PIPELINE=0 QW_PROFILE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
         run pipeline_on_$rep 1500 env QW_COMM_PUSH2D=1 QW_PROFILE=1 QW_PREFILL_PIPELINE=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --reps 3 16384
     done
     for c in 2048 4096 8192; do  # chunk (and so piece) size
@@ -142,7 +157,7 @@ compute)
         env QW_COMM_PUSH2D=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
     ;;
 *)
-    echo "usage: $0 correctness|pool|pool2|pool3|pool4|stall|compute|all [outdir]"
+    echo "usage: $0 correctness|pool|pool2|pool3|pool4|stall|compute|final|all [outdir]"
     exit 2
     ;;
 esac

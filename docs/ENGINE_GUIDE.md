@@ -166,12 +166,19 @@ Speed figures are single-stream decode unless stated.
 | Flat pushes for big payloads | one copy instead of a block per row | prefill +4-10% | none | on | on | `QW_COMM_ROWWISE=1` old |
 | Two prefill micro-batches | collectives of one half overlap the other | prefill +7% | rounding only | on | on | `QW_NO_SPLIT=1` |
 | Prefill chunk | tokens per prefill pass | 8k vs 4k: ~2% faster prefill | rounding only | 8192 | **4096** (frees ~0.9 GB/card for KV) | `QW_PREFILL_CHUNK` |
+| 2D push of the big collectives | strided or tiny-row payloads (a reduce-scatter's slices, the sums-of-squares all-reduce) copied by all threads over a flat (row, column) range, for 64 rows or more | prefill +5.7% at 8k tokens, +7.6% at 16k (reduce-scatter 1.31 -> 0.52 ms, ssq all-reduce 0.91 -> 0.05 ms per micro-batch); GPU energy -5..6% per prefill; decode untouched | none (bit-identical) | on | not deployed yet (image `15822e2` predates it) | `QW_COMM_PUSH2D=0` |
+| Prefill input pipeline | the next chunk's embeddings and PLE rows prepared on a helper thread while the GPUs run this chunk | 16k tokens +2.9% (host inputs 320 -> 75 ms) | none (bit-identical, checked with captures) | on | not deployed yet | `QW_PREFILL_PIPELINE=0` |
 | Batched prefill | several waiting prompts in one pass | bursts +4-7%, 4 prompts 2.05 -> 1.62 s | rounding only | on | on | `QW_PREFILL_BATCH=0` |
 | Interleaved prefill | long prompts go in pieces between decode steps; short prompts go first, and a lone long prefill yields to arrivals | longest stall 12.4 -> 1.15 s; decoders keep ~22 tok/s | none | piece 2048, decode share 0.25 | same | `QW_PREFILL_PIECE`, `QW_DECODE_SHARE` |
 | KV slots | sequences held at once, each with a KV capacity | more slots = more concurrency | none | 262144,65536,32768,32768 | **262144,131072,65536,32768** | `QW_SLOTS` / `--slots` |
 | Prefix cache, VRAM | reuse a slot's own history and snapshots | skips prefill of reused tokens | none (exact) | on | on | |
 | Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 160 GB, which the host did not hold (OOM kill 2026-10-01); 128 GB recommended (see Host RAM below) | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
 | Prefix cache, disk | blocks and snapshots survive restarts | 4k tokens restored in 0.55 s after restart (dev box); production's cache is on a 2-HDD ZFS mirror: cold loads 160-205 MB/s, 4-6 GB in 21-38 s, ARC-resident GB/s | none (exact) | 200 GB | 200 GB (`/cache` volume, ZFS on HDDs) | `--disk-cache-dir`, `--disk-cache-gb` |
+| Pinned arenas of the cache | how the host buffers of the RAM tier are pinned: `hipHostMalloc`, non-coherent (cached) rather than the default coherent, fine-grained kind | large copies 13-15 GB/s against 1.1; pins cheaper on bad days | none | non-coherent | not deployed yet | `QW_POOL_ARENA=malloc` (huge-page arenas were slower here and were removed) |
+| Rolling save reserve | the saves of a prefill get their pinned buffers two chunks ahead, not the whole prompt at once | cold 100k prompt through the store 54-57 s against 73-93 s (no store 53 s) in a good host state; in a bad one the extra time over no store halves but +49% remains | none | 2 chunks | not deployed yet | `QW_RESERVE_AHEAD` (0 = whole prompt) |
+| KV replica sharing | the 2 KV heads sit on 4 ranks, so ranks (0,1) and (2,3) hold identical KV: a block keeps one RAM buffer per pair | -24% RAM per prompt (12.3 -> 9.3 GB at 64k), half the device-to-host export, 60 -> 42 pins | none (bit-identical: 56 of 56 blocks, a 64k prefill) | on | not deployed yet | `QW_KV_PAIRS=0`, `QW_KV_PAIR_CHECK=N` compares the replicas of every Nth block |
+| Standing pinned reserve | pinned memory kept free for a burst, refilled after 1.5 s without a request; the server waits for it before it reports ready | disk loads 225 -> 800 MB/s from RAM-buffer waits; **worse** during long prefills (100k: 100 s against 77 s), the refill runs between chunks | none | 0 (off) | off | `QW_POOL_RESERVE_GB` |
+| One pin at a time | a process-wide gate serializes arena pins | pin time 74-127 s -> 23-30 s at 100k, the prefill ~4% (not distinguishable) | none | off | off | `QW_POOL_SERIAL=1` |
 | Snapshot spacing | captures at chat message starts at least N apart | | none | 1024 | 1024 | `QW_SNAP_MIN_GAP` |
 | MTP speculative decoding | drafts up to K tokens, verified exactly | 67 -> 107-112 tok/s (Qwen sampling) | none (exact sampling) | K = 5 | 5 | `--mtp` (0 off) |
 | Adaptive draft count | K per request from its running acceptance | avoids drafting that does not pay | none | on | on | `QW_SPEC_BASE`, `QW_SPEC_COST` |
@@ -196,7 +203,11 @@ Speed figures are single-stream decode unless stated.
 | Media by URL | an image or video URL is fetched only when every address of its host is public, and each redirect is checked; videos decode as a stream (one pass counts the frames, one keeps the sampled ones) | a 60 s 1080p30 video: ~11 GB of server memory -> ~0.1 GB; 300 frames of 720p: 1,631 -> 69 MB | none (identical pixels) | public addresses only | public addresses only | `QW_MEDIA_FETCH=0` (data: URLs only), `QW_MEDIA_ALLOW_PRIVATE=1` |
 
 Diagnostics: `QW_TRACE` (step phase timings, sampling fallbacks), `QW_PROFILE`
-(prefill timings), `QW_GUARD` (allocation guard zones), `QW_NOGRAPH`.
+(prefill timings: host inputs, jobs, after_chunk), `QW_MOE_STATS` (busiest rank over
+the mean in expert work, per layer), `QW_GUARD` (allocation guard zones),
+`QW_NOGRAPH`. Benchmarks: `bench/run_suite.sh` runs the pinning, collective, cold
+prefill and compute measurements in stages on the dev box and keeps every log;
+`cold_prefill_bench` and `prefill_bench` report GPU energy next to time.
 
 ---
 
@@ -277,12 +288,13 @@ from that.
    together, 2-9 s seen in production; and the memory type matters too (default
    `hipHostMalloc` is coherent, fine-grained memory; non-coherent is cached).
    So: the saves of a long prefill reserve their buffers a window of chunks
-   ahead (not the whole prompt at once: that started every arena together),
-   an optional standing reserve is pinned at start (the server waits for it
-   before it reports ready) and topped up one arena at a time only after a quiet
-   period, never while a prefill takes buffers, and emptied arenas can be kept
-   instead of unpinned. Switches: `QW_RESERVE_AHEAD`, `QW_KV_PAIRS`,
-   `QW_POOL_ARENA`, `QW_POOL_RESERVE_GB`, `QW_POOL_KEEP`, `QW_POOL_SERIAL`
+   ahead (not the whole prompt at once: that started every arena together).
+   An optional standing reserve (pinned at start, the server waits for it) was
+   built and is off: it refills between the chunks of a prefill and made long
+   prompts slower. Even so a cold 100k prompt through the cache pays +49% over no
+   store when the host is in a bad memory state (+5% in a good one), against
+   +57% (good state, 100k) to +124% (bad state, 64k) before; DESIGN.md has the numbers. Switches: `QW_RESERVE_AHEAD`,
+   `QW_KV_PAIRS`, `QW_POOL_ARENA`, `QW_POOL_RESERVE_GB`, `QW_POOL_SERIAL`
    (section 4). The pool must serve several callers at once (the scheduler's
    saves and the disk-load threads): a caller that wakes to find the arena's
    units taken has to ask again, and a returned unit has to wake a waiting
@@ -509,13 +521,18 @@ fetches that row's full logits (~1 row in 10,000 in real text).
   the margin also covers a disk-tier load (up to ~9 GB taken before the budget
   is enforced). A kill empties the RAM tier, so the next requests load from
   the disk tier. Inside the engine's container `/proc/meminfo` is the host's.
-- **Pinned host memory is slow to make:** `hipHostMalloc` of a 256 MB arena took
-  0.7-1.5 s on the production host (2-9 s with the four ranks' pools pinning at
-  once), against 0.03-0.26 s for `mmap` + `mlock` of the same size (THP in
-  `madvise` mode: 2 MB pages are 4-7x faster). A prefill makes ~200 MB/s of cache
-  data to pin, so a cache that is still growing can throttle a long cold prefill
-  (105k tokens: 104.5 s against ~62 s). Size reserves ahead of the demand and keep
-  arenas. Not reproducible on a workstation with THP always on.
+- **Pinned host memory is slow to make, and slows everything else:** `hipHostMalloc` of a 256 MB arena took 0.05 s on a
+  settled box, 0.7-1.5 s with the four ranks' pools pinning together and 2-9 s in production, because the host's NUMA nodes
+  are full of page cache and every pin reclaims first, and a pin holds the process's memory-map lock (any thread that maps
+  or faults memory waits). A cold 100k-token prompt through the cache took 73-93 s against 53 s without it, with no caller
+  waiting for a buffer: the pins slowed the GPUs' own work. What helped: pin less and later (buffers two chunks ahead, not the
+  whole prompt; one RAM copy per replicated KV pair: -24% bytes). What did not: huge pages (compaction fails here), `hipHostRegister`
+  of ordinary memory (slower), keeping emptied arenas, a standing reserve (it refilled between chunks). The cost drifts with the
+  host's memory state (+5% early in a night, +49% late), so measure with rotating order and repetitions, and expect run-to-run spread.
+  Not reproducible on a workstation with THP always on.
+- **Look for idle threads in collectives:** the strided reduce-scatter used 31% of a block's threads and the tiny-row
+  all-reduce one block per destination; a flat (row, column) index over all threads made them 2.5x and 20x faster, bit-identical,
+  worth +6-8% of prefill. Measure each collective against the link's ceiling (14-24 GB/s per GPU for pushes) before blaming bytes.
 - **Readiness:** the engine reports ready (and the server answers `/health`)
   only after the table is in RAM; before, a cold start served requests while
   rows still came from disk (warmup 28-35 s instead of ~5 s).
@@ -530,8 +547,8 @@ fetches that row's full logits (~1 row in 10,000 in real text).
 | single stream, greedy | ~117 tok/s |
 | plain decode (no drafts) | ~67 tok/s (14.7 ms/step) |
 | 4 concurrent requests | ~231 tok/s aggregate |
-| prefill | ~2,050-2,200 tok/s |
-| prefill in production (1-8k fresh tokens, 2026-10-01 on) | p50 1,869 tok/s; ~1,500 at 100k tokens of context; a cold 105k-token prompt 1,003 tok/s (pinned-memory allocation, DESIGN.md "Prefill and time to first token in production") |
+| prefill | ~2,050-2,200 tok/s; with the 2D push and the input pipeline ~2,190-2,220 at 8-16k tokens (2,153 -> 2,219 at 16k), 1,935 for 4k tokens after 60k of context |
+| prefill in production (1-8k fresh tokens, 2026-10-01 on) | p50 1,869 tok/s; ~1,500 at 100k tokens of context; a cold 105k-token prompt 1,003 tok/s (pinned-memory allocation; on the dev box a cold 100k prompt through the cache now takes 54-57 s against 73-93 s before, 53 s without it, in a good host state; DESIGN.md "Saving to the prefix cache and the prefill collectives") |
 | startup (warm) | ~120 s with the bf16 table (~60 s with int8; the weights themselves ~33-45 s, loaded in parallel) |
 | accuracy vs fp32 reference with the original PLE table | 0.050 mean \|Δlogprob\| (production's fp8 table; 0.044 with bf16) |
 | tasks (int4 / int8 table) | GSM8K 94.8 / 94.6%, MMLU 86.6 / 86.0%, ARC-Challenge 97.2 / 97.2% (no significant difference) |

@@ -56,7 +56,7 @@ public:
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
     int prefill_chunk() const { return opt_.prefill_chunk; }
-    // QW_PREFILL_PIPELINE at construction; tests and benchmarks may change it between prefills
+    // QW_PREFILL_PIPELINE (default on) at construction; tests and benchmarks may change it between prefills
     void set_prefill_pipeline(bool on) { pipeline_ = on; }
     // Empties a slot (its state is zeroed lazily by the next prefill/decode).
     void slot_reset(int slot);
@@ -331,11 +331,11 @@ private:
     } pjob_;
     std::vector<float> pemb_;     // [T][H]
     std::vector<uint16_t> pple_;  // [T][H] fp16
-    // QW_PREFILL_PIPELINE=1: the next chunk's embeddings and PLE rows are prepared into these on a helper thread
+    // QW_PREFILL_PIPELINE (default on): the next chunk's embeddings and PLE rows are prepared into these on a helper thread
     // while the GPUs run the current chunk (they depend on the tokens only), instead of between the two
     std::vector<float> pemb2_;
     std::vector<uint16_t> pple2_;
-    bool pipeline_ = false;
+    bool pipeline_ = true;  // QW_PREFILL_PIPELINE=0 off
     std::vector<float> plogits_;  // [T][VOCAB] when all_logits
     std::vector<std::vector<float>> seg_logits_;  // [segments][VOCAB]: after each segment's last row
     // prefill host side: embeddings and PLE rows of `chunk` into emb / ple at row0. `len` is the slot's length at the

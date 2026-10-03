@@ -716,15 +716,17 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          capture: -10% of snapshot bytes at no measured cost; hold writes back and keep one per
          >= 4,096 tokens plus chain ends: -55% for ~0.05 s of extra prefill per request); byte
          shuffle + zstd-1 (-41% together with the pairs); a daily write cap
-   - [ ] prefill and TTFT in production (measured 2026-10-02, section "Prefill and time to first token
-         in production"): ordinary prefills run at the benchmark speed since the 10-01 deploy (1-8k
-         fresh tokens: p50 1,869 tok/s; TTFT p50 0.53 s, p90 2.3 s). What is left: disk loads (23% of
-         the TTFT time; the SSD move), cold long prefills limited by pinned-memory allocation (105k
-         tokens: 104.5 s against ~62 s, 51 arena pins of 0.5-9.3 s; a hypothesis that needs an A/B on
-         the dev box) and the compute side (collectives 42% of GPU time at 8k, not byte-bound). Open,
-         in order: per-request timing in the request log; huge-page arenas, a per-chunk reserve and
-         rank pairs in RAM; one GPU window for chunk size, micro-batches, MoE imbalance and a
-         long-context profile
+   - [~] prefill and TTFT in production (measured 2026-10-02, sections "Prefill and time to first token in
+         production" and "Saving to the prefix cache and the prefill collectives"). Built and A/B-measured on the dev
+         box: a 2-chunk rolling reserve, one RAM copy per KV replica pair and non-coherent arenas are the defaults
+         (cold 100k prompt: 54-57 s against 73-93 s, no store 53 s, when the host is in a good state; the extra
+         time over no store roughly halves when it is bad, but +49% remains), the collectives' 2D push (+5.7% at 8k
+         tokens, +7.6% at 16k, bit-identical, decode untouched) and the input pipeline (+2.9%) are on. Rejected and
+         recorded: huge-page arenas, kept arenas, the standing reserve as built (worse during long prefills; off),
+         chunk 8192 (same as 4096), an expert permutation (real-text imbalance 1.14x: ~1.8% at most). Open: why a cold prompt still pays +49% in a bad host state (test with the
+         n-gram table locked), a standing reserve that refills only while idle, per-request timing in the request
+         log, the QSA attention kernel (20.7% of
+         GPU time at 60k of context), the SSD move for disk loads (23% of the TTFT time)
 
 ## Disk-tier loads and host memory (analysis 2026-10-01)
 
@@ -1021,6 +1023,10 @@ committed early). Expected: a cold 100k prompt in ~60 s instead of ~104 s, and a
 faster refill of the cache after every restart. Test: the same 100k prefill with
 a pre-pinned pool against today's, on the dev box.
 
+**Result (same day, see "Saving to the prefix cache and the prefill collectives"):** the mechanism holds, the first guess
+at the fix did not: huge pages are slower here, pins hold the process's memory-map lock and slow the GPUs' own work (no
+caller waited for a buffer), and what helped was pinning less and later (the rolling reserve, rank pairs stored once).
+
 **Checked and not worth it** (same log and the cache directory):
 
 | idea | what the data says |
@@ -1070,6 +1076,193 @@ against 14-25 GB/s for a kernel push between a pair; a chunk has ~800 of them
    1k/2k/4k/8k with and without micro-batches; a context option for
    `prefill_bench` (prefill N tokens, then time a chunk); `rocprofv3` of one 4k
    chunk at 60k context; routing counts per rank per layer.
+
+## Saving to the prefix cache and the prefill collectives (built and measured 2026-10-02)
+
+**Decision (the owner, 2026-10-02):** the RAM and disk cache stays on even where saving costs more than recomputing
+would, because it saves energy: a recompute of a 64k-token prompt runs the four GPUs at ~620 W for 34 s (21 kJ), a
+restore is a copy; an SSD for the disk tier is planned. This section is about making saves and loads cheaper; "no
+store" below is the floor the overhead is measured against, never a candidate.
+
+Measured on the dev box with production stopped, through the real Session and block store
+(`bench/cold_prefill_bench.hip`: a cold 64k or 100k-token chat-like prompt, 4,096-token chunks, a store budget that holds
+it unless stated, a fresh store for every run, the start of the configuration order rotating between repetitions; GPU
+energy from the cards' power sensors, GPUs only, not the host). `bench/run_suite.sh` reruns every number in stages
+(`correctness`, `pool`, `pool2`, `pool3`, `pool4`, `compute`, `stall`, `final`). Candidates were built behind switches and
+kept only where the numbers pay.
+
+| switch | what it does | code default |
+|---|---|---|
+| `QW_RESERVE_AHEAD=N` | pinned buffers for the saves of the next N chunks, taken at the start of a prefill and after every chunk (0: the whole prompt at once, as before) | 2 |
+| `QW_KV_PAIRS` | a block's KV kept once per replica group of ranks: -24% RAM per block, half the device-to-host export | on |
+| `QW_KV_PAIR_CHECK=N` | also exports the replicas of every Nth shared block and compares them (counts mismatches) | off |
+| `QW_POOL_ARENA` | `noncoherent` (`hipHostMallocNonCoherent`) or `malloc` (default flags: coherent, fine-grained memory) | noncoherent |
+| `QW_POOL_SERIAL=1` | one arena pinned at a time in the whole process | off (no clear gain) |
+| `QW_POOL_RESERVE_GB=G` | a standing reserve of pinned memory, refilled after 1.5 s without a request; the Session waits up to 30 s for it before the server reports ready | 0 (harmful during long prefills, below) |
+| `QW_COMM_PUSH2D` | strided and tiny-row collectives pushed by all threads over a flat (row, column) range, for 64 rows or more | on |
+| `QW_PREFILL_PIPELINE` | the next chunk's host inputs prepared while the GPUs run this one | on |
+| `QW_PROFILE=1`, `QW_MOE_STATS=1` | diagnostics: host/GPU split of a prefill, routing balance per layer | off |
+
+### Pinning, and what a cold prefill pays for saving
+
+**The host.** Its four NUMA nodes are full of page cache and ARC (`numactl -H`: 1.6 and 3.7 GB free of 64 GB on two
+nodes, 5-11 GB each at the end of the window) and the kernel's counters since boot show a machine that lives in reclaim:
+248k allocation stalls, 39.5 M pages scanned directly, 614k compaction stalls of which 93% failed, 39% of
+transparent-huge-page faults falling back to 4 KB pages. Getting pages for a pin means reclaiming them first, so the
+cost of pinning is the host's memory state, and that state drifts: the same configuration took 173 s and 37 s of pin
+time in two runs, the first store run after an engine load was the slow one twice, and the whole machine was
+much slower late at night than early in the window (below).
+
+**Pinning in isolation** (`bench/pin_bench.hip`, four GPUs idle, 256 MB arenas):
+
+| way | 1 thread | 4 threads | 8 threads | small mmap/munmap on another thread while pinning |
+|---|---|---|---|---|
+| `hipHostMalloc`, default flags | 0.050 s | 0.083 s (max 0.41) | 0.287 s (max 2.0) | 45 ms (8 threads: 170 ms) |
+| `hipHostMalloc`, non-coherent | 0.045 s | 0.127 s (max 0.68) | 0.216 s (max 1.4) | 44-58 ms |
+| `mmap` + `hipHostRegister`, 4 KB pages | 0.353 s | 1.257 s | 2.232 s | 315-357 ms |
+| `mmap` + `MADV_HUGEPAGE` + register | 0.089 s | 0.479 s | 0.886 s | 129-200 ms |
+
+Pins serialize (at 8 threads the aggregate rate falls) and every pin holds the process's memory-map lock for its
+length: a thread that maps or faults memory waits for it. Huge pages do not help here (compaction fails) and
+registering memory is slower than allocating it, so the guess of the previous section (huge-page arenas, "4-7x
+cheaper") was wrong and the arena kind was removed from the code. The default allocation is coherent, fine-grained memory
+(a 64 MB host-to-device copy from it ran at 1.1 GB/s, 13-15 from non-coherent memory; the engine's many small restore
+copies reach 4-5 GB/s per rank from either), which is why the non-coherent kind is the default. With the GPUs busy
+computing, pinning itself is not slower (`stall` stage: 0.047 s per arena at one thread, 0.09 s at eight, probe stalls
+~45 ms); its cost to a prefill shows only in the runs below.
+
+**Cold prefill through the store.** "old" = the behaviour before today (the whole prompt's buffers reserved at once, one
+KV buffer per rank, default-flag arenas); "defaults" = non-coherent arenas, two chunks ahead, one KV buffer per replica
+group (bench name `nc+pairs`; `ahead2+pairs` is the same with default-flag arenas). Seconds, min / median / max over the
+repetitions; kJ is GPU energy; pins = arenas pinned, pin s = pool-thread time in `hipHostMalloc`; no caller ever waited
+for a buffer in any run (`waits` 0): the pins slow the GPUs' own work.
+
+Early in the window (host in its good state), 64k tokens, four repetitions (`pool2`):
+
+| configuration | s | mean vs no store | kJ | pins | pin s | RAM GB |
+|---|---|---|---|---|---|---|
+| no store | 34.01 / 34.19 / 34.21 | | 21.3 | 0 | 0 | 0 |
+| old | 34.99 / 35.41 / **42.91** | +8.8% | 21.9 | 60-67 | 16-81 | 12.3 |
+| defaults | 34.70 / 34.85 / 35.37 | +2.2% | 21.6 | 42 | 8.5-12.6 | 9.3 |
+| default-flag arenas (`ahead2+pairs`) | 34.66 / 34.75 / 34.97 | +1.9% | 21.6 | 42 | 8.1-14.4 | 9.3 |
+| one pin at a time (`serial+ahead2+pairs`) | 34.59 / 34.95 / 36.82 | +3.3% | 21.6 | 42 | 2.3-2.8 | 9.3 |
+
+and 100k tokens, two repetitions: no store 52.9 / 53.2 s (33.3 kJ); old **93.0 / 73.5 s** (+57%, 37.3 kJ, 95 pins,
+106-248 s of pin time, the GPUs at 400-490 W instead of 620); `ahead2+pairs` 57.5 / 54.4 s (+5.5%, 34.0 kJ, 60 pins,
+11-24 s). The old behaviour reproduces production's slow cold prompt (105k tokens: 104.5 s against ~62 s expected).
+
+Later in the window (23:00 to 02:00; the host's free memory per node had shrunk, and the numbers are much worse for
+everything that stores):
+
+| run | no store | old | defaults / `ahead2+pairs` | other |
+|---|---|---|---|---|
+| 100k, 3 reps (`pool4`) | 52.8 / 53.0 / 53.3 s, 33.3 kJ | not run | **72.6 / 76.9 / 87.2 s** (+49%), 36.5 kJ, 60 pins, 74-127 s pin time; `ahead2+pairs` 74.3 / 79.7 / 81.4 | serial pins 73.1 / 74.0 / 79.8 (pin time 23-30 s); standing reserve 10 GB 100.1 / 100.2 / 103.4 (94 pins) |
+| 64k, 4 reps, 6 GB budget (`churn_64k`: arenas given back and pinned again) | 33.6 / 34.1 / 34.3 s, 21.2 kJ | 63.2 / 76.0 / 78.4 s (+115%), 25.6 kJ, 65-70 pins | `ahead2+pairs` 35.8 / 46.0 / 46.6 (+26%), 22.4 kJ, 32 pins | arenas kept: old+keep 69.7 / 81.1 / 84.4, `ahead2+pairs+keep` 36.8 / 44.8 / 44.9: no effect |
+| 64k, 4 reps (`reserve_64k`) | 33.9 / 34.1 / 34.4 s, 21.3 kJ | 70.9 / 78.3 / 84.9 s (+124%), 25.7 kJ | `ahead2+pairs` 49.8 / 54.3 / 54.9 (+55%), 23.5 kJ | standing reserve 10 GB 55.5 / 61.3 / 64.5 |
+
+What to take from it, honestly:
+
+- The new defaults always beat the old behaviour, in every stage, by a wide margin when the host is bad (the extra time over
+  no store roughly halves: 64k +42 s -> +20 s in `churn_64k`, +44 s -> +20 s in `reserve_64k`), and cost 2-5% when it
+  is good. They also pin fewer and lighter (42 against 60-67 arenas at 64k, 9.3 against 12.3 GB).
+- They do not remove the cost in a bad state: +49% over no store for a cold 100k prompt late at night, +3.2 kJ (+10%) of
+  GPU energy. A cold prompt that long is one the cache would have saved the next time anyway (a 100k recompute is 33 kJ).
+  Saving costs 0.3-3 kJ per cold prompt against 21-33 kJ for the recompute, so the cache pays back from a hit rate of
+  1-10% of what is saved (GPU energy only; the host's CPUs and memory are not metered; 272 of 975 production requests
+  continued an earlier prompt).
+- The slowdown is not proportional to the time spent in `hipHostMalloc`: one pin at a time cut pin time to a quarter (23-30
+  s against 74-127 s) and the 100k prompt by about 4% (medians 74.0 against 76.9 / 79.7, three repetitions: not
+  distinguishable), so the rest comes from the memory state itself (reclaim and compaction work competing with the
+  threads that drive the GPUs). A suspect for the dev box only, untested: its user may not lock memory (`ulimit -l` 8 MB,
+  "mlock refused"), so the n-gram table is page cache, and pinning 14 GB under node pressure can evict part of it, making
+  every token's gather a disk read; production locks the table, so its numbers may be better. Test: a box with
+  `ulimit -l unlimited`, the same 100k prompt with the table locked.
+- The standing reserve (`QW_POOL_RESERVE_GB`) makes long prefills worse (100 s against 77 s at 100k; 61 s against 54 s at
+  64k) and stays off. It pins 10 GB in the first seconds, and its "refill after 1.5 s without a get()" test is met between
+  the chunks of a prefill (a chunk takes ~2 s), so the refill pins while the GPUs compute. A fix would refill only while the
+  engine is idle (the Session knows). What it does help is a disk load: 13 entries (0.4 GB) took 0.31 s (800 MB/s) with the
+  reserve against 1.6 s (225 MB/s) without, 1.5-4.5 s of thread time waiting for buffers against 0.3-0.5 s.
+- Keeping emptied arenas (`QW_POOL_KEEP`, built and measured in `churn_64k`) changed nothing and was removed.
+
+**Replica sharing.** Two KV heads on four ranks: ranks (0,1) and (2,3) compute the same K, V and indexer keys from the
+same inputs, and the bytes are identical (56 of 56 disk blocks incl. a partial one in `tests/gpu/test_kv_replicas`; no
+mismatch in a 64k prefill with `QW_KV_PAIR_CHECK=1`; snapshots have no identical pairs). The store keeps one buffer per
+group (`Payload` aliases the replica to the primary), exports it once (`export_kv` skips an aliased rank), and reads a
+disk file's replica bytes by skipping them; the files are unchanged (still four rank buffers, v1), so nothing is lost for
+the planned v2 format that stores them once ("Disk-tier write volume").
+
+**Rolling reserve.** `Session::prefill_range` asked the store for the pinned memory of the whole prompt at the start (105k
+tokens: 49 arenas at once). Now it asks for the next two chunks' worth at the start and after every chunk
+(`QW_RESERVE_AHEAD`): the first saves find buffers, the rest are pinned in step with the prefill. The interleaved path
+reserves per piece, as before. A cancelled request no longer leaves memory pinned for saves it never makes.
+
+### The collectives, and the other compute candidates
+
+**Collectives** (`bench/comm_bench.hip`, the engine's `Comm` at a 2,048-row micro-batch, i.e. a 4,096-token chunk; raw P2P
+ceiling from plain push kernels: ~14 GB/s per GPU for 2.6 MB messages, 22-24 for 8 MB):
+
+| collective | plain | 2D push | per rank sent |
+|---|---|---|---|
+| all-gather of the block input (fp16 640 -> 2,560) | 0.454 ms (17.3 GB/s) | 0.451 ms | 7.9 MB |
+| reduce-scatter of the block output (fp16) | **1.307 ms (6.0 GB/s)** | **0.518 ms (15.2 GB/s)** | 7.9 MB |
+| all-reduce of the HC down projection (fp16) | 0.491 ms (8.2 GB/s) | 0.477 ms | 4.0 MB |
+| all-reduce of the HC sums of squares (16 B rows) | **0.914 ms** | **0.046 ms** | 0.1 MB |
+
+The all-gather is at the link's rate. The other two were far below it: the reduce-scatter's source rows are 5,120 B apart
+with a 1,280 B slice per destination, and the push looped over rows with a 256-thread block per 80 16-byte columns (69%
+of the threads idle); the sums of squares are 2,048 rows of one 16-byte store, which the small-payload path gave to one
+block per destination, one row at a time. `Comm::Tuning::push2d` copies a flat index over (row, column) pairs with every
+thread instead: bit-identical results (`tests/gpu/test_comm_variants`: 27 MB of outputs per rank, all collectives,
+256-2,048 rows). It applies from 64 rows, so decode keeps its row-block push (with it also on for 4-8 rows, the 4-slot decode
+step read 21.12-21.38 against 21.00-21.03 ms, perhaps +0.8%, so it was restricted). A vectorized receive changed nothing
+and was removed.
+
+**End to end** (`prefill_bench`, chunk 4,096, best of 3, two alternating repetitions of each variant):
+
+| tokens | plain | 2D push | gain | GPU energy |
+|---|---|---|---|---|
+| 8,192 | 2,082 / 2,064 tok/s | 2,188 / 2,193 | **+5.7%** | 2.45-2.49 -> 2.32-2.33 kJ |
+| 16,384 | 2,001 / 1,996 | 2,145 / 2,158 | **+7.6%** | 5.10 -> 4.78 kJ |
+
+Decode (`test_batch_decode`, ms per step at 1 / 2 / 4 / 8 rows): 14.75-14.79 / 16.66-16.79 / 21.00-21.03 / 26.37-26.57
+plain against 14.75-14.79 / 16.63-16.75 / 21.12-21.38 / 26.50-26.53 with it applied to every row count. The greedy
+determinism run (`test_speculative --gen 256 --k 5 --repeat 6`, two prompts) gives identical tokens in all repeats with
+and without it.
+
+**Prefill input pipeline** (`QW_PREFILL_PIPELINE`): the embeddings and fp16 PLE rows of the next chunk are prepared on a
+helper thread while the GPUs run the current chunk (they depend on the tokens only), instead of between chunks with the
+GPUs idle. 16,384 tokens: 2,155 -> 2,219 tok/s (**+2.9%**, host inputs 320 -> 75 ms, 4.77 -> 4.69 kJ). Bit-identical logits
+and next decode steps, with captures in the middle (`tests/gpu/test_prefill_pipeline`).
+
+**Chunk size** (2D push on): 2,048 / 4,096 / 8,192 tokens give 2,057 / 2,188 / 2,197 tok/s at 8k and 1,998 / 2,153 / 2,157
+at 16k: 4,096 and 8,192 are the same (the old note of +2% for 8,192 is gone with the better collectives), 2,048 costs 6%
+(the price of the 2,048-token pieces that interleave with decoding). Production stays at 4,096.
+
+**Long context.** 4,096 tokens after 60,000 of context run at 1,935 tok/s (2,188 with none: -12%); the 60,000 tokens
+themselves took 29.3 s (2,047 tok/s). The kernel trace of that run (all four ranks summed, 255 s of kernel time): the
+collectives 34% (waiting for the peers 20.2%, pushes 11.8%, small exchanges 1.0%, receives 1.0%), QSA attention 20.7% (it
+grows with context), rocBLAS GEMMs 16.6%, routed experts 15.1%, GDN scan 4.8%.
+
+**MoE balance** (`QW_MOE_STATS=1`): the busiest rank's expert tiles over the mean's, per layer summed. With a fixed
+arithmetic sequence of token ids: 1.21 for 4.4k tokens, 1.35 over four chunks of 16k (1.44 in token pairs; worst layer 1.93),
+1.33 over the 60k run. With real text (60,655 token ids of the docs and engine sources, `prefill_bench --tokens-file`,
+`tools/text_tokens.py`): **1.137** over four chunks of 16k (1.19 in token pairs; worst layers 40: 1.41, 31, 15: 1.26). That is
+the factor the MoE phase (15% of GPU time) and the waiting at the next collective grow by: perfect balance would save at
+most 15% x (1 - 1/1.137) = ~1.8% of prefill, and only the part of the imbalance that is the same on every prompt can be
+removed by a static expert permutation. Not worth building.
+
+**The defaults as built** (`final` stage, after the rebuild; 2D push and pipeline on): prefill 8,192 tokens 2,243 tok/s
+(2.32 kJ), 16,384 tokens 2,221 tok/s (4.67 kJ, 285 mJ per token; 2,001 before this work, +11%); decode 14.73 / 16.60 /
+21.03 / 26.42 ms per step at 1 / 2 / 4 / 8 rows (unchanged); the 6-repeat greedy determinism run, the pool, comm-variant,
+pipeline, block-store and disk-load tests all pass.
+
+**Tried and not kept:** huge-page arenas (slower to pin, and the registered mapping cost the other threads more: probe
+stalls 129-200 ms against 45); `hipHostRegister` of ordinary memory; keeping emptied arenas; the vectorized receive in the
+collectives; the standing reserve as built (above; off, not removed).
+
+**Open:** why the cold prefill still pays +49% over no store when the host is bad (test with the n-gram table locked);
+a standing reserve that refills only while the engine is idle; per-request timing in the request log (queue, load,
+pinned-buffer wait, restore, prefill, first token); a v2 disk format with the replica pairs stored once; the QSA attention kernel (20.7% of GPU time at 60k of context).
 
 ## Vision: where image time goes (2026-10-01)
 

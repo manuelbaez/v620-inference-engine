@@ -46,7 +46,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
     moe_stats_ = std::getenv("QW_MOE_STATS") != nullptr;
-    pipeline_ = std::getenv("QW_PREFILL_PIPELINE") && std::atoi(std::getenv("QW_PREFILL_PIPELINE")) != 0;
+    if (const char *p = std::getenv("QW_PREFILL_PIPELINE")) pipeline_ = std::atoi(p) != 0;
 
     for (int r = 0; r < RANKS; ++r) ranks_.push_back(std::make_unique<Rank>());
     // The ranks load in parallel, each on its own thread with its own pool

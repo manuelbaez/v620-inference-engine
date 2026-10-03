@@ -88,25 +88,6 @@ static int run(const char *label, PoolOptions opt) {
             check(st.pins > 0, "the pool counts the arenas it pinned");
         }
 
-        // 2b'. arenas kept (QW_POOL_KEEP): putting everything back unpins nothing
-        {
-            PoolOptions ko = opt;
-            ko.keep = true;
-            PinnedPool pk(UNIT, PER_ARENA, 0, 2, ko);
-            std::vector<uint8_t *> units;
-            for (int i = 0; i < 100; ++i) units.push_back(pk.get());
-            const size_t peak_k = pk.allocated_bytes();
-            for (uint8_t *u : units) pk.put(u);
-            std::this_thread::sleep_for(std::chrono::milliseconds(300));
-            check(pk.allocated_bytes() == peak_k, "kept arenas are not given back");
-            uint8_t *again_k = pk.get();  // and they serve the next takes without pinning
-            const uint64_t pins_k = pk.stats().pins;
-            for (int i = 0; i < 90; ++i) units.push_back(pk.get());
-            check(pk.stats().pins == pins_k, "units of kept arenas are reused without pinning");
-            pk.put(again_k);
-            for (size_t i = 100; i < units.size(); ++i) pk.put(units[i]);
-        }
-
         // 2c. a standing reserve: pinned a while after start, used up by a burst without any pinning meanwhile, and
         // topped up again only after a quiet period
         {

@@ -25,9 +25,9 @@ reusable across turns without re-prefilling.
 | 1. Spec + CPU fp32 reference (`src/ref`) | done; matches vLLM (greedy identical at 57 and 4,266 tokens) |
 | 2. Decode kernels, P2P collectives | done (`tests/gpu`) |
 | 3. 4-GPU runtime (TP4 dense + EP4 experts) | plain decode **67 tok/s** single stream (HIP graphs per batch size), **prefill ~2,050-2,200 tok/s** (vLLM: ~56 / ~1,060); the four ranks load in parallel |
-| 4. Prefix cache | per-slot reuse, VRAM snapshots, and a block store shared by all conversations in host RAM (128 GB) and on disk (survives restarts): any stored prefix up to a chat message boundary is restored in 0.02-0.5 s instead of re-prefilled (a shared 12k system prompt: 6.1 s -> 0.34 s); a restore from a cold disk takes as long as the disk reads (production's HDD mirror: 160-205 MB/s), see docs/DESIGN.md "Disk-tier loads and host memory" |
+| 4. Prefix cache | per-slot reuse, VRAM snapshots, and a block store shared by all conversations in host RAM (128 GB) and on disk (survives restarts): any stored prefix up to a chat message boundary is restored in 0.02-0.5 s instead of re-prefilled (a shared 12k system prompt: 6.1 s -> 0.34 s); a restore from a cold disk takes as long as the disk reads (production's HDD mirror: 160-205 MB/s), see docs/DESIGN.md "Disk-tier loads and host memory"; the cache stays on even where saving costs more than recomputing (energy: a 64k-token recompute is ~21 kJ on the GPUs), and saving it is cheap since 2026-10-02 (buffers pinned two chunks ahead, one RAM copy per KV replica pair, non-coherent arenas): a cold 100k-token prompt through the store takes 54-57 s against 73-93 s before and 53 s with no store when the host's memory is in a good state (+49% in a bad one, DESIGN.md "Saving to the prefix cache and the prefill collectives") |
 | 5. MTP speculative decoding | done: exact, adaptive draft count up to 5 (off while drafting does not pay), draft steps chained on the GPUs; **107-112 tok/s** single stream with Qwen's sampling settings (~117 greedy), **~231 tok/s** at 4 concurrent; on by default (`--mtp 5`) |
-| 6. Prefill kernels and scheduling | two micro-batches per chunk, several waiting prompts per pass (batched prefill), long prompts in pieces between decode steps (interleaved prefill) |
+| 6. Prefill kernels and scheduling | the big collectives pushed by all threads (+6-8%), the next chunk's inputs prepared during the current one (+3%), two micro-batches per chunk, several waiting prompts per pass (batched prefill), long prompts in pieces between decode steps (interleaved prefill) |
 | 7. OpenAI server, tokenizer, llama-swap entry | done: serving production through llama-swap and litellm; images and video (vision tower on every card, 720p in 0.33 s) |
 | 8. CacheBlend-style reuse (experimental) | built and measured, rejected on quality (docs/DESIGN.md) |
 | 9. Sampling | on the GPUs (penalties, candidates, Gumbel-max), exact; host fallback |
@@ -113,7 +113,7 @@ src/session/           slots, prefix cache (snapshots, block store, disk tier), 
 src/vision/            the vision tower (a copy on every card)
 src/capi/              C API implementation
 tools/                 qw_gpu / qw_ref runners, vLLM ground-truth helper, GPTQ and PLE table tools, task benchmarks
-bench/                 P2P, GEMM and uncached-memory microbenchmarks
+bench/                 P2P, GEMM and uncached-memory microbenchmarks; pinning, collectives, cold prefill through the store and GPU energy (run_suite.sh runs them in stages on the dev box)
 tests/unit, tests/gpu  host unit tests; GPU tests (collectives, batched decode and prefill, speculative decoding, sampling, prefix cache, vision)
 server/                OpenAI server (qwserve package), its tests, ctl.sh
 docker/                container image for llama-swap (built on the serving box by scripts/build-image.sh)
