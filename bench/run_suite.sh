@@ -117,6 +117,16 @@ final)  # the defaults as built, after a rebuild: the gates and the numbers the 
         docs/ENGINE_GUIDE.md docs/DESIGN.md src/engine/prefill.hip src/engine/engine.hpp docs/MODEL.md
     run f_moe_text 1500 env QW_MOE_STATS=1 QW_PROFILE=1 $B/prefill_bench --reps 1 --tokens-file "$OUT/text_ids.txt" 16384
     ;;
+disk)  # the disk tier's file formats through the tiers: v2 block files (the default), v1 with a buffer per rank (~10 min)
+    export QW_PLE_DIR=$FP8
+    run d_disk_tier 300 $B/test_disk_tier
+    run d_block_store 1500 $B/test_block_store
+    run d_host_tier 1500 $B/test_host_tier
+    run d_disk_load 1500 $B/test_disk_load
+    run d_host_tier_v1 1500 env QW_KV_PAIRS=0 $B/test_host_tier
+    run d_disk_load_v1 1500 env QW_KV_PAIRS=0 $B/test_disk_load
+    run d_kv_replicas 1500 $B/test_kv_replicas
+    ;;
 stall)
     export QW_PLE_DIR=$FP8
     run pin_busy 900 $B/pin_bench 256 3 --busy
@@ -157,7 +167,7 @@ compute)
         env QW_COMM_PUSH2D=1 QW_PREFILL_CHUNK=4096 $B/prefill_bench --ctx 60000 --reps 1 4096
     ;;
 *)
-    echo "usage: $0 correctness|pool|pool2|pool3|pool4|stall|compute|final|all [outdir]"
+    echo "usage: $0 correctness|pool|pool2|pool3|pool4|stall|compute|final|disk|all [outdir]"
     exit 2
     ;;
 esac
