@@ -708,11 +708,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          M = 8), so int8 stays off
    - [~] vision attention kernel: block size by image size (1080p 1.37 -> 1.23 s); a register-blocked redesign would be next
    - [x] vision: HF 3D M-RoPE positions measured; plain positions kept (as good or better)
-   - [ ] disk-tier write volume (the tier is moving to an SSD; measured 2026-10-01, section "Disk-tier
+   - [~] disk-tier write volume (the tier is moving to an SSD; measured 2026-10-01, section "Disk-tier
          write volume"): tens of GB/day (bound: 42 GB/day from the 4.7-day turnover); snapshots are
-         47% of the bytes and ~80% of them were never restored from. Open, in order: a bytes-written
-         counter; store the replicated rank pairs of a block once (-26.5% of all bytes, bit exact,
-         56 of 56 blocks checked); a disk snapshot policy (skip a prompt-end snapshot next to a
+         47% of the bytes and ~80% of them were never restored from. Done 2026-10-03: the replicated rank
+         pairs of a block are stored once (file format v2, -26.5% of all bytes, bit exact, 56 of 56 blocks
+         checked, v1 files still read). Open, in order: a bytes-written
+         counter; a disk snapshot policy (skip a prompt-end snapshot next to a
          capture: -10% of snapshot bytes at no measured cost; hold writes back and keep one per
          >= 4,096 tokens plus chain ends: -55% for ~0.05 s of extra prefill per request); byte
          shuffle + zstd-1 (-41% together with the pairs); a daily write cap
@@ -846,7 +847,8 @@ log, `QW_LOAD_THREADS`, `tests/gpu/test_pinned_pool`, `test_disk_tier`,
 Question: the disk tier is moving to an SSD, how to write less. The engine does
 not count bytes written, so this comes from the cache directory (6,075 files),
 the production log (`journalctl -t qw`, 09-27 to 10-01, 989 requests) and
-sampled files, all read-only. Nothing below is implemented yet.
+sampled files, all read-only. Implemented since (2026-10-03): the rank pairs of a block stored once (file format v2,
+below); the rest is still open.
 
 **What is on disk** (199.9 GB; the 200 GB budget is full):
 
@@ -955,6 +957,8 @@ Rejected: lossy encodings (fp8 KV, int8 snapshots): a cache hit would give
 different outputs from a miss, and the accuracy rule keeps lossy off.
 
 ## Prefill and time to first token in production (measured 2026-10-02)
+
+*Update 2026-10-03: plan item 1 (per-request timing in the request log) is built, see "Request timings" at the end of this section.*
 
 Question: what can lower TTFT or raise prompt throughput. From the production
 log (`journalctl -t qw`, 09-25 to 10-02: 975 requests with a TTFT, 1,275
@@ -1188,8 +1192,10 @@ What to take from it, honestly:
 same inputs, and the bytes are identical (56 of 56 disk blocks incl. a partial one in `tests/gpu/test_kv_replicas`; no
 mismatch in a 64k prefill with `QW_KV_PAIR_CHECK=1`; snapshots have no identical pairs). The store keeps one buffer per
 group (`Payload` aliases the replica to the primary), exports it once (`export_kv` skips an aliased rank), and reads a
-disk file's replica bytes by skipping them; the files are unchanged (still four rank buffers, v1), so nothing is lost for
-the planned v2 format that stores them once ("Disk-tier write volume").
+disk file's replica bytes by skipping them; the disk files followed on 2026-10-03: a block written from grouped buffers is a v2 file ("QWBLOCK2") with one buffer per
+group, 10.9 MB less than a full 21.8 MB block (-50% of its KV bytes; -26.5% of all bytes of the tier, snapshots being unchanged); v1 files
+stay readable (index scan and reads), and a store that keeps a buffer per rank (`QW_KV_PAIRS=0`) still writes v1 and
+reads a v2 file by copying the group's bytes to the replicas (`tests/gpu/test_disk_tier`).
 
 **Rolling reserve.** `Session::prefill_range` asked the store for the pinned memory of the whole prompt at the start (105k
 tokens: 49 arenas at once). Now it asks for the next two chunks' worth at the start and after every chunk
@@ -1263,6 +1269,29 @@ collectives; the standing reserve as built (above; off, not removed).
 **Open:** why the cold prefill still pays +49% over no store when the host is bad (test with the n-gram table locked);
 a standing reserve that refills only while the engine is idle; per-request timing in the request log (queue, load,
 pinned-buffer wait, restore, prefill, first token); a v2 disk format with the replica pairs stored once; the QSA attention kernel (20.7% of GPU time at 60k of context).
+
+### Request timings (2026-10-03)
+
+The request line of the log now says where the time before the first token went, after the old fields (which keep their
+meaning and order, so scripts that read them still work):
+
+```
+request ab12: stop, prompt 12000 (11264 cached), generated 300, ttft 0.80 s, decode 71.2 tok/s, slot 1 | queue 0.01 s, load 0.00 s, restore 0.02 s, prefill 0.70 s (saves 0.04 s, pin wait 0.00 s), interleaved 0.05 s
+```
+
+- `queue`: arrival until a slot was taken (the `ttft` field counts from the slot, as before).
+- `load`: the cached prompt loading from disk in the background (slot taken until its restore starts).
+- `restore`: copying what the caches hold into the slot (`Session::begin_prompt`).
+- `prefill`: the engine's prefill calls the request was part of (a batched pass counts in full for each prompt in it),
+  including `saves` (the block store's export and queueing of the new blocks and snapshots, inside the chunk callbacks)
+  and in them `pin wait`, the time the saves waited for an arena to be pinned (per thread, so other requests' waits are
+  not mixed in).
+- `interleaved`: the rest from the start of the restore to the first token: decode steps and prefills of other requests
+  that ran in between, and the first token's sampling.
+
+`Session::slot_timing`, `qw_get_slot_timing` and `Engine.slot_timing` carry it; `server/tests/test_request_log.py` checks
+the line (a disk load shows as `load`). Not in the line: the disk load's thread time getting buffers (it is in the load log
+line) and anything after the first token.
 
 ## Vision: where image time goes (2026-10-01)
 

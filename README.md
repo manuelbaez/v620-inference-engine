@@ -15,6 +15,7 @@ reusable across turns without re-prefilling.
   cache, CacheBlend notes and the roadmap.
 - [`docs/ENGINE_GUIDE.md`](docs/ENGINE_GUIDE.md): how the engine works, every feature
   with its effect and defaults, the decisions made, and a plan for porting to a new model.
+- [`docs/PENDING_TESTS.md`](docs/PENDING_TESTS.md): benchmarks that gave no result yet and measurements still to do.
 - [`docs/CODE_REVIEW.md`](docs/CODE_REVIEW.md): open improvement points found by reading the
   code, each with evidence, fix, effort and status.
 
@@ -77,7 +78,7 @@ times; JSON at `/metrics.json`). Through llama-swap:
 ```sh
 python3 -m venv ~/qwenv && ~/qwenv/bin/pip install tokenizers jinja2 aiohttp numpy pillow
 server/ctl.sh start                             # port 8000; stop | restart | status
-for t in admission prefill_order thinking marshal event_loop isolation health tool_calls fetch video api; do
+for t in admission prefill_order thinking marshal event_loop isolation health tool_calls fetch video api request_log; do
   ~/qwenv/bin/python server/tests/test_$t.py; done   # no GPU, no checkpoint (test_video needs ffmpeg)
 server/tests/test_e2e.py --url http://host:8000 --model qw --compare ref.json
 server/tests/test_concurrency.py --url http://host:8000 --model qw -n 4

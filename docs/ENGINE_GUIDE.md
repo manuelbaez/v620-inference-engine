@@ -173,7 +173,7 @@ Speed figures are single-stream decode unless stated.
 | KV slots | sequences held at once, each with a KV capacity | more slots = more concurrency | none | 262144,65536,32768,32768 | **262144,131072,65536,32768** | `QW_SLOTS` / `--slots` |
 | Prefix cache, VRAM | reuse a slot's own history and snapshots | skips prefill of reused tokens | none (exact) | on | on | |
 | Prefix cache, RAM (block store) | 256-token KV blocks + state snapshots shared by all conversations | 12k shared system prompt: 6.1 -> 0.34 s | none (exact) | 128 GB | 160 GB, which the host did not hold (OOM kill 2026-10-01); 128 GB recommended (see Host RAM below) | `--host-cache-gb`, `QW_HOST_CACHE_GB` |
-| Prefix cache, disk | blocks and snapshots survive restarts | 4k tokens restored in 0.55 s after restart (dev box); production's cache is on a 2-HDD ZFS mirror: cold loads 160-205 MB/s, 4-6 GB in 21-38 s, ARC-resident GB/s | none (exact) | 200 GB | 200 GB (`/cache` volume, ZFS on HDDs) | `--disk-cache-dir`, `--disk-cache-gb` |
+| Prefix cache, disk | blocks and snapshots survive restarts; a block file holds one KV buffer per replica pair (v2, 10.9 MB less than a 21.8 MB block; -26.5% of the tier's bytes; v1 files still read) | 4k tokens restored in 0.55 s after restart (dev box); production's cache is on a 2-HDD ZFS mirror: cold loads 160-205 MB/s, 4-6 GB in 21-38 s, ARC-resident GB/s; half the KV bytes per cold block read and per write | none (exact) | 200 GB | 200 GB (`/cache` volume, ZFS on HDDs); the v2 format is in the next image | `--disk-cache-dir`, `--disk-cache-gb`; `QW_KV_PAIRS=0` writes v1 |
 | Pinned arenas of the cache | how the host buffers of the RAM tier are pinned: `hipHostMalloc`, non-coherent (cached) rather than the default coherent, fine-grained kind | large copies 13-15 GB/s against 1.1; pins cheaper on bad days | none | non-coherent | not deployed yet | `QW_POOL_ARENA=malloc` (huge-page arenas were slower here and were removed) |
 | Rolling save reserve | the saves of a prefill get their pinned buffers two chunks ahead, not the whole prompt at once | cold 100k prompt through the store 54-57 s against 73-93 s (no store 53 s) in a good host state; in a bad one the extra time over no store halves but +49% remains | none | 2 chunks | not deployed yet | `QW_RESERVE_AHEAD` (0 = whole prompt) |
 | KV replica sharing | the 2 KV heads sit on 4 ranks, so ranks (0,1) and (2,3) hold identical KV: a block keeps one RAM buffer per pair | -24% RAM per prompt (12.3 -> 9.3 GB at 64k), half the device-to-host export, 60 -> 42 pins | none (bit-identical: 56 of 56 blocks, a 64k prefill) | on | not deployed yet | `QW_KV_PAIRS=0`, `QW_KV_PAIR_CHECK=N` compares the replicas of every Nth block |
@@ -196,7 +196,7 @@ Speed figures are single-stream decode unless stated.
 | int8 dense weights | W8A16 copies of dense matrices | +13% at 1 row, 0% at 8 | **worse**: +0.012..0.033 | off | off | `QW_INT8_DENSE=1` (+ `QW_INT8_DIR` GPTQ) |
 | W4A8 experts | int8 activations for the expert GEMM in prefill | prefill +2% | **worse** (0.075 -> 0.104) | off | off | `QW_INT8_EXPERTS=1` |
 
-| Logs | stats line every N s while busy, one line per request, errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
+| Logs | stats line every N s while busy, one line per request (with queue, disk load, restore, prefill, saves, pin wait and interleaved seconds after the old fields), errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
 | Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
 | Background disk loads | a prompt whose cache is on disk waits while threads read it into RAM; others keep running, including prompts whose cache is all in RAM | removes a ~54 s stall per 97k-token disk restore | none | on, 1 thread | on, 1 thread | `QW_LOAD_THREADS` (parallel file reads, to be measured) |
 | Health and watchdog | `/health` answers 503 with a reason when the scheduler thread died, an engine call has run over `QW_STUCK_SECONDS` (a wedged GPU) or a rank failed / a collective timed out (permanent); a watchdog exits the process after `QW_EXIT_GRACE` s so the supervisor restarts it | a failed or wedged engine is restarted instead of failing every request behind a healthy-looking server | none | on (300 s, 30 s) | on | `QW_STUCK_SECONDS`, `QW_EXIT_GRACE`, `QW_WATCHDOG_EXIT=0` |
@@ -278,7 +278,8 @@ from that.
    **Replica sharing:** the 2 KV heads sit on 4 cards, so ranks (0,1) and (2,3)
    hold byte-identical KV; a block keeps one buffer per pair in RAM (half the
    pinned memory, half the device-to-host traffic, and a disk read into shared
-   buffers skips the replicas' bytes; the files keep four buffers).
+   buffers skips the replicas' bytes; block files written from shared buffers (v2, "QWBLOCK2") hold one buffer per pair,
+   v1 files stay readable).
    **Pinned memory** comes from ~250 MB arenas. Pinning one means reclaiming
    pages first on a host whose NUMA nodes are full of page cache and ARC, holds
    the process's memory-map lock for the whole pin (every thread that maps or
