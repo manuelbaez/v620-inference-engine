@@ -74,6 +74,7 @@ class Request:
         self.timing = None   # the engine's slot_timing() at the first token: restore, prefill (saves, pin wait)
         self.share = {}      # id() of a prefilling request -> length of the prefix this prompt shares with it
         self.t_share = None  # when it first waited for such a request's prefill (Scheduler._shares_prefill)
+        self.share_on = None  # id() of the request it is waiting for
 
     def prompt_np(self):
         """The prompt as an int32 array (a view of the C API's array: no copy)."""
@@ -361,10 +362,16 @@ class Scheduler:
                 m = min(len(a), len(b))
                 diff = np.nonzero(a[:m] != b[:m])[0]
                 common = r.share[id(p)] = int(diff[0]) if len(diff) else m
-            if common - (len(p.prompt) - p.left) >= self.SHARE_MIN:
+            # worth waiting for when SHARE_MIN or more shared tokens are still to come; once it waits, it waits until
+            # the other request is past the whole shared part (only then is the snapshot at its end in the store:
+            # released earlier, it found nothing to restore and prefilled everything itself, 1.7 s later)
+            left = common - (len(p.prompt) - p.left)
+            if left >= self.SHARE_MIN or (left > 0 and r.share_on == id(p)):
+                r.share_on = id(p)
                 if r.t_share is None:
                     r.t_share = time.time()
                 return True
+        r.share_on = None
         return False
 
     def _poll_loading(self):

@@ -109,6 +109,9 @@ def main():
     a.left = 13000 - 8192  # a's prefill is at 8,192 of the 12,000 shared tokens
     s._admit()
     check("still waiting inside the shared part", [r.name for r in s.waiting], ["b"])
+    a.left = 13000 - 11000  # 1,000 shared tokens to go: fewer than SHARE_MIN, but it already waits for them
+    s._admit()
+    check("waits until the first is past the whole shared part", [r.name for r in s.waiting], ["b"])
     a.left = 13000 - 12288  # past the shared part
     s._admit()
     check("admitted once the first is past it", sorted(r.name for r in s.prefilling), ["a", "b", "other", "short"])
