@@ -63,6 +63,7 @@ qw_handle *qw_open(const char *options_json, char *err, int errlen) {
                 for (size_t i = 0; i < v->size(); ++i) opt.slot_spill.push_back(int((*v)[i].as_int()));
             }
             if (auto *v = j.find("slot_max_tokens")) opt.slot_max_tokens = int(v->as_int());  // spill up to this capacity
+            if (auto *v = j.find("weight_cache_dir")) opt.weight_cache_dir = v->as_str();
             if (auto *v = j.find("prefill_chunk")) opt.prefill_chunk = int(v->as_int());
             if (auto *v = j.find("warmup")) opt.warmup = v->as_bool();
             if (auto *v = j.find("devices")) {

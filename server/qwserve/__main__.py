@@ -28,6 +28,9 @@ def main():
     ap.add_argument("--slot-max-tokens", type=int, default=int(os.environ.get("QW_SLOT_MAX_TOKENS", "524288")),
                     help="with --kv-spill on, the capacity of every slot whose VRAM tokens are fewer (env QW_SLOT_MAX_TOKENS); "
                          "the pinned RAM it takes is logged at start")
+    ap.add_argument("--weight-cache-dir", default=os.environ.get("QW_WEIGHT_CACHE_DIR", ""),
+                    help="directory for the converted-weights cache (~19 GB per card): the first start writes it, later "
+                         "starts load the cards from it instead of converting the checkpoint ('' : off; env QW_WEIGHT_CACHE_DIR)")
     ap.add_argument("--prefill-chunk", type=int, default=int(os.environ.get("QW_PREFILL_CHUNK", "8192")),
                     help="tokens per prefill pass; its buffers take VRAM in proportion (env QW_PREFILL_CHUNK)")
     ap.add_argument("--reasoning-effort", default=os.environ.get("QW_REASONING_EFFORT", "xhigh"),

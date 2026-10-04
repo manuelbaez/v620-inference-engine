@@ -67,6 +67,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         for (size_t i = named; i < opt_.slot_spill.size(); ++i)
             opt_.slot_spill[i] = std::max(0, opt_.slot_max_tokens - opt_.slot_tokens[i]);
     }
+    if (const char *wd = std::getenv("QW_WEIGHT_CACHE_DIR"); wd && opt_.weight_cache_dir.empty()) opt_.weight_cache_dir = wd;
     if (const char *st = std::getenv("QW_SPILL_STAGE")) opt_.spill_stage = std::atoi(st) != 0;
     if (const char *cm = std::getenv("QW_SPILL_CACHE_MB")) opt_.spill_cache_mb = std::atoi(cm);
     bool any_spill = false;
@@ -147,7 +148,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         rk.dev = opt_.devices[size_t(r)];
         CK(hipSetDevice(rk.dev));
         CK(hipStreamCreateWithFlags(&rk.s, hipStreamNonBlocking));
-        load_rank_weights(rk, st_, pool, mtp_);
+        load_rank_weights(rk, st_, pool, mtp_, opt_.weight_cache_dir);
         alloc_rank_buffers(rk, opt_, spill_.get(), max_slot_tokens(), mtp_);
         size_t free_b = 0, total_b = 0;
         CK(hipMemGetInfo(&free_b, &total_b));

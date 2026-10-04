@@ -215,7 +215,8 @@ struct Rank {
 };
 
 // Loads rank rk.r's shard of every weight (weights.hip).
-void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp);
+// cache_dir: the converted-weights cache (EngineOptions::weight_cache_dir), or "".
+void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp, const std::string &cache_dir);
 // Rows of a slot's ring of raw indexer keys: a prefill chunk, the 3 positions before it, a snapshot's tail.
 inline int raw_ring_rows(const EngineOptions &opt) {
     return opt.prefill_chunk + gpu::RAW_TAIL + 64;

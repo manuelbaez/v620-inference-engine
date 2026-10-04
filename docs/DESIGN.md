@@ -537,6 +537,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          memory the kernels read and write directly. Built and measured 2026-10-03/04: bit-exact
          (`test_spill`), no cost without spill, decode +3-5% per spilled row, prefill into the
          spilled part at 97-99% of resident with the per-layer staging. See "KV spill"
+   - [~] converted-weights cache: built 2026-10-04, off (`--weight-cache-dir`); a card's weights load in 7-13 s from
+         the page cache against 48 s, but 340 s cold from the HDD pool. To enable when the model storage is on SSDs.
+         See "Converted-weights cache"
    - [x] PLE n-gram table precision (`core/ple.cpp`: int4, int8 and bf16 layouts, chosen by the
          sidecar's META.json). Against a new fp32 reference with Qwen's original bf16 table
          (4,000 tokens): engine with the int4 table 0.065 mean |dlogprob| / 96.8% top-1, int8
@@ -1877,3 +1880,32 @@ that touches spill overwrites it, so with interleaved prefill (long prompts go i
 decoders start cold after each piece, and the handover needs its own invalidation and bit-exact tests with prefill and
 decode alternating. Under mixed load it would do worse than the two separate buffers. The simpler lever when VRAM is
 short is `QW_SPILL_CACHE_MB=128` (85% hits).
+
+## Converted-weights cache (built 2026-10-04; off, waiting for SSDs)
+
+Every start converts the checkpoint into the engine's layouts for each card: bf16 -> fp16 slices of the dense
+matrices, the int4 experts repacked (~14.5 GB per card), the MTP head's bf16 experts quantized. Measured per card on the
+dev box (checkpoint in the page cache): 44.7-48.8 s, of which 36.6-41.3 s is conversion and 5.5-6.2 s the upload.
+
+`--weight-cache-dir DIR` (`QW_WEIGHT_CACHE_DIR`, `EngineOptions::weight_cache_dir`; default off) keeps the converted
+pieces. Every upload of the loader goes through `WeightCache::item` (`src/engine/weights.hip`): the piece is built by
+its lambda and uploaded, and appended to `DIR/rank<r>.qww` when recording; with a matching file it is read and uploaded
+and the lambda does not run. The file's key covers the checkpoint's files (path, size, modification time), the rank,
+the MTP head and `WEIGHT_CACHE_VERSION` (bump it when a conversion changes); it is written as `.tmp` and renamed when
+the loader finishes, so an interrupted start leaves nothing that would be used; a replay that does not consume exactly
+the recorded pieces fails with "delete it". Runs with `QW_INT8_*` set do not use it. 18.4 GB per card, 73.6 GB in all.
+
+| start | weights per card |
+|---|---|
+| no cache | 47.9-48.8 s (convert 39.7-41.3, upload 5.5-6.2) |
+| recording | 734-744 s: the four files written to the HDD pool took ~700 s (once) |
+| from the cache, file in the page cache | **7.4-12.7 s** (read 0.4-1.7, upload 7.0-11.3) |
+| the same before the file was pulled in by all loader threads | 30-34 s (page faults under `hipMemcpy`, one thread) |
+| from the cache, cold on the HDD pool | 334-343 s |
+
+Logits are bit-identical to the build before in every mode (`bench/logits_dump`: no cache, recording, replay).
+Why it is off: on this host the files cannot stay in the page cache next to the PLE table (51 GB), the pinned spill
+(71 GB) and the prefix cache, so a start would read them from the 2-HDD mirror at ~215 MB/s, 7x slower than
+converting. And at the 2026-10-04 production start the cards were loaded ~58 s before the PLE table's 143 s read
+finished: until the table reads faster, the weights are not what a start waits for. Both change with the model
+storage on SSDs (73.6 GB at 2 GB/s is ~37 s cold; the table ~25 s).

@@ -59,6 +59,10 @@ struct EngineOptions {
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion
     bool mtp = true;           // load the MTP head (speculative decoding drafts)
+    // Directory of the converted-weights cache ("" off; QW_WEIGHT_CACHE_DIR): each card's weights in the engine's
+    // layouts (~19 GB per card), written by the first start and read by the next ones instead of converting the
+    // checkpoint again. Keyed by the checkpoint's files; a stale or incomplete file is replaced.
+    std::string weight_cache_dir;
 };
 
 class Engine {

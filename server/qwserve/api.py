@@ -28,6 +28,8 @@ class Server:
         self.eos_ids = self.prompt.eos_ids
         opts = {"model_dir": args.model_dir, "ple_dir": args.ple_dir, "prefill_chunk": args.prefill_chunk,
                 "slots": [int(x) for x in args.slots.split(",")]}
+        if getattr(args, "weight_cache_dir", ""):
+            opts["weight_cache_dir"] = args.weight_cache_dir
         if getattr(args, "kv_spill", "off") == "on":
             opts["slot_max_tokens"] = args.slot_max_tokens
         t0 = time.time()
