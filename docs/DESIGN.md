@@ -1958,3 +1958,13 @@ standing reserve refilled on the scheduler's idle signal, not on a timer), or sm
 
 **A start waits for busy cards (`QW_START_WAIT_S`, off).** Instead of failing with out-of-memory when another
 process holds the cards, the engine waits up to that long for them. Not deployed.
+
+**Pre-pinned cache in production (trial since 2026-10-04 ~18:00 UTC, image `qw-engine:2b58fd9`).** Production's log
+since the KV spill deploy: 152 arenas pinned while serving in 521 s, single pins up to 13.5 s; the cache held 12-19 GB
+on normal days (87 GB on a benchmark day) of its 64 GB budget. So: `QW_POOL_PREPIN=1` with `--host-cache-gb 32`, the
+arenas pinned by the engine right after the KV spill (`Engine::cache_bank`), `QW_START_WAIT_S=300`, `QW_SHARE_WAIT=0`
+(not decided yet). The first start: 37.9 GB (143 arenas of 265 MB) pinned in 157.6 s, still 0.24 GB/s although it is
+pinned before the weights (the spill's 70.8 GB took 13.3 s just before it: the two differ in flags and placement,
+`hipHostMallocNonCoherent` on the device's node against `Mapped | Portable | NumaUser` with a bind policy; to
+find out which matters), engine ready in 290.6 s (was ~150 s), the PLE table pinned in 9 s, host 69 GiB available
+(was 91-105), smoke test passed, no pin while serving so far. To watch: pins while serving (expected 0), TTFT outliers.
