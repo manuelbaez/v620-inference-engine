@@ -56,12 +56,25 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     const size_t kv_low = size_t(reserve_gb * 1e9 * 0.6 / kv_copies_ / double(kv_unit));
     const size_t snap_low = size_t(reserve_gb * 1e9 * 0.4 / RANKS / double(snap_unit));
     const PoolOptions po = PoolOptions::from_env();
+    // QW_POOL_PREPIN=1: the whole RAM budget is pinned now, as arenas every pool draws from and returns to, so nothing
+    // is pinned while serving (each pin stalls the process: 1.7-4.9 s per arena with the KV spill and the PLE table
+    // already pinned). Costs the pin time at start and the budget's RAM from the start, used or not. An arena holds
+    // units of one kind at a time, so some of the budget is lost to arenas that are partly empty: 12% more is pinned.
+    if (const char *t = std::getenv("QW_POOL_PREPIN"); t && std::atoi(t) != 0 && ram_budget > 0) {
+        const size_t arena = (std::max(kv_unit * size_t(KV_ARENA_UNITS), snap_unit * size_t(SNAP_ARENA_UNITS)) + 4095) / 4096 * 4096;
+        const size_t count = size_t(double(ram_budget) * 1.12 / double(arena)) + 2 * RANKS;
+        std::vector<int> devs;
+        for (int r = 0; r < RANKS; ++r) devs.push_back(e_.rank_device(r));
+        bank_ = std::make_unique<ArenaBank>(arena, count, devs, po);
+        log("prefix cache: %.1f GB pinned at start for the pools (%zu arenas of %.0f MB) in %.1f s", double(arena * count) / 1e9,
+            count, double(arena) / 1e6, bank_->pin_s);
+    }
     for (int r = 0; r < RANKS; ++r) {
         const bool kv_rank = !kv_pairs_ || cfg::kv_primary(r) == r;
-        kv_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(kv_unit, KV_ARENA_UNITS, e_.rank_device(r), kv_rank ? kv_low : 0, po);
+        kv_pool_[size_t(r)] = std::make_unique<PinnedPool>(kv_unit, KV_ARENA_UNITS, e_.rank_device(r),
+                                                           kv_rank ? kv_low : 0, po, bank_.get());
         snap_pool_[size_t(r)] =
-            std::make_unique<PinnedPool>(snap_unit, SNAP_ARENA_UNITS, e_.rank_device(r), snap_low, po);
+            std::make_unique<PinnedPool>(snap_unit, SNAP_ARENA_UNITS, e_.rank_device(r), snap_low, po, bank_.get());
     }
     nodes_[ROOT] = Node{};
     if (!disk_dir.empty()) {

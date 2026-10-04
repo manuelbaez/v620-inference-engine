@@ -1909,3 +1909,52 @@ Why it is off: on this host the files cannot stay in the page cache next to the 
 converting. And at the 2026-10-04 production start the cards were loaded ~58 s before the PLE table's 143 s read
 finished: until the table reads faster, the weights are not what a start waits for. Both change with the model
 storage on SSDs (73.6 GB at 2 GB/s is ~37 s cold; the table ~25 s).
+
+## The real workload, and three changes measured against it (2026-10-04)
+
+**What production serves** (1,310 requests, 2026-09-27 to 10-04, from the request log): prompts median 44k tokens, p90
+156k, max 219k, 49% over 45k; 96% of prompt tokens come from the cache (a turn adds ~350 tokens, median); 357 tokens
+generated (median); mostly one request at a time (two or more in ~20% of the busy samples). TTFT median 0.5 s, p90 7.3
+s, p99 54 s; decode median 79 tok/s (2.26 tokens per step at 28 ms). 92 requests (7%) with 8k or more uncached tokens
+hold 52% of all TTFT (40 of 76 minutes), at a median of 1,144 uncached tokens per second of TTFT; only 12 of them came
+within 30 minutes of an engine start. 60 engine starts in the period, 17 of them failed with out-of-memory (16 on
+09-25..27, one on 10-04 when a request arrived while a test on the dev box held the cards).
+
+**Slot choice (on).** With every slot at the same capacity, a new conversation went to the least recently used slot:
+production's first session after the KV spill deploy sat in a 44k-resident slot at 44.5k tokens with the 256k-resident
+slot idle. `Session::acquire` now prefers, among slots with equal reuse, the one whose VRAM part covers the prompt
+(the smallest such; the largest VRAM part when none does). Measured: a 49k-token conversation starts in slot 0.
+
+**Moving a conversation that outgrows its slot's VRAM part (`QW_SLOT_MOVE=1`; off).** When the slot holding a
+prompt's prefix would spill and a free slot holds the prompt in VRAM, acquire takes that slot if the block store can
+restore the conversation there (the snapshot at its last prompt's end). Server test (a conversation from 29k tokens,
++2.7k per turn, 16 turns, slots 256k + 5 x 44k): the move happened at 46,217 tokens: restore 0.17 s, 2,692 tokens
+prefilled after it (43,525 reused), TTFT 2.02 s against ~1.4 s for its neighbours, once. After the boundary: decode
+mean 88.9 tok/s moved against 82.1 spilled (10 turns each, 54-83 tokens per turn: noisy; the step-level measurements
+above say 1-3%). A spilled slot has no fixed cost per turn: 512 tokens at 60k context prefill in 0.38-0.39 s spilled
+against 0.36 s resident, 2,048 in 1.11 against 1.06-1.10 (`spill_bench --ctxs 60000,60512,...`).
+
+**Waiting for a shared prefix (`QW_SHARE_WAIT`, on; `QW_SHARE_MIN` 2048).** A waiting request whose prompt starts
+like one being prefilled waits while that one still has 2,048 or more of the shared tokens to go, then restores them
+from the block store (`Scheduler._shares_prefill`; `server/tests/test_admission.py`). Server test, cold prompts:
+
+| | off | on |
+|---|---|---|
+| 4 requests sharing a 16k-token system prompt, all done after | 26.4 / 27.5 s | **8.4 / 8.1 s** |
+| ... their TTFTs | 9.4, 13.1, 18.5, 23.9 s | 7.1 s, then 0.3-0.6 s after 7.2 s in the queue |
+| the same 26k-token prompt twice at once | 14.1 and 24.4 s | 14.1 s both (the second: 0.08 s after waiting) |
+
+Without it the four are prefilled side by side (the later ones pick up 4,096 cached tokens on the way).
+
+**Pinning the prefix cache's memory at start (`QW_POOL_PREPIN=1`; off, not viable here).** `ArenaBank` pins the
+RAM budget (plus 12%) as arenas the pools take and return, so serving pins nothing. The stalls it is meant to remove
+are real: in the server tests a turn's TTFT goes from ~1.2 s to 3-5.6 s when an arena is pinned during it, 4-31 pins
+per 22-turn session, 1.7-4.9 s per 265 MB arena with the spill and the table pinned. But pinning the 64 GB budget after
+them took 335 s and 570 s (0.13-0.22 GB/s: the host has to reclaim page cache for every arena; the spill's 71 GB pins
+in ~10 s because it goes first), the server's start timed out once, and on the dev box (which cannot mlock the PLE
+table) the table was pushed out of the page cache: cold prefill 153 s against 26-31, decode 28-77 tok/s. With 0 pins
+while serving, as designed. Left in as an option; what to try instead: pin ahead only while the engine is idle (the
+standing reserve refilled on the scheduler's idle signal, not on a timer), or smaller arenas.
+
+**A start waits for busy cards (`QW_START_WAIT_S`, off).** Instead of failing with out-of-memory when another
+process holds the cards, the engine waits up to that long for them. Not deployed.

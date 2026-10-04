@@ -45,12 +45,36 @@ struct PoolStats {
     double wait_s = 0;    // time those callers waited
 };
 
+// Pinned arenas kept for the life of the process (QW_POOL_PREPIN): pinned once at start, taken by the pools before
+// they pin anything themselves and given back instead of unpinned, so that serving pins nothing (a pin stalls the whole
+// process for as long as it takes: seconds on a host short of free memory).
+class ArenaBank {
+public:
+    // Pins `count` arenas of arena_bytes, one after another, spread over the devices (NUMA placement).
+    ArenaBank(size_t arena_bytes, size_t count, const std::vector<int> &devices, PoolOptions opt);
+    ~ArenaBank();
+    ArenaBank(const ArenaBank &) = delete;
+    ArenaBank &operator=(const ArenaBank &) = delete;
+    size_t arena_bytes() const { return bytes_; }
+    uint8_t *take();  // nullptr when none is left
+    void give(uint8_t *p);
+    size_t left() const;
+    double pin_s = 0;  // what pinning them took
+
+private:
+    size_t bytes_;
+    mutable std::mutex mu_;
+    std::vector<uint8_t *> free_, all_;
+};
+
 class PinnedPool {
 public:
     // device: made current while allocating an arena (NUMA placement). standing: free units kept ready for a burst of
     // saves: topped up one arena at a time, only after the pool has had no get() for a while (a refill that ran during
     // a long prefill would pin concurrently with its compute, which is what it is there to avoid).
-    PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt = {});
+    // bank: arenas come from it (and go back to it) while it has any; an arena then holds as many units as fit it.
+    PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt = {},
+               ArenaBank *bank = nullptr);
     ~PinnedPool();
     PinnedPool(const PinnedPool &) = delete;
     PinnedPool &operator=(const PinnedPool &) = delete;
@@ -71,6 +95,7 @@ private:
     struct Arena {
         uint8_t *base = nullptr;
         std::vector<int> free;  // unit indices
+        bool banked = false;    // from the bank: given back, not unpinned
     };
     std::unique_ptr<Arena> new_arena();  // without the lock
     void free_arena(Arena &a) const;           // without the lock
@@ -84,6 +109,7 @@ private:
     // (starts as if the pool had been quiet for a while: the first fill of the standing reserve need not wait)
     std::chrono::steady_clock::time_point last_get_ = std::chrono::steady_clock::now() - std::chrono::seconds(60);
     PoolOptions opt_;
+    ArenaBank *bank_ = nullptr;
     mutable std::mutex mu_;
     std::condition_variable cv_, ready_cv_;
     std::vector<std::unique_ptr<Arena>> arenas_;

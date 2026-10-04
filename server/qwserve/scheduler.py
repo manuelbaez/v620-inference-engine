@@ -6,7 +6,9 @@ import threading
 import time
 import traceback
 
-from .engine import Sampling, Tokens
+import numpy as np
+
+from .engine import Sampling, Tokens, c_array
 from .dashboard.metrics import Metrics
 
 
@@ -70,6 +72,12 @@ class Request:
         self.t_admit = self.t_first = None  # slot taken, first token (time.time())
         self.t_begin = None  # the prompt's cached part started to be restored (after any disk load)
         self.timing = None   # the engine's slot_timing() at the first token: restore, prefill (saves, pin wait)
+        self.share = {}      # id() of a prefilling request -> length of the prefix this prompt shares with it
+        self.t_share = None  # when it first waited for such a request's prefill (Scheduler._shares_prefill)
+
+    def prompt_np(self):
+        """The prompt as an int32 array (a view of the C API's array: no copy)."""
+        return np.frombuffer(c_array(self.prompt), dtype=np.int32) if len(self.prompt) else np.zeros(0, np.int32)
 
     def timings(self):
         """llama.cpp-style per-request timings (llama-swap's activity log reads these)."""
@@ -110,6 +118,11 @@ class Scheduler:
     LOG_INTERVAL = float(os.environ.get("QW_LOG_INTERVAL", "10"))  # seconds between stats lines (0: off)
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
+    # A waiting request whose prompt starts like one being prefilled waits until that one is past the shared part,
+    # then takes it from the block store (QW_SHARE_WAIT=0: off; QW_SHARE_MIN: the least shared tokens still to prefill
+    # that are worth waiting for).
+    SHARE_WAIT = os.environ.get("QW_SHARE_WAIT", "1") != "0"
+    SHARE_MIN = int(os.environ.get("QW_SHARE_MIN", "2048"))
     BATCH_PREFILL = os.environ.get("QW_PREFILL_BATCH", "1") != "0"  # several prompts per prefill pass
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
     # (QW_STUCK_SECONDS) is a wedged GPU. Unhealthy for EXIT_GRACE seconds (QW_EXIT_GRACE), the
@@ -295,6 +308,9 @@ class Scheduler:
             if r.no_slot_at == self.slot_epoch:  # no slot was released since it found none
                 i += 1
                 continue
+            if self._shares_prefill(r):  # another request is prefilling the start of this prompt: wait for it
+                i += 1
+                continue
             n = len(r.prompt)
             need = r.max_new if r.max_new else self.DEFAULT_RESERVE
             need = max(1, min(need, self.e.max_tokens - n))
@@ -328,6 +344,28 @@ class Scheduler:
                 continue
             self._begin(r)
         return moved
+
+    def _shares_prefill(self, r):
+        """True while a request being prefilled still has SHARE_MIN or more tokens to go of a prefix it shares with r
+        (the same system prompt, or the same prompt sent twice): r then waits, and restores that prefix from the block
+        store (the snapshot at a message boundary or chunk end in it) instead of computing it a second time next to
+        the first. QW_SHARE_WAIT=0 turns it off."""
+        if not self.SHARE_WAIT or r.media:
+            return False
+        for p in self.prefilling:
+            if p.media or p.cancelled.is_set():
+                continue
+            common = r.share.get(id(p))
+            if common is None:
+                a, b = r.prompt_np(), p.prompt_np()
+                m = min(len(a), len(b))
+                diff = np.nonzero(a[:m] != b[:m])[0]
+                common = r.share[id(p)] = int(diff[0]) if len(diff) else m
+            if common - (len(p.prompt) - p.left) >= self.SHARE_MIN:
+                if r.t_share is None:
+                    r.t_share = time.time()
+                return True
+        return False
 
     def _poll_loading(self):
         """Requests whose cached prompt was loading from disk: begin those whose load is done."""

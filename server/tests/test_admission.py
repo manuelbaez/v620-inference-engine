@@ -51,8 +51,11 @@ class FakeEngine:
         return 0, None
 
 
-def request(name, n):
-    r = Request([1] * n, {"max_tokens": 1000}, lambda *a: None, set())
+def request(name, n, prefix=None):
+    """n tokens; requests share no prefix (their first token differs) unless given the same `prefix` tokens."""
+    first = [2 + sum(map(ord, name)) % 30000]
+    tokens = (list(prefix) + first + [1] * n)[:n] if prefix else (first + [1] * n)[:n]
+    r = Request(tokens, {"max_tokens": 1000}, lambda *a: None, set())
     r.name = name
     return r
 
@@ -89,6 +92,26 @@ def main():
     check("big2 gets the 256k slot", [(r.name, e.capacity[r.slot]) for r in s.prefilling if r.name == "big2"],
           [("big2", 262144)])
     check("still waiting", [r.name for r in s.waiting], ["small3"])
+    s.shutdown(1)
+
+    # shared prefix: a request whose prompt starts like one being prefilled waits until that one is past the shared
+    # part (it then restores it from the block store), while a request with another prompt is admitted at once
+    e = FakeEngine([65536, 65536, 65536, 65536])
+    s = Scheduler(e)
+    system = [7] * 12000
+    s.waiting = [request("a", 13000, system), request("b", 12500, system), request("other", 12500),
+                 request("short", 13000, [7] * 1000)]
+    s._admit()
+    check("shared 12k prefix: first and unrelated ones admitted, a 1k share is not worth waiting",
+          sorted(r.name for r in s.prefilling), ["a", "other", "short"])
+    check("the second with the same system prompt waits", [r.name for r in s.waiting], ["b"])
+    a = next(r for r in s.prefilling if r.name == "a")
+    a.left = 13000 - 8192  # a's prefill is at 8,192 of the 12,000 shared tokens
+    s._admit()
+    check("still waiting inside the shared part", [r.name for r in s.waiting], ["b"])
+    a.left = 13000 - 12288  # past the shared part
+    s._admit()
+    check("admitted once the first is past it", sorted(r.name for r in s.prefilling), ["a", "b", "other", "short"])
     s.shutdown(1)
     print("FAILED" if fails else "all ok")
     return 1 if fails else 0

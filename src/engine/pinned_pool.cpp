@@ -36,8 +36,46 @@ const char *PoolOptions::name(Arena a) {
     return a == Arena::NonCoherent ? "non-coherent" : "hipHostMalloc";
 }
 
-PinnedPool::PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt)
-    : unit_(unit_bytes), per_arena_(units_per_arena), device_(device), standing_(standing), opt_(opt) {
+ArenaBank::ArenaBank(size_t arena_bytes, size_t count, const std::vector<int> &devices, PoolOptions opt)
+    : bytes_(arena_bytes) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < count; ++i) {
+        CK(hipSetDevice(devices[i % devices.size()]));
+        void *p = nullptr;
+        CK(hipHostMalloc(&p, bytes_, opt.arena == PoolOptions::Arena::NonCoherent ? hipHostMallocNonCoherent : 0u));
+        all_.push_back(static_cast<uint8_t *>(p));
+    }
+    free_ = all_;
+    pin_s = since(t0);
+}
+
+ArenaBank::~ArenaBank() {
+    for (uint8_t *p : all_) (void)hipHostFree(p);
+}
+
+uint8_t *ArenaBank::take() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (free_.empty()) return nullptr;
+    uint8_t *p = free_.back();
+    free_.pop_back();
+    return p;
+}
+
+void ArenaBank::give(uint8_t *p) {
+    std::lock_guard<std::mutex> lk(mu_);
+    free_.push_back(p);
+}
+
+size_t ArenaBank::left() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return free_.size();
+}
+
+PinnedPool::PinnedPool(size_t unit_bytes, int units_per_arena, int device, size_t standing, PoolOptions opt,
+                       ArenaBank *bank)
+    : unit_(unit_bytes), per_arena_(bank ? int(bank->arena_bytes() / unit_bytes) : units_per_arena), device_(device),
+      standing_(standing), opt_(opt), bank_(bank) {
+    QW_CHECK(per_arena_ > 0, "PinnedPool: the bank's arenas are smaller than a unit");
     prefetch_ = std::thread([this] { prefetch_loop(); });
 }
 
@@ -59,6 +97,13 @@ std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
     if (opt_.serial) turn.lock();
     const auto t0 = std::chrono::steady_clock::now();
     auto a = std::make_unique<Arena>();
+    if (bank_)
+        if (uint8_t *p = bank_->take()) {  // already pinned: nothing to wait for
+            a->base = p;
+            a->banked = true;
+            for (int i = per_arena_ - 1; i >= 0; --i) a->free.push_back(i);
+            return a;
+        }
     CK(hipSetDevice(device_));
     const size_t bytes = unit_ * size_t(per_arena_);
     if (opt_.arena == PoolOptions::Arena::NonCoherent) {
@@ -80,6 +125,10 @@ std::unique_ptr<PinnedPool::Arena> PinnedPool::new_arena() {
 }
 
 void PinnedPool::free_arena(Arena &a) const {
+    if (a.banked) {
+        bank_->give(a.base);
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     (void)hipSetDevice(device_);
     (void)hipHostFree(a.base);

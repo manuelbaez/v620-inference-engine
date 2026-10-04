@@ -112,6 +112,7 @@ private:
     size_t kv_bytes() const { return kv_pool_[0]->unit_bytes() * size_t(kv_copies_); }    // RAM of a block's KV
     size_t snap_bytes() const { return snap_pool_[0]->unit_bytes() * size_t(RANKS); }     // ... of a snapshot's state
     void check_pairs(int slot, int64_t pos, int64_t n, const Node &nd);
+    std::unique_ptr<ArenaBank> bank_;  // QW_POOL_PREPIN: the pools' arenas, pinned at start (before the pools: freed after)
     size_t ram_size(const Node &nd) const;
     const Node *find(uint64_t k) const;
     // The node for tokens [pos, pos + n) after `parent`, if stored.

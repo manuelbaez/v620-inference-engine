@@ -83,6 +83,32 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     moe_stats_ = std::getenv("QW_MOE_STATS") != nullptr;
     if (const char *p = std::getenv("QW_PREFILL_PIPELINE")) pipeline_ = std::atoi(p) != 0;
 
+    // QW_START_WAIT_S: when another process holds the cards' memory (a test on the box that shares them, a model still
+    // unloading), wait for it up to that long instead of failing the start with an out-of-memory error.
+    if (const char *sw = std::getenv("QW_START_WAIT_S"); sw && std::atof(sw) > 0) {
+        const double limit = std::atof(sw);
+        const auto t0 = std::chrono::steady_clock::now();
+        bool told = false;
+        for (;;) {
+            size_t least = SIZE_MAX, total = 0;
+            for (int d : opt_.devices) {
+                size_t f = 0, t = 0;
+                CK(hipSetDevice(d));
+                CK(hipMemGetInfo(&f, &t));
+                least = std::min(least, f);
+                total = t;
+            }
+            const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (least >= total / 10 * 9 || waited >= limit) {
+                if (told) log("the cards are %s after %.0f s", least >= total / 10 * 9 ? "free" : "still busy", waited);
+                break;
+            }
+            if (!told) log("the cards are in use (%.1f of %.1f GiB free on the fullest): waiting up to %.0f s",
+                           double(least) / double(1ull << 30), double(total) / double(1ull << 30), limit);
+            told = true;
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    }
     for (int r = 0; r < RANKS; ++r) ranks_.push_back(std::make_unique<Rank>());
     {  // the plan, in numbers
         size_t vram_tokens = 0, logical = 0;

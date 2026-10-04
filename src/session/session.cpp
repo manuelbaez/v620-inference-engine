@@ -78,18 +78,54 @@ size_t Session::reusable(int slot, const std::vector<int32_t> &prompt) const {
 
 int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     const int64_t need = int64_t(prompt.size()) + std::max<int64_t>(max_new, 1);
+    // What the request will hold soon: the VRAM part of a slot should cover it (beyond it the slot spills).
+    const int64_t soon = int64_t(prompt.size()) + std::min<int64_t>(std::max<int64_t>(max_new, 1), 2048);
+    // Slot a is a better home than b for these tokens: its VRAM part covers them and b's does not; both cover them:
+    // the smaller one (the big slot stays free for a long prompt); neither does: the larger one.
+    const auto vram_better = [&](int a, int b) {
+        const int64_t va = e_.slot_vram_tokens(a), vb = e_.slot_vram_tokens(b);
+        if ((va >= soon) != (vb >= soon)) return va >= soon;
+        return va >= soon ? va < vb : va > vb;
+    };
     int best = -1;
     size_t best_reuse = 0;
     for (int i = 0; i < num_slots(); ++i) {
         const SlotInfo &si = slots_[size_t(i)];
         if (si.busy || e_.slot_capacity(i) < need) continue;
         const size_t r = reusable(i, prompt);
+        const bool same_vram = best >= 0 && e_.slot_vram_tokens(i) == e_.slot_vram_tokens(best);
         if (best < 0 || r > best_reuse ||
             (r == best_reuse &&
-             (si.used < slots_[size_t(best)].used ||
-              (si.used == slots_[size_t(best)].used && e_.slot_capacity(i) < e_.slot_capacity(best))))) {
+             (same_vram ? (si.used < slots_[size_t(best)].used ||
+                           (si.used == slots_[size_t(best)].used && e_.slot_capacity(i) < e_.slot_capacity(best)))
+                        : vram_better(i, best)))) {
             best = i;
             best_reuse = r;
+        }
+    }
+    // A conversation about to run past its slot's VRAM part moves to a free slot that holds it in VRAM (or, when none
+    // does, to one with a larger VRAM part), when the block store can restore it there: the snapshot at the end of its
+    // last prompt is there, so the move costs importing those blocks and prefilling what came after (measured: 0.17 s
+    // of restore, once). Off by default (the conversation stays and spills, which costs 1-3% of decode);
+    // QW_SLOT_MOVE=1 turns it on. QW_SLOT_MOVE_SLACK: the tokens the move may have to prefill again (default 4096).
+    static const bool move_on = std::getenv("QW_SLOT_MOVE") && std::atoi(std::getenv("QW_SLOT_MOVE")) != 0;
+    static const int64_t move_slack = std::getenv("QW_SLOT_MOVE_SLACK") ? std::atoll(std::getenv("QW_SLOT_MOVE_SLACK")) : 4096;
+    if (move_on && store_ && best >= 0 && best_reuse > 0 && e_.slot_vram_tokens(best) < soon) {
+        int to = -1;
+        for (int i = 0; i < num_slots(); ++i) {
+            if (i == best || slots_[size_t(i)].busy || e_.slot_capacity(i) < need) continue;
+            if (e_.slot_vram_tokens(i) <= e_.slot_vram_tokens(best)) continue;
+            if (to < 0 || vram_better(i, to)) to = i;
+        }
+        if (to >= 0) {
+            const BlockStore::Hit hit = store_->lookup(prompt, 0);
+            if (hit.n + move_slack >= int64_t(best_reuse)) {
+                log("slot move: a prompt of %zu tokens leaves slot %d (%lld tokens in VRAM, %zu reusable there) for slot %d "
+                    "(%lld in VRAM): %lld tokens come from the block store",
+                    prompt.size(), best, (long long)e_.slot_vram_tokens(best), best_reuse, to,
+                    (long long)e_.slot_vram_tokens(to), (long long)hit.n);
+                best = to;
+            }
         }
     }
     if (best >= 0) {
