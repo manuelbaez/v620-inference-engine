@@ -1859,6 +1859,15 @@ is 256 MB (VRAM for ~19k resident tokens across the slots).
 
 **Not done.** One host copy shared with the block store.
 
+**Production (2026-10-04, image `qw-engine:06ce991`).** `QW_SLOTS=262144,45056,45056,45056,45056,45056`,
+`QW_KV_SPILL=on`, `QW_SLOT_MAX_TOKENS=524288`, `--host-cache-gb 64` (was 160). The start: 70.8 GB pinned in 14.4 s (91%
+of the sampled pages on the intended node), 1.81 GiB of VRAM free per card after the load, ready in 154 s, of which
+the fp8 PLE table's read took 143 s (the ranks were loaded ~58 s before it finished); smoke test passed; the host has
+101 GiB available with the engine up and the cache empty. Server check on the dev box before it (`--kv-spill on`, the
+same slots): a 78.6k-token prompt in a 44k-resident slot decoded at 71.7 tok/s, follow-up turns reused 56k and 78.7k
+cached tokens, a new conversation sharing the long prefix reused 77.8k. Seen there: pinning the prefix cache's arenas
+took 1.7-4.9 s each with 122 GB already pinned (spill + table), and steps of up to 419 ms next to them.
+
 **A possibility, not built: the prefill staging buffer as cache space.** The staging buffer (1 KiB per token of the
 largest spill, ~456 MB in the 6-slot plan) is only used while a prefill chunk reads a slot's spilled part; during pure
 decoding it is idle VRAM holding the same kind of rows as the decode cache. The cache could use it then: either a
