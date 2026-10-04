@@ -1857,4 +1857,14 @@ Cache size (4-row runs, real text, one spilled slot decoding; B's cost over A at
 it comes by 128 MB; the pool is shared, so several spilled slots decoding at once divide it, which is why the default
 is 256 MB (VRAM for ~19k resident tokens across the slots).
 
-**Not done.** One host copy shared with the block store; the staging buffer (idle during decode) as cache space.
+**Not done.** One host copy shared with the block store.
+
+**A possibility, not built: the prefill staging buffer as cache space.** The staging buffer (1 KiB per token of the
+largest spill, ~456 MB in the 6-slot plan) is only used while a prefill chunk reads a slot's spilled part; during pure
+decoding it is idle VRAM holding the same kind of rows as the decode cache. The cache could use it then: either a
+larger cache at no VRAM cost (256 + 456 MB: ~94% hits instead of 86-92%, a few tenths of a ms per spilled step), or the
+dedicated pool dropped (256 MB back per card, ~4k more resident tokens per small slot). The cost: every prefill chunk
+that touches spill overwrites it, so with interleaved prefill (long prompts go in pieces between decode steps) the
+decoders start cold after each piece, and the handover needs its own invalidation and bit-exact tests with prefill and
+decode alternating. Under mixed load it would do worse than the two separate buffers. The simpler lever when VRAM is
+short is `QW_SPILL_CACHE_MB=128` (85% hits).
