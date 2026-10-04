@@ -532,6 +532,11 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [ ] intermittent: greedy speculative output differing from plain decoding in
          `test_speculative` (different prompt from run to run, 4-12-row verification batches;
          also on the pre-GPU-sampling build), likely the open issue below; to root-cause
+   - [~] KV spill: a slot holds more tokens than its VRAM (`EngineOptions::slot_spill`,
+         `QW_SLOT_SPILL=0,131072,...`); the rest of its K/V/raw indexer keys lives in pinned host
+         memory the kernels read and write directly. Built and measured 2026-10-03/04: bit-exact
+         (`test_spill`), no cost without spill, decode +3-5% per spilled row, prefill into the
+         spilled part at 97-99% of resident with the per-layer staging. See "KV spill"
    - [x] PLE n-gram table precision (`core/ple.cpp`: int4, int8 and bf16 layouts, chosen by the
          sidecar's META.json). Against a new fp32 reference with Qwen's original bf16 table
          (4,000 tokens): engine with the int4 table 0.065 mean |dlogprob| / 96.8% top-1, int8
@@ -1628,3 +1633,198 @@ launches and collectives, in this order of expected payoff:
    ~2,000 tok/s. Profile a long prefill the same way before
    choosing: candidates are the chunked (WY) GDN kernel, the fp32-output
    router GEMM (rocBLAS falls back to a slow HSS kernel), and QSA attention.
+
+## KV spill: slots larger than their VRAM (built and measured 2026-10-03)
+
+**What.** A slot's capacity becomes `slot_tokens` (the tokens held in VRAM, as before) plus `slot_spill` (tokens held
+in pinned host memory). Positions below the VRAM part live where they always did; positions from it on have their K, V
+and raw indexer keys in host memory mapped into the device's address space, and the kernels address them with one
+compare per row (`kv_row`, `kernels/types.hpp` `SlotPtrs::vt`, `KvSplit`). The compressed keys stay in VRAM for the
+whole logical length, so scoring and the top-512 selection run unchanged on the GPU: only the K/V rows the selected
+groups name are read from the host. A slot without spill has `vt = NO_SPILL` and takes the first branch.
+
+**Why it can work.** Decode reads about 2,052 tokens per layer whatever the context: 2 MiB of K+V per layer, ~24 MiB per
+row and rank over the 12 QSA layers (25 with the MTP layer). The cost of a spilled slot is that traffic over PCIe, not a
+function of its length. In VRAM a spilled token costs 0.83 KB (compressed keys) instead of 20.8 KB.
+
+**Host memory.** `SpillPool` (`src/engine/spill.cpp`) pins everything once at start (pinning on demand stalled the
+process for seconds, see "Pinning"). One copy per KV pair: both ranks of a pair compute the same bytes and both write
+them, each reading what it wrote (no cross-rank ordering). 13.3 KB (K, V) + 6.7 KB (raw keys) per spilled token and
+KV group. A layer's pages are placed near one of the pair's two GPUs, alternating by layer
+(`hipHostMallocNumaUser` plus `set_mempolicy(MPOL_PREFERRED)`; `QW_SPILL_NUMA=0` leaves it to HIP). Placement is
+read back with `move_pages` and logged at start. `QW_SPILL_NC=1` maps the memory non-coherent (cacheable).
+Spill is allocated from the host's RAM budget: it comes out of what `QW_HOST_CACHE_GB` can use.
+
+**What was measured (`bench/spill_gather_bench`, dev box, production's model resident but idle, 2026-10-03).**
+Kernels shaped like the decode attention read scattered 2 KiB groups (512 per row) from the pool:
+
+| | per GPU |
+|---|---|
+| one GPU alone, 1 row, attention-shaped | 22-23 GB/s (a "wide" kernel with 8x the blocks: 22-27) |
+| the two GPUs of a pair reading the same buffers | 21-23 |
+| all four GPUs together, pages placed near their GPUs | **22-23 each, ~90 GB/s in all** |
+| all four together, every page on one node (HIP's default from device 0, `QW_SPILL_NUMA=0`) | **11.7 each, ~47 GB/s in all** |
+| layers on the GPU's own node vs on its pair's node | 22.4 vs 23.3: within noise |
+
+So a 4-block-per-row attention-shaped read already reaches the link's rate (Gen4 x16, ~25 GB/s; same as the P2P
+push), and neighbouring NUMA nodes cost nothing measurable: the node is a memory-controller domain on one IO die.
+What matters is spreading the pages: one node's controllers cap all four GPUs together at ~47 GB/s. A spilled row
+at 22 GB/s is ~1.1 ms per step per rank (24 MiB), against 17.3 ms for a plain step: ~6%, if every selected token
+were spilled; spilled slots decoding in the same step add up on the link. Mapped host memory was verified in both
+directions (device writes read by the host, host writes read by the device: no bad words on any GPU).
+**Checks.** `tests/gpu/test_spill.hip` passes: spilled slots (boundaries at 4096 and 8192, chunks that straddle them,
+appended prefills, one-row decode, 4-row verification runs with `accept`) give bit-identical logits to a resident slot,
+and `export_kv` / `import_kv` across the boundary bit-identical bytes.
+
+**Engine cost (`bench/spill_bench`, dev box, 2026-10-03, chunk 4096, cap 262144, B = 32,768 tokens in VRAM + 229,376
+spilled; random-token prompts).**
+
+Without spill in use (the same source built on the unmodified tree against the new tree with spill off, two runs each,
+alternating): decode 16.9 / 17.1 / 18.0 ms at 8k / 32k / 131k on both (differences under 0.2 ms, the noise); prefill
+2,202 / 2,169 / 1,991 tok/s on the old tree against 2,192 / 2,147 / 1,979 on the new: -0.5 to -1%, the same sign at every
+context, about the size of the run-to-run spread (0.3-0.6%). The compare in the attention kernels is not free in prefill.
+
+A resident slot (A) against the spilled one (B) in one process:
+
+| context | decode, 1 row: A / B | 4-row runs: A / B | prefill increment tok/s: A / B |
+|---|---|---|---|
+| 8k, 32k (inside B's VRAM part) | 17.1 / 17.1, 17.2 / 17.2 | 24.2 / 24.2, 24.4 / 24.4 | 2,201 / 2,192, 2,151 / 2,132 |
+| 65k | 17.5 / 18.0 (+3%) | 24.7 / 28.3 (+14%) | 2,074 / 950 |
+| 131k | 18.0 / 18.8 (+5%) | 25.5 / 29.9 (+18%) | 1,910 / 734 |
+| 200k | 18.9 / 19.9 (+5%) | 26.3 / 30.9 (+18%) | 1,627 / 680 |
+
+A and B decoding in the same step: 20.3 / 21.0 / 22.2 ms at 65k / 131k / 200k (A alone 17.5 / 18.0 / 18.9). Reading:
+- Inside the VRAM part B is identical to A: the spill path costs nothing there.
+- Decode costs +0.5 / +0.8 / +1.0 ms per spilled row at 65k / 131k / 200k, about the 1.1 ms the link would take for
+  every selected token (24 MiB at 22 GB/s). The fraction of spilled positions at those contexts is 50 / 75 / 84%,
+  so on these random-token prompts the top-512 selection is spread about evenly over the positions; real text may
+  concentrate on recent tokens (which are in the spilled part, being the newest) or on the start. Not measured.
+- A 4-row run costs 4x a single row (+3.6 / +4.5 / +4.6 ms): every row reads its own selection and nothing is shared
+  between the rows of a run, whose selections are nearly the same. A union fetch per run would cut that to about
+  one row's worth.
+- **Prefill into the spilled part is 2.2-2.6x slower** (950 / 734 / 680 tok/s against 2,074 / 1,910 / 1,627): the
+  attention kernels read the host for every query of the chunk. This is the case the staging plan below is for.
+
+**Settings (2026-10-03).** `--kv-spill on|off` (default off; `QW_KV_SPILL`), `--slots` = the tokens each slot keeps in
+VRAM, `--slot-max-tokens N` (default 524288; `QW_SLOT_MAX_TOKENS`) = the capacity of every slot, spilling what its VRAM
+tokens do not cover; `QW_SLOT_SPILL` names the spill of each slot explicitly, `QW_SPILL=0` forces everything off. At
+start the engine logs the plan (VRAM tokens + spilled per slot, GB of pinned RAM), refuses a plan the host cannot hold
+(spill + `QW_SPILL_MARGIN_GB`, default 24, against `MemAvailable`) or that the cards cannot hold after the weights, and
+logs each card's free VRAM (the early estimate is `19.4 GiB + slots + 6144 B per compressed-key group of the longest slot`,
+within 0.05 GiB of the measured value on two configurations; `QW_VRAM_CHECK=0` skips both VRAM checks); `bench/slots_probe` checks a configuration loads and decodes across all its slots.
+
+**Sizing (per card, measured on the dev box, int4 PLE table; 12.24 GiB of VRAM free after the weights, vision tower
+and buffers with one 8k slot).** A slot costs 19.97 KB per resident token (K, V, fp32 raw keys; 13 layers), 832 B per
+token of capacity (compressed keys: 436 MB for a 512k slot) and ~38 MB of state; the 512k scoring buffers add ~0.8 GB
+for the prefill; keep ~0.5 GiB free. Host RAM per spilled token: 39.9 KB (K, V and raw keys, both KV groups).
+- Warmup (graphs for every batch size, rocBLAS kernels) takes ~1.1 GiB of VRAM on top of what the load leaves, and
+  ~0.5 GiB should stay free, so a plan needs ~1.6 GiB free after the load. 6 slots, 1 x 256k + 5 x 32k in VRAM, all
+  512k, left 0.97 GiB: it loaded, and warmup died with `hipMalloc: out of memory`. (The constructor then hung forever:
+  an exception left it while the rank threads waited, and destroying the condition variable under them never
+  returned, which also lost the error message. The constructor now stops the threads first.)
+- **6 slots, 1 x 256k + 5 x 24k in VRAM, all 512k: loads and runs** (1.73 GiB free after the load, 0.62 after warmup and a
+  run, 110 GB of pinned RAM pinned in 36.6 s, 6-row decode step 25.3 ms against 25.1 without spill, 27.8 ms with 40k
+  tokens in every slot, five of them 15k tokens into their spilled part). That is the largest of this shape on these
+  cards: the next 8k tokens in each of the five small slots would not leave room for warmup.
+- 8 slots (256k + 7 x 16k, all 512k): fits the VRAM by arithmetic (~7 GiB resident + 3.3 GiB compressed keys) but
+  needs ~152 GB of pinned RAM: not on this host next to the PLE table and the prefix cache.
+- Pinning and placement (`QW_SPILL_POLICY`, default `auto`: a node's layers are bound to it when it can give that much
+  counting the page cache it can reclaim, otherwise preferred). Pin times vary with the host's memory state: 108.6 GB
+  took 73 s and 210 s with the nodes' free lists nearly empty, 55 GB 10.5-11.2 s and 110 GB 36.6 s later. With the old
+  "preferred" policy 45-55% of the sampled pages landed on the intended node at 108 GB (the kernel falls back to
+  another node when the node's free list runs low, instead of reclaiming page cache); with `auto` 80-92% (42% of the
+  pages on node 0 where 25% were meant; the fallback goes there). Placement is not exact, and need not be: the reads
+  run at the link's rate either way as long as the pages are spread (below).
+- **numactl does not help.** HIP places a whole buffer on one node, chosen from the thread's policy, so a process-wide
+  `numactl --interleave=all` or `--membind=0,1` put everything on node 0 (`QW_SPILL_POLICY=process` leaves the policy to
+  the process): four GPUs reading together reach 15.2 GB/s each instead of 22.7-23.0 with the per-buffer placement
+  (preferred 22.7, auto 23.0, bind 23.0). The engine's per-buffer binding is what spreads the pool.
+- With the raw indexer keys in a ring (below, 2026-10-04): **6 slots, 1 x 256k + 5 x 56k in VRAM, all 512k, load and
+  run**: 69.1 GB pinned in 12.1 s (was 110 GB with 5 x 24k), 89% of the pages on the intended node, 1.76 GiB of VRAM
+  free after the load (the estimate said 2.0: it is now 0.25 GiB optimistic), 0.66 after warmup and a run, 6-row step
+  25.2 ms. 5 x 64k would leave 1.45 GiB and is refused.
+
+**Raw indexer keys as a ring (2026-10-04).** A slot used to keep every position's raw indexer key (fp32, 128 per
+token and QSA layer: 6.7 KB per token and rank, a third of its KV), but only a group's own 4 positions are ever read, to
+build its compressed key. Now each slot keeps a ring of `prefill_chunk + RAW_TAIL + 64` rows per layer (position p at
+row p % rows; 30 MB per slot at a 4096-token chunk), and a snapshot carries the raw keys of its last `RAW_TAIL` = 256
+positions for every layer (1.7 MB per rank; the MTP layer can lag the committed tokens by up to 192 positions, so a
+group's last 3 would not do). Prefill captures copy the tail at the end of the chunk's job; `snapshot_save` /
+`snapshot_restore` and `export_recurrent` / `import_recurrent` carry it. Blocks no longer hold raw keys: 5.3 -> 3.6 MB per
+256-token block and rank (-32%). The state layout id changed (5), so cache files written before are ignored (one cold
+disk tier after the deploy). `blend_splice` (the rejected CacheBlend experiment) needs every raw key and now refuses.
+KV spill holds K and V only (13.3 KB per spilled token and KV group, was 20).
+Exactness: `bench/logits_dump` (13k-token prompt in 4k chunks, 48 decode steps, four 4-row runs rolled back with
+`accept`, a snapshot at 13,057 = 1 mod 4, 6,000 more tokens so the ring wraps, the snapshot restored and 32 steps; on a
+resident and a spilled slot) gives bit-identical logits on the builds before and after (212 rows); `test_spill`,
+`test_snapshot_capture`, `test_block_store`, `test_host_tier` pass.
+Speed (old and new build alternating, dev box): resident decode 16.9-18.0 ms and prefill 2,156-2,192 / 2,135-2,144 /
+1,968-1,972 tok/s at 8k / 32k / 131k on both; a slot spilled at 32k the same on both (decode 17.0-18.9 ms, prefill 945 /
+734 tok/s at 65k / 131k): no change beyond the noise. A cold 65k-token prompt through the block store (`cold_prefill_bench`,
+nc+pairs): 31.44-31.45 s against 31.37-31.40 s, saves +1.5-1.7% over no store against +1.2-1.5%, pinning 5.5-5.8 s
+against 5.1-5.4 s, the cache's RAM 9.3 -> 8.6 GB: the blocks are a third smaller, but for one long prompt the
+snapshots (33 MB per rank each, now 1.7 MB more) are most of the cache. What it buys is VRAM: 6.7 KB less per resident
+token.
+
+**Non-coherent spill memory** (`QW_SPILL_NC=1`: the GPUs' L2 may cache the host's lines): prefill into the spilled part
+825 -> 973 tok/s at 65k and 703 -> 790 at 98k (resident: ~2,100 / ~2,000), decode 0.1-0.2 ms better; `test_spill`
+passes. Not the default: a CPU write into the spill (an `import_kv`) under a GPU's cached lines is not covered by a test.
+
+Coherence (`tests/gpu/test_spill_coherence.hip`, 200 repetitions of each, coherent and non-coherent mapping): a GPU
+reads a 1 MiB region (so it sits in its L2), the CPU rewrites it, the GPU reads again; a GPU writes, the stream is
+synchronized, the CPU reads; the first sequence inside captured graphs; GPU 0 reads, GPU 1 writes, GPU 0 reads again.
+No stale word in any of them, in either mapping. With the prefill staging below the non-coherent mapping only buys
+decode ~0.15 ms per step with a spilled row (~1%); it stays opt-in.
+
+**Prefill staging (2026-10-04, `EngineOptions::spill_stage`, on; `QW_SPILL_STAGE=0` off).** Each card has a VRAM buffer
+as large as the largest slot's spill (K and V) and a copy stream. Before each QSA layer (and the MTP layer) of a chunk
+that reaches a slot's spilled part, the rows of that layer already in host memory (from the slot's VRAM boundary to the
+chunk's first position) are copied in; the layer's kernels then use the buffer in place of the host part (same
+indexing), the chunk's own rows are written into it, and after both micro-batches' attention they go back to host
+memory, which frees the buffer for the next QSA layer's copy. The copy for a QSA layer runs while the three GDN layers
+before it compute, so one buffer is enough. Segments of a batched chunk are staged while their regions fit the buffer;
+the others read host memory directly. Bit-identical to the direct path (`bench/logits_dump` against the build before:
+identical; `test_spill`'s batched case prints the same hash with the staging on and off).
+
+| context (B: 32k in VRAM) | resident A | B staged | B direct (before) |
+|---|---|---|---|
+| 65k | 2,081 tok/s | **2,061** | 935 |
+| 131k | 1,911 | **1,872** | 722 |
+| 200k | 1,622 | **1,580** | 671 |
+
+Prefill into the spilled part now runs at 97-99% of a resident slot (was 40-45%); decode unchanged. Cost: VRAM for the
+buffer, 1 KiB per token of the largest spill (456 MiB for a 512k slot with 56k in VRAM). The 6-slot plan becomes
+1 x 256k + 5 x 48k in VRAM, all 512k: loads and runs (1.82 GiB free after the load, 0.71 after warmup and a run, 70.2 GB
+pinned in 14.0 s, 6-row decode step 25.1 ms).
+
+**Fetch once per verification run (built 2026-10-04, measured, reverted).** Per QSA layer, after the selection: mark
+the spilled groups any row of a run selected (a bitmap per run), number them, copy each once into a VRAM scratch, and
+let the rows read them there (graph variants used only for batches with such a run). Bit-identical, but slower on
+4-row runs: 24.2 / 28.5 / 30.3 / 31.2 ms per step at 32k / 65k / 131k / 200k without it, 25.1 / 28.9 / 31.5 / 33.3 ms with
+it. Three more kernels and a memset per layer cost ~0.8 ms even with nothing spilled, more than the saved reads.
+Non-coherent mapping (the L2 serving the rows' repeats) does better on the same runs: +2.5 / 3.5 / 3.6 ms over the
+resident slot against +3.9 / 4.9 / 4.9 coherent.
+
+**Infinity Cache and host memory** (`spill_gather_bench --tokens N --rows 4 --reps 100`, a region read over and over):
+2 MiB (fits the 4 MiB L2): coherent 34 GB/s, non-coherent ~1,250 GB/s; 32 MiB (fits the 128 MB Infinity Cache, not
+the L2): 23 and 26 GB/s; 1.4 GiB: 23 and 23. The Infinity Cache does not hold host memory's lines: only what is
+copied into VRAM benefits from it.
+
+**Locality of the spilled selection (`bench/spill_locality`, `QW_SPILL_LOCALITY=1`, real text: this repository's docs
+and sources, 230,646 tokens; a slot with 8,192 tokens in VRAM; 256 greedy decode steps at each context).** Of the groups
+a step selects, the share the same layer selected within the last K steps, i.e. the hit rate of a cache holding the
+groups of the last K steps, and its size per spilled slot (12 layers, 4 KiB per group and layer):
+
+| context | spilled share | K=1 | K=2 | K=4 | K=8 | K=16 | K=32 |
+|---|---|---|---|---|---|---|---|
+| 32k | 59% | 61.4% (14 MB) | 70.4% (20) | 77.8% (30) | 83.6% (52) | 88.1% (96) | 91.3% (183) |
+| 100k | 97% | 57.5% (23) | 67.6% (33) | 76.2% (53) | 82.7% (93) | 87.9% (172) | 91.2% (330) |
+| 200k | 98% | 61.4% (24) | 71.0% (33) | 77.6% (51) | 82.7% (88) | 86.7% (161) | 89.6% (307) |
+
+Per layer the K=1 rate ranges 54-73%. Runs of 4 rows with the text's next tokens select 1.86-1.94x one row's distinct
+spilled groups (a fetch once per run would read 47-48% of what the rows read now). So a cache of the last few steps'
+spilled rows in VRAM would serve ~3/4 of the reads at ~50 MB per spilled slot, and it would also take the repeats
+within a run; to pay, it has to live inside the attention kernel (a tag check per row, fill on miss), not in extra
+kernels.
+
+**Not done.** That cache; one host copy shared with the block store.

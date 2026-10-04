@@ -20,8 +20,14 @@ def main():
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "build", "libqw_engine.so"))
     ap.add_argument("--served-model-name", default="qw/qwen3.8-flash-next")
     ap.add_argument("--slots", default=os.environ.get("QW_SLOTS", "262144,65536,32768,32768"),
-                    help="KV capacity (tokens) of each sequence slot, comma-separated; one slot per concurrent "
-                         "request (env QW_SLOTS)")
+                    help="KV tokens held in VRAM by each sequence slot, comma-separated; one slot per concurrent "
+                         "request (env QW_SLOTS). Without --kv-spill this is also the slot's capacity")
+    ap.add_argument("--kv-spill", choices=["on", "off"], default=os.environ.get("QW_KV_SPILL", "off"),
+                    help="on: a slot holds up to --slot-max-tokens, the part beyond its VRAM tokens in pinned host RAM "
+                         "that the GPUs read directly (env QW_KV_SPILL; docs/DESIGN.md, KV spill)")
+    ap.add_argument("--slot-max-tokens", type=int, default=int(os.environ.get("QW_SLOT_MAX_TOKENS", "524288")),
+                    help="with --kv-spill on, the capacity of every slot whose VRAM tokens are fewer (env QW_SLOT_MAX_TOKENS); "
+                         "the pinned RAM it takes is logged at start")
     ap.add_argument("--prefill-chunk", type=int, default=int(os.environ.get("QW_PREFILL_CHUNK", "8192")),
                     help="tokens per prefill pass; its buffers take VRAM in proportion (env QW_PREFILL_CHUNK)")
     ap.add_argument("--reasoning-effort", default=os.environ.get("QW_REASONING_EFFORT", "xhigh"),

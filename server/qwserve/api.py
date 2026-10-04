@@ -28,6 +28,8 @@ class Server:
         self.eos_ids = self.prompt.eos_ids
         opts = {"model_dir": args.model_dir, "ple_dir": args.ple_dir, "prefill_chunk": args.prefill_chunk,
                 "slots": [int(x) for x in args.slots.split(",")]}
+        if getattr(args, "kv_spill", "off") == "on":
+            opts["slot_max_tokens"] = args.slot_max_tokens
         t0 = time.time()
         self.engine = Engine(args.lib, opts)
         print(f"engine ready in {time.time() - t0:.1f}s, slots {self.engine.capacity}, "

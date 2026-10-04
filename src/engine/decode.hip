@@ -78,6 +78,9 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
             gpu::qsa_compress_B(w.ikn, rk.dtab, idx, rows, s);
             gpu::qsa_attend_B(b.q16, b.gate, b.iq, rk.dtab, idx, rows, b.scores, b.score_ld, b.lists, b.counts,
                               b.att_partial, b.act16, s);
+            if (rk.loc_stats && kind != 2)
+                gpu::qsa_locality_B(rk.dtab, idx, rows, b.lists, b.counts, rk.loc_last, rk.loc_run, rk.loc_groups,
+                                    rk.loc_stats, s);
             gemv(w.qsa_o, w.qsa_o8, H, QH_L * HEAD_DIM, b.act16, b.partial);
         } else {
             gemv(w.gdn_proj, w.gdn_proj8, GDN_PROJ_L, H, b.bin, b.proj);

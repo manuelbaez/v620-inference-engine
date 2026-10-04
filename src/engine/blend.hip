@@ -34,6 +34,10 @@ void Engine::blend_transfer_end() {
 
 void Engine::blend_splice(int dst, int src, int64_t src_p0, int64_t dst_p0, int64_t n) {
     QW_CHECK(n > 0 && src_p0 + n <= slots_[size_t(src)].len && dst_p0 + n <= slot_capacity(dst), "blend_splice: range");
+    QW_CHECK(opt_.slot_spill[size_t(src)] == 0 && opt_.slot_spill[size_t(dst)] == 0,
+             "blend_splice: not supported on slots with KV spill");
+    QW_CHECK(false, "blend_splice: the slots keep only a ring of raw indexer keys now, and re-deriving a moved chunk's "
+                    "compressed keys needs all of them (the CacheBlend experiment was rejected: docs/DESIGN.md)");
     const hipMemcpyKind d2d = hipMemcpyDeviceToDevice;
     for (auto &rkp : ranks_) {
         Rank &rk = *rkp;
@@ -50,7 +54,7 @@ void Engine::blend_splice(int dst, int src, int64_t src_p0, int64_t dst_p0, int6
             CK(hipMemcpyAsync(d.raw_k[size_t(i)] + dst_p0 * IDX_DIM, s.raw_k[size_t(i)] + src_p0 * IDX_DIM,
                               size_t(n) * IDX_DIM * 4, d2d, rk.s));
             gpu::rope_shift(d.K[size_t(i)] + dst_p0 * HEAD_DIM, n, dst_p0 - src_p0, rk.s);
-            gpu::qsa_compress_T(d.raw_k[size_t(i)], ikn, dst_p0, int(n), d.ck[size_t(i)], rk.s);
+            gpu::qsa_compress_T(d.kv(size_t(i)), ikn, dst_p0, int(n), d.ck[size_t(i)], rk.s);
         }
     }
     host_copies_wait();

@@ -163,10 +163,23 @@ constexpr int ATT_BLOCKS = (IDX_BUDGET + IDX_RATIO - 1 + ATT_CHUNK - 1) / ATT_CH
 constexpr int ATT_REC = HEAD_DIM + 2;                                                 // m, l, acc[256]
 constexpr int ATT_PART = ATT_BLOCKS * QSA_LOCAL_HEADS * ATT_REC;                      // per query row
 
+// Row `pos` of a per-position array that is split at vt: VRAM below, mapped host memory from vt on (KV spill,
+// kernels/types.hpp). Unspilled slots have vt = NO_SPILL, so the branch is uniform and always the first.
+template <typename T>
+__device__ __forceinline__ T *kv_row(T *dev, T *host, int32_t vt, int64_t pos, int width) {
+    return pos < vt ? dev + pos * width : host + (pos - vt) * width;
+}
+
+// Row of position pos in a slot's ring of raw indexer keys (kernels/types.hpp).
+template <typename T>
+__device__ __forceinline__ T *raw_row(T *ring, int32_t rows, int64_t pos) {
+    return ring + (pos % rows) * IDX_DIM;
+}
+
 // Block b (256 threads) covers list entries [64b, 64b+64); writes one
-// partial record (m, l, acc[256]) per head.
-__device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const int32_t *list, int n,
-                                   float *partial) {
+// partial record (m, l, acc[256]) per head. K and V rows below vt are read from K / V, the others from Kh / Vh.
+__device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const uint4 *Kh, const uint4 *Vh,
+                                   int32_t vt, const int32_t *list, int n, float *partial) {
     QW_DCHECK(n >= 0 && n <= LIST_W);
     constexpr int NH = QSA_LOCAL_HEADS;
     __shared__ float sh[8][NH][ATT_REC];
@@ -192,8 +205,8 @@ __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *
     for (int i = base + w; i < min(n, base + ATT_CHUNK); i += 8) {
         const int tok = list[i];
         QW_DCHECK(tok >= 0 && tok < (1 << 20));
-        uint4 kv = K[size_t(tok) * (HEAD_DIM / 8) + lane];
-        uint4 vv = V[size_t(tok) * (HEAD_DIM / 8) + lane];
+        uint4 kv = kv_row(K, Kh, vt, tok, HEAD_DIM / 8)[lane];
+        uint4 vv = kv_row(V, Vh, vt, tok, HEAD_DIM / 8)[lane];
         const __half *kh = reinterpret_cast<const __half *>(&kv);
         const __half *vh = reinterpret_cast<const __half *>(&vv);
         float kf[8], vf[8];

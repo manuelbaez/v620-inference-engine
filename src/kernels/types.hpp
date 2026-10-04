@@ -26,9 +26,30 @@ constexpr int MTP_HIST = 256;              // decoded rows' hiddens kept per slo
 
 // K/V/ck hold fp16 bits: store with __half_as_ushort (assigning a __half to a
 // uint16_t converts the value to an integer).
+//
+// KV spill: positions < vt live in VRAM (K, V hold vt rows), positions >= vt in pinned host memory mapped into the
+// device's address space (Kh, Vh, indexed from position vt). The compressed keys ck always stay in VRAM, sized for
+// the whole logical length. A slot without spill has vt = NO_SPILL.
+constexpr int32_t NO_SPILL = 1 << 30;
+// The raw indexer keys are only read to build a group's compressed key, from the group's own 4 positions, so a slot
+// keeps them in a ring of raw_ring rows (position p at row p % raw_ring): a prefill chunk, the 3 positions before it
+// and the RAW_TAIL a snapshot captured inside the chunk takes. A snapshot carries the last RAW_TAIL positions' raw
+// keys (the MTP layer can lag the committed tokens by up to Engine::MTP_HISTORY positions).
+constexpr int RAW_TAIL = 256;
+
+// One QSA layer's KV of one slot, as the prefill kernels take it.
+struct KvSplit {
+    uint16_t *K, *V;
+    float *raw;  // ring [raw_ring][IDX_DIM]
+    uint16_t *Kh, *Vh;
+    int32_t vt, raw_ring;
+};
+
 struct SlotPtrs {
     uint16_t *K[QSA_LAYERS_MAX], *V[QSA_LAYERS_MAX], *ck[QSA_LAYERS_MAX];
-    float *raw_k[QSA_LAYERS_MAX];
+    float *raw_k[QSA_LAYERS_MAX];  // rings of raw_ring rows
+    uint16_t *Kh[QSA_LAYERS_MAX], *Vh[QSA_LAYERS_MAX];
+    int32_t vt, raw_ring;
     float *S;         // [N_GDN][12][128][128]
     float *ring;      // [N_GDN][GDN_RING][2560]
     float *ple;       // [PLE_RING][2560]

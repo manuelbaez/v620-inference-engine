@@ -8,8 +8,7 @@ namespace qw::gpu {
 // One block per token.
 __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const float *qn, const float *kn,
                                                          const float *iqn, int64_t start, __half *q16, __half *gate,
-                                                         __half *iq16, __half *K, __half *V, float *raw_k,
-                                                         const int32_t *rope3) {
+                                                         __half *iq16, KvSplit kv, const int32_t *rope3) {
     __shared__ float src[HEAD_DIM], buf[HEAD_DIM], red[8];
     const int t = blockIdx.x, th = threadIdx.x;
     const int64_t pos = start + t;
@@ -31,8 +30,9 @@ __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const 
     __syncthreads();
     norm_shared(src, kn, buf, HEAD_DIM, red);
     rope3_shared(buf, pt, ph, pw);
-    K[pos * HEAD_DIM + th] = __float2half(buf[th]);
-    V[pos * HEAD_DIM + th] = vp[th];
+    kv_row(reinterpret_cast<__half *>(kv.K), reinterpret_cast<__half *>(kv.Kh), kv.vt, pos, HEAD_DIM)[th] =
+        __float2half(buf[th]);
+    kv_row(reinterpret_cast<__half *>(kv.V), reinterpret_cast<__half *>(kv.Vh), kv.vt, pos, HEAD_DIM)[th] = vp[th];
     for (int h = 0; h < IDX_HEADS; ++h) {
         __syncthreads();
         if (th < IDX_DIM) src[th] = __half2float(ip[h * IDX_DIM + th]);
@@ -41,26 +41,25 @@ __global__ __launch_bounds__(256) void qsa_prep_T_kernel(const __half *P, const 
         rope3_shared(buf, pt, ph, pw);
         if (th < IDX_DIM) iq16[(size_t(t) * IDX_HEADS + h) * IDX_DIM + th] = __float2half(buf[th]);
     }
-    if (th < IDX_DIM) raw_k[pos * IDX_DIM + th] = __half2float(ip[IDX_HEADS * IDX_DIM + th]);
+    if (th < IDX_DIM) raw_row(kv.raw, kv.raw_ring, pos)[th] = __half2float(ip[IDX_HEADS * IDX_DIM + th]);
 }
 
 void qsa_prep_T(const uint16_t *P, const float *qn, const float *kn, const float *iqn, int64_t start, int T,
-                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s,
+                uint16_t *q16, uint16_t *gate, uint16_t *iq16, const KvSplit &kv, hipStream_t s,
                 const int32_t *rope3) {
     qsa_prep_T_kernel<<<T, 256, 0, s>>>(reinterpret_cast<const __half *>(P), qn, kn, iqn, start,
                                         reinterpret_cast<__half *>(q16), reinterpret_cast<__half *>(gate),
-                                        reinterpret_cast<__half *>(iq16), reinterpret_cast<__half *>(K),
-                                        reinterpret_cast<__half *>(V), raw_k, rope3);
+                                        reinterpret_cast<__half *>(iq16), kv, rope3);
 }
 
 // One 128-thread block per group completed in the chunk.
-__global__ __launch_bounds__(128) void qsa_compress_T_kernel(const float *raw_k, const float *ikn, int64_t c0,
-                                                             __half *ck, int64_t start, const int32_t *rope3) {
+__global__ __launch_bounds__(128) void qsa_compress_T_kernel(KvSplit kv, const float *ikn, int64_t c0, __half *ck,
+                                                             int64_t start, const int32_t *rope3) {
     __shared__ float mean[IDX_DIM], buf[IDX_DIM], red[4];
     const int64_t c = c0 + blockIdx.x;
     const int th = threadIdx.x;
     float m = 0.f;
-    for (int r = 0; r < IDX_RATIO; ++r) m += raw_k[(c * IDX_RATIO + r) * IDX_DIM + th];
+    for (int r = 0; r < IDX_RATIO; ++r) m += raw_row(kv.raw, kv.raw_ring, c * IDX_RATIO + r)[th];
     mean[th] = m / IDX_RATIO;
     __syncthreads();
     float ss = block_sum<4>(mean[th] * mean[th], red);
@@ -73,12 +72,12 @@ __global__ __launch_bounds__(128) void qsa_compress_T_kernel(const float *raw_k,
     ck[c * IDX_DIM + th] = __float2half(buf[th]);
 }
 
-void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
+void qsa_compress_T(const KvSplit &kv, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
                     const int32_t *rope3, int64_t rope_start) {
     const int64_t c_first = start / IDX_RATIO;                   // first group whose last token is >= start
     const int64_t c_last = (start + T - IDX_RATIO) / IDX_RATIO;  // last group completed by the chunk
     if (start + T < IDX_RATIO || c_last < c_first) return;
-    qsa_compress_T_kernel<<<int(c_last - c_first + 1), 128, 0, s>>>(raw_k, ikn, c_first,
+    qsa_compress_T_kernel<<<int(c_last - c_first + 1), 128, 0, s>>>(kv, ikn, c_first,
                                                                     reinterpret_cast<__half *>(ck), rope_start, rope3);
 }
 
@@ -109,11 +108,12 @@ void qsa_select_T(const float *scores, int ldsc, int64_t q0, int Q, int32_t *lis
     qsa_select_T_kernel<<<Q, 1024, 0, s>>>(scores, ldsc, q0, lists, counts);
 }
 
-__global__ __launch_bounds__(256) void qsa_attend_T_kernel(const uint4 *q16, const uint4 *K, const uint4 *V,
-                                                           const int32_t *lists, const int32_t *counts,
-                                                           float *partial) {
+__global__ __launch_bounds__(256) void qsa_attend_T_kernel(const uint4 *q16, KvSplit kv, const int32_t *lists,
+                                                           const int32_t *counts, float *partial) {
     const int q = blockIdx.y;
-    attend_body(q16 + size_t(q) * QSA_LOCAL_HEADS * (HEAD_DIM / 8), K, V, lists + size_t(q) * LIST_W, counts[q],
+    attend_body(q16 + size_t(q) * QSA_LOCAL_HEADS * (HEAD_DIM / 8), reinterpret_cast<const uint4 *>(kv.K),
+                reinterpret_cast<const uint4 *>(kv.V), reinterpret_cast<const uint4 *>(kv.Kh),
+                reinterpret_cast<const uint4 *>(kv.Vh), kv.vt, lists + size_t(q) * LIST_W, counts[q],
                 partial + (size_t(q) * ATT_BLOCKS + blockIdx.x) * QSA_LOCAL_HEADS * ATT_REC);
 }
 
@@ -124,11 +124,10 @@ __global__ __launch_bounds__(256) void qsa_combine_T_kernel(const float *partial
                  int(blockIdx.y));
 }
 
-void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const uint16_t *K, const uint16_t *V, const int32_t *lists,
+void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, const int32_t *lists,
                   const int32_t *counts, int Q, float *partial, uint16_t *out, hipStream_t s) {
-    qsa_attend_T_kernel<<<dim3(ATT_BLOCKS, Q), 256, 0, s>>>(reinterpret_cast<const uint4 *>(q16),
-                                                            reinterpret_cast<const uint4 *>(K),
-                                                            reinterpret_cast<const uint4 *>(V), lists, counts, partial);
+    qsa_attend_T_kernel<<<dim3(ATT_BLOCKS, Q), 256, 0, s>>>(reinterpret_cast<const uint4 *>(q16), kv, lists, counts,
+                                                            partial);
     qsa_combine_T_kernel<<<dim3(Q, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, reinterpret_cast<const __half *>(gate),
                                                                        reinterpret_cast<__half *>(out));
 }
@@ -153,8 +152,8 @@ __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, 
     }
     norm_shared(kp, kn, buf, HEAD_DIM, red);
     rope_shared(buf, pos);
-    sp.K[qi][pos * HEAD_DIM + t] = __half_as_ushort(__float2half(buf[t]));
-    sp.V[qi][pos * HEAD_DIM + t] = __half_as_ushort(__float2half(vp[t]));
+    kv_row(sp.K[qi], sp.Kh[qi], sp.vt, pos, HEAD_DIM)[t] = __half_as_ushort(__float2half(buf[t]));
+    kv_row(sp.V[qi], sp.Vh[qi], sp.vt, pos, HEAD_DIM)[t] = __half_as_ushort(__float2half(vp[t]));
     __syncthreads();
     for (int h = 0; h < IDX_HEADS; ++h) {
         norm_shared(ip + h * IDX_DIM, iqn, buf, IDX_DIM, red);
@@ -162,7 +161,7 @@ __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, 
         if (t < IDX_DIM) iq[(size_t(r) * IDX_HEADS + h) * IDX_DIM + t] = buf[t];
         __syncthreads();
     }
-    if (t < IDX_DIM) sp.raw_k[qi][pos * IDX_DIM + t] = ip[IDX_HEADS * IDX_DIM + t];
+    if (t < IDX_DIM) raw_row(sp.raw_k[qi], sp.raw_ring, pos)[t] = ip[IDX_HEADS * IDX_DIM + t];
 }
 
 void qsa_prep_B(const float *proj, const float *qn, const float *kn, const float *iqn, const SlotPtrs *tab, int qi,
@@ -178,7 +177,7 @@ __global__ __launch_bounds__(128) void qsa_compress_B_kernel(const float *ikn, c
     if ((pos + 1) % IDX_RATIO != 0) return;
     const SlotPtrs &sp = tab[rows.slot[r]];
     float m = 0.f;
-    for (int k = 0; k < IDX_RATIO; ++k) m += sp.raw_k[qi][(pos - k) * IDX_DIM + t];
+    for (int k = 0; k < IDX_RATIO; ++k) m += raw_row(sp.raw_k[qi], sp.raw_ring, pos - k)[t];
     mean[t] = m / IDX_RATIO;
     __syncthreads();
     const float ss = block_sum<4>(mean[t] * mean[t], red);
@@ -234,7 +233,8 @@ __global__ __launch_bounds__(256) void qsa_attend_B_kernel(const uint4 *q16, con
     QW_DCHECK(rows.slot[r] >= 0 && rows.slot[r] < 8 && counts[r] <= rows.pos[r] + 1);
     const SlotPtrs &sp = tab[rows.slot[r]];
     attend_body(q16 + size_t(r) * QSA_LOCAL_HEADS * (HEAD_DIM / 8), reinterpret_cast<const uint4 *>(sp.K[qi]),
-                reinterpret_cast<const uint4 *>(sp.V[qi]), lists + size_t(r) * LIST_W, counts[r],
+                reinterpret_cast<const uint4 *>(sp.V[qi]), reinterpret_cast<const uint4 *>(sp.Kh[qi]),
+                reinterpret_cast<const uint4 *>(sp.Vh[qi]), sp.vt, lists + size_t(r) * LIST_W, counts[r],
                 partial + size_t(r) * ATT_PART + size_t(blockIdx.x) * QSA_LOCAL_HEADS * ATT_REC);
 }
 
@@ -253,6 +253,54 @@ void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const
                                                                  lists, counts, partial);
     qsa_combine_B_kernel<<<dim3(rows.M, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, gate,
                                                                             reinterpret_cast<__half *>(out));
+}
+
+__global__ __launch_bounds__(256) void qsa_locality_B_kernel(const SlotPtrs *tab, int qi, Rows rows,
+                                                             const int32_t *lists, const int32_t *counts, int32_t *last,
+                                                             int32_t *run_mark, int groups,
+                                                             unsigned long long *stats) {
+    constexpr int K[LOC_NK] = {1, 2, 4, 8, 16, 32};
+    const int r = blockIdx.x;
+    const SlotPtrs &sp = tab[rows.slot[r]];
+    if (!sp.Kh[qi]) return;
+    int n_run = 0;
+    for (int j = 0; j < rows.M; ++j) n_run += rows.run_first[j] == rows.run_first[r];
+    const int64_t pos = rows.pos[r];
+    const size_t at = (size_t(rows.slot[r]) * QSA_LAYERS_MAX + size_t(qi)) * size_t(groups);
+    int32_t *lst = last + at;
+    const int32_t *list = lists + size_t(r) * LIST_W;
+    const int n = counts[r];
+    unsigned long long *st = stats + size_t(qi) * LOC_STATS;
+    if (n_run != 1) {  // a run: its rows' spilled groups, summed and distinct
+        const int32_t key = int32_t(rows.pos[rows.run_first[r]]);
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const int tok = list[i];
+            if (tok < sp.vt || (i > 0 && (list[i - 1] >> 2) == (tok >> 2))) continue;
+            const int g = (tok - sp.vt) >> 2;
+            if (g >= groups) continue;
+            atomicAdd(st + LOC_RUN, 1ull);
+            if (atomicExch(run_mark + at + g, key) != key) atomicAdd(st + LOC_RUN + 1, 1ull);
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const int tok = list[i];
+        if (i > 0 && (list[i - 1] >> 2) == (tok >> 2)) continue;  // a group once (its tokens are consecutive)
+        atomicAdd(st + 0, 1ull);
+        if (tok < sp.vt) continue;
+        const int g = (tok - sp.vt) >> 2;
+        if (g >= groups) continue;
+        atomicAdd(st + 1, 1ull);
+        const int32_t prev = lst[g];
+        for (int k = 0; k < LOC_NK; ++k)
+            if (pos - prev <= K[k]) atomicAdd(st + 2 + k, 1ull);
+        lst[g] = int32_t(pos);
+    }
+}
+
+void qsa_locality_B(const SlotPtrs *tab, int qi, Rows rows, const int32_t *lists, const int32_t *counts, int32_t *last,
+                    int32_t *run_mark, int groups, unsigned long long *stats, hipStream_t s) {
+    qsa_locality_B_kernel<<<rows.M, 256, 0, s>>>(tab, qi, rows, lists, counts, last, run_mark, groups, stats);
 }
 
 }  // namespace qw::gpu

@@ -8,6 +8,7 @@
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
 #include "engine/rank.hpp"
+#include "kernels/qsa.hpp"
 
 namespace qw {
 
@@ -81,10 +82,12 @@ void alloc_prefill(PrefillBuf &b, int C, int max_slot_tokens, bool mtp) {
     b.h_ple = pinned<uint16_t>(size_t(C) * H);
 }
 
-void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
+void alloc_slots(Rank &rk, const EngineOptions &opt, const SpillPool *spill, bool mtp) {
     std::vector<gpu::SlotPtrs> tab(opt.slot_tokens.size());
     for (size_t si = 0; si < opt.slot_tokens.size(); ++si) {
-        const size_t cap = size_t(opt.slot_tokens[si]);
+        const size_t cap = size_t(opt.slot_tokens[si]);  // tokens in VRAM
+        const size_t spilled = si < opt.slot_spill.size() ? size_t(std::max(0, opt.slot_spill[si])) : 0;
+        const size_t logical = cap + spilled;
         Rank::Slot sl;
         sl.S = zeros<float>(SLOT_S);
         sl.ring = zeros<float>(SLOT_RING);
@@ -95,16 +98,31 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, bool mtp) {
         for (int i = 0; i < N_QSA + int(mtp); ++i) {
             sl.K.push_back(zeros<uint16_t>(cap * HEAD_DIM));
             sl.V.push_back(zeros<uint16_t>(cap * HEAD_DIM));
-            sl.ck.push_back(zeros<uint16_t>(cap / IDX_RATIO * IDX_DIM + IDX_DIM));
-            sl.raw_k.push_back(zeros<float>(cap * IDX_DIM));
+            sl.ck.push_back(zeros<uint16_t>(logical / IDX_RATIO * IDX_DIM + IDX_DIM));
+            sl.raw_k.push_back(zeros<float>(size_t(raw_ring_rows(opt)) * IDX_DIM));
+        }
+        sl.raw_ring = raw_ring_rows(opt);
+        if (spilled) {
+            sl.vt = int32_t(cap);
+            for (int i = 0; i < N_QSA + int(mtp); ++i) {
+                const SpillPool::Buf &b = spill->buf(int(si), rk.r, i);
+                sl.Kh.push_back(b.K);
+                sl.Vh.push_back(b.V);
+            }
         }
         gpu::SlotPtrs &t = tab[si];
         std::memset(&t, 0, sizeof t);
+        t.vt = sl.vt;
+        t.raw_ring = sl.raw_ring;
         for (int i = 0; i < N_QSA + int(mtp); ++i) {
             t.K[i] = sl.K[size_t(i)];
             t.V[i] = sl.V[size_t(i)];
             t.ck[i] = sl.ck[size_t(i)];
             t.raw_k[i] = sl.raw_k[size_t(i)];
+            if (spilled) {
+                t.Kh[i] = sl.Kh[size_t(i)];
+                t.Vh[i] = sl.Vh[size_t(i)];
+            }
         }
         t.S = sl.S;
         t.ring = sl.ring;
@@ -208,12 +226,38 @@ void alloc_batch(Rank::Batch &b, int max_slot_tokens, bool mtp) {
 
 }  // namespace
 
-void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, int max_slot_tokens, bool mtp) {
+size_t slot_vram_bytes(const EngineOptions &opt, bool mtp) {
+    const size_t layers = size_t(N_QSA + int(mtp));
+    size_t total = size_t(Engine::SNAPSHOTS) * (SLOT_S + SLOT_RING + SLOT_PLE + XW + RAW_TAIL_FLOATS) * 4;
+    for (size_t si = 0; si < opt.slot_tokens.size(); ++si) {
+        const size_t vram = size_t(opt.slot_tokens[si]);
+        const size_t spilled = si < opt.slot_spill.size() ? size_t(std::max(0, opt.slot_spill[si])) : 0;
+        total += layers * (vram * 2 * HEAD_DIM * 2                                        // K, V (fp16)
+                           + size_t(raw_ring_rows(opt)) * IDX_DIM * 4                      // the raw keys' ring (fp32)
+                           + ((vram + spilled) / IDX_RATIO * IDX_DIM + IDX_DIM) * 2);       // compressed keys, whole length
+        total += (SLOT_S + SLOT_RING + SLOT_PLE + XW) * 4 + (mtp ? size_t(gpu::MTP_HIST) * XW * 4 : 0) +
+                 size_t(2) * VOCAB_L * 4;
+    }
+    return total + spill_stage_tokens(opt) * 2 * HEAD_DIM * 2;  // the prefill staging of the spill (K, V)
+}
+
+void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spill, int max_slot_tokens, bool mtp) {
+    {
+        size_t free_b = 0, total_b = 0;
+        CK(hipMemGetInfo(&free_b, &total_b));
+        const size_t need = slot_vram_bytes(opt, mtp);
+        QW_CHECK(need + (size_t(1) << 30) <= free_b,
+                 "the slots need " + std::to_string(need >> 20) + " MiB of VRAM per card (K, V and raw keys of the resident tokens, "
+                 "compressed keys of the whole capacity, recurrent state) and only " + std::to_string(free_b >> 20) +
+                 " MiB are free after the weights, with ~1 GiB more needed for the prefill and decode buffers: "
+                 "fewer or smaller resident slots (--slots), or a smaller --slot-max-tokens");
+    }
     for (auto &sn : rk.snaps) {
         sn.S = zeros<float>(SLOT_S);
         sn.ring = zeros<float>(SLOT_RING);
         sn.ple = zeros<float>(SLOT_PLE);
         sn.pend = zeros<float>(XW);
+        sn.raw_tail = zeros<float>(RAW_TAIL_FLOATS);
     }
     // prefill: two micro-batches of half a chunk each, on two streams
     QW_CHECK(opt.prefill_chunk >= 512 && opt.prefill_chunk % 2 == 0, "prefill_chunk must be even and >= 512");
@@ -225,7 +269,26 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, int max_slot_tokens,
     rocblas_set_stream(rk.blas2, rk.s2);
     if (rocblas_create_handle(&rk.blas) != rocblas_status_success) fail("rocblas_create_handle");
     rocblas_set_stream(rk.blas, rk.s);
-    alloc_slots(rk, opt, mtp);
+    alloc_slots(rk, opt, spill, mtp);
+    if (rk.r == 0 && std::getenv("QW_SPILL_LOCALITY")) {
+        int m = 0;
+        for (int s : opt.slot_spill) m = std::max(m, s);
+        rk.loc_groups = m / IDX_RATIO;
+        const size_t n = opt.slot_tokens.size() * size_t(gpu::QSA_LAYERS_MAX) * size_t(rk.loc_groups);
+        rk.loc_last = zeros<int32_t>(n);
+        CK(hipMemset(rk.loc_last, 0xC0, n * 4));  // very negative: never selected
+        rk.loc_run = zeros<int32_t>(n);
+        CK(hipMemset(rk.loc_run, 0xC0, n * 4));
+        rk.loc_stats = zeros<unsigned long long>(size_t(gpu::QSA_LAYERS_MAX) * gpu::LOC_STATS);
+    }
+    if (const size_t n = spill_stage_tokens(opt)) {
+        rk.stage_tokens = n;
+        rk.stage_k = zeros<uint16_t>(n * HEAD_DIM);
+        rk.stage_v = zeros<uint16_t>(n * HEAD_DIM);
+        CK(hipStreamCreateWithFlags(&rk.s3, hipStreamNonBlocking));
+        for (hipEvent_t *e : {&rk.stage_ready, &rk.stage_free, &rk.stage_done[0], &rk.stage_done[1]})
+            CK(hipEventCreateWithFlags(e, hipEventDisableTiming));
+    }
     alloc_batch(rk.bt, max_slot_tokens, mtp);
     CK(hipDeviceSynchronize());
 }

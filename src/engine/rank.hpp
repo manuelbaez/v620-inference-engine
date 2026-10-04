@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <string>
@@ -16,6 +17,7 @@
 #include "core/shard.hpp"
 #include "core/threadpool.hpp"
 #include "engine/engine.hpp"
+#include "engine/spill.hpp"
 #include "kernels/sampling_types.hpp"
 #include "kernels/types.hpp"
 #include "vision/vision_encoder.hpp"
@@ -118,14 +120,31 @@ struct Rank {
         float *hist = nullptr;                                // [MTP_HIST][XW] decoded rows' MTP inputs
         int32_t *pen = nullptr;  // [2][VOCAB_L] token counts for the penalties: prompt + generated, generated
         std::vector<uint16_t *> K, V, ck;
-        std::vector<float *> raw_k;
+        std::vector<float *> raw_k;  // rings of raw_ring rows (kernels/types.hpp)
+        int32_t raw_ring = 0;
+        // KV spill: positions >= vt are in pinned host memory shared with the rank's KV group (empty without spill)
+        std::vector<uint16_t *> Kh, Vh;
+        int32_t vt = gpu::NO_SPILL;
+        gpu::KvSplit kv(size_t layer) const {
+            if (Kh.empty()) return {K[layer], V[layer], raw_k[layer], nullptr, nullptr, gpu::NO_SPILL, raw_ring};
+            return {K[layer], V[layer], raw_k[layer], Kh[layer], Vh[layer], vt, raw_ring};
+        }
     };
     std::vector<Slot> slots;
+    // KV spill staging for prefill (EngineOptions::spill_stage): K and V of up to stage_tokens spilled positions of one
+    // QSA layer, indexed like a slot's host part (position vt + i at row i, plus a segment's offset); a copy stream,
+    // and events: the copy in done, each micro-batch's attention done, the write-back done (the buffer is free)
+    uint16_t *stage_k = nullptr, *stage_v = nullptr;
+    size_t stage_tokens = 0;
+    hipStream_t s3 = nullptr;
+    hipEvent_t stage_ready = nullptr, stage_free = nullptr;
+    std::array<hipEvent_t, 2> stage_done{};
     gpu::SlotPtrs *dtab = nullptr;
     int32_t **pen_tab = nullptr;  // device [slots]: each slot's pen
     // recurrent-state snapshots (pool, any slot)
     struct Snap {
         float *S = nullptr, *ring = nullptr, *ple = nullptr, *pend = nullptr;
+        float *raw_tail = nullptr;  // [QSA_LAYERS_MAX][RAW_TAIL][IDX_DIM]: the last positions' raw indexer keys
     };
     std::array<Snap, Engine::SNAPSHOTS> snaps{};
     std::unique_ptr<VisionEncoder> vit;  // this card's copy of the vision tower (null: text only)
@@ -182,6 +201,10 @@ struct Rank {
         uint8_t *pen_gen = nullptr;
         size_t pen_cap = 0;
     } bt;
+    // QW_SPILL_LOCALITY experiment (rank 0 only): last selecting position per slot, layer and spilled group; counters
+    int32_t *loc_last = nullptr, *loc_run = nullptr;
+    unsigned long long *loc_stats = nullptr;
+    int loc_groups = 0;
     // captured graphs per row count: [kind][M], kind 0 decode, 1 decode + GDN state save, 2 MTP
     std::array<std::array<hipGraphExec_t, gpu::MAX_ROWS + 1>, 3> graphs{};
     std::array<std::array<uint32_t, gpu::MAX_ROWS + 1>, 3> n_coll{};
@@ -190,8 +213,26 @@ struct Rank {
 
 // Loads rank rk.r's shard of every weight (weights.hip).
 void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp);
+// Rows of a slot's ring of raw indexer keys: a prefill chunk, the 3 positions before it, a snapshot's tail.
+inline int raw_ring_rows(const EngineOptions &opt) {
+    return opt.prefill_chunk + gpu::RAW_TAIL + 64;
+}
+constexpr size_t RAW_TAIL_FLOATS = size_t(gpu::QSA_LAYERS_MAX) * gpu::RAW_TAIL * IDX_DIM;
+// The raw indexer keys of positions [n - RAW_TAIL, n) (those >= 0) of a slot's first `layers` QSA layers, between its
+// rings and a tail [QSA_LAYERS_MAX][RAW_TAIL][IDX_DIM] in position order (row RAW_TAIL - 1 is position n - 1).
+void raw_tail_copy(const Rank::Slot &sl, int layers, int64_t n, float *tail, bool to_tail, hipMemcpyKind kind,
+                   hipStream_t s);
+// Positions the prefill staging buffer of the spill holds: the largest slot's spill (0: no spill or staging off).
+inline size_t spill_stage_tokens(const EngineOptions &opt) {
+    if (!opt.spill_stage) return 0;
+    int m = 0;
+    for (int s : opt.slot_spill) m = std::max(m, s);
+    return size_t(m);
+}
+// Bytes of VRAM per rank that the slots (KV, compressed keys, recurrent state) and the snapshot pool take.
+size_t slot_vram_bytes(const EngineOptions &opt, bool mtp);
 // Allocates the rank's slots, snapshot pool, scratch, streams and rocBLAS
 // handles (buffers.hip). The rank's device must be current.
-void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, int max_slot_tokens, bool mtp);
+void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spill, int max_slot_tokens, bool mtp);
 
 }  // namespace qw

@@ -29,13 +29,28 @@
 namespace qw {
 
 struct Rank;  // per-GPU state (rank.hpp)
+class SpillPool;  // KV beyond a slot's VRAM tokens (spill.hpp)
+
+#define QW_HAVE_SPILL 1  // EngineOptions::slot_spill exists (benchmarks that also build on older trees test for it)
 
 struct EngineOptions {
     std::string model_dir = "/mnt/llms/qwen3.8-flash-next-awq";
     std::string ple_dir = "/mnt/llms/qwen3.8-flash-next-ple/ples_int4";
     std::array<int, RANKS> devices{0, 1, 2, 3};
-    // KV capacity (tokens) of each sequence slot; multiples of 256.
+    // KV tokens of each sequence slot held in VRAM; multiples of 256.
     std::vector<int> slot_tokens{262144, 65536, 32768, 32768};
+    // Tokens a slot holds beyond its VRAM, in pinned host memory the kernels read directly (multiples of 256; empty or
+    // 0: none). A slot's capacity is slot_tokens + slot_spill; the compressed keys stay in VRAM for all of it.
+    std::vector<int> slot_spill{};
+    // The capacity every slot should have (multiple of 256): each slot spills whatever its VRAM tokens do not cover.
+    // 0: off (slots hold what their VRAM holds). Ignored for the slots slot_spill names. QW_SLOT_MAX_TOKENS sets it
+    // when this is 0; QW_SPILL=0 turns every form of spill off.
+    int slot_max_tokens = 0;
+    // Prefill into a slot's spilled part reads that part from VRAM: before each QSA layer the spilled rows the chunk can
+    // attend to are copied into a staging buffer (one per card, as large as the largest spill) on a copy stream, while
+    // the layers before it run, and the chunk's new rows go back to host memory after. QW_SPILL_STAGE=0: off (the
+    // attention reads host memory directly, 2.2-2.6x slower prefill there).
+    bool spill_stage = true;
     int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion
@@ -52,7 +67,8 @@ public:
     ~Engine();
 
     int num_slots() const { return int(slots_.size()); }
-    int64_t slot_capacity(int slot) const;
+    int64_t slot_capacity(int slot) const;      // tokens the slot can hold: VRAM plus spill
+    int64_t slot_vram_tokens(int slot) const;   // ... of which in VRAM
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
     int prefill_chunk() const { return opt_.prefill_chunk; }
@@ -193,6 +209,8 @@ public:
     // for the copies.
     void import_recurrent(int slot, const RankBufs &src, int64_t n, const std::vector<int32_t> &tail);
     void host_copies_wait();
+    // QW_SPILL_LOCALITY experiment: the counters per QSA layer ([QSA_LAYERS_MAX][gpu::LOC_STATS]), then zeroed.
+    std::vector<unsigned long long> spill_locality();
     int rank_device(int r) const;  // HIP device of rank r (the order of RankBufs)
     // Identifies the state layout (shapes, ring sizes, MTP layer): a saved
     // state is only loadable by an engine with the same id.
@@ -288,6 +306,7 @@ private:
     // for draft tokens (pinned, mapped into every device's address space)
     uint16_t *embed_ = nullptr;
     std::unique_ptr<PleTable> ple_;
+    std::unique_ptr<SpillPool> spill_;
     NgramHasher hasher_;
     std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch
     std::vector<std::unique_ptr<Rank>> ranks_;

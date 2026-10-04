@@ -108,6 +108,69 @@ void Engine::run_prefill_rank(Rank &rk) {
                 m.subs.push_back({i, &rk.slots[size_t(sg.slot)], sg.start + (a - sg.row0), e - a, a - m.row0,
                                   a > sg.row0, e == sg.row0 + sg.T});
         }
+    // KV spill staging (EngineOptions::spill_stage): which segments read their spilled part from the staging buffer,
+    // at which offset in it. A segment is staged when its chunk reaches past its slot's VRAM part and its region (the
+    // spilled positions up to the chunk's end) fits after the segments staged before it; the others read the host.
+    std::vector<int64_t> stage_off(segs.size(), -1);
+    {
+        size_t used = 0;
+        for (size_t i = 0; rk.stage_tokens && i < segs.size(); ++i) {
+            const Rank::Slot &sl = rk.slots[size_t(segs[i].slot)];
+            const int64_t end = segs[i].start + segs[i].T;
+            if (sl.Kh.empty() || end <= sl.vt) continue;
+            const size_t need = size_t(end - sl.vt);
+            if (used + need > rk.stage_tokens) continue;
+            stage_off[i] = int64_t(used);
+            used += need;
+        }
+    }
+    const bool staging = std::any_of(stage_off.begin(), stage_off.end(), [](int64_t o) { return o >= 0; });
+    // The rows of layer qi each staged segment already holds in host memory go into the buffer (rows [vt, first) with
+    // `first` the first position the chunk writes in that layer), after the previous layer's write-back freed it.
+    // first_of(i): that position for segment i (the MTP layer's rows start one early when the store holds a hidden).
+    auto stage_in = [&](size_t qi, const std::function<int64_t(size_t)> &first_of) {
+        if (!staging) return;
+        CK(hipStreamWaitEvent(rk.s3, rk.stage_free, 0));
+        for (size_t i = 0; i < segs.size(); ++i) {
+            if (stage_off[i] < 0) continue;
+            const Rank::Slot &sl = rk.slots[size_t(segs[i].slot)];
+            const int64_t n = first_of(i) - sl.vt;
+            if (n <= 0) continue;
+            const size_t o = size_t(stage_off[i]) * HEAD_DIM;
+            CK(hipMemcpyAsync(rk.stage_k + o, sl.Kh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
+            CK(hipMemcpyAsync(rk.stage_v + o, sl.Vh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
+        }
+        CK(hipEventRecord(rk.stage_ready, rk.s3));
+    };
+    // ... and after both micro-batches' attention the rows the chunk wrote, [first, end) of the spilled part, go back.
+    auto stage_out = [&](size_t qi, const std::function<int64_t(size_t)> &first_of,
+                         const std::function<int64_t(size_t)> &end_of) {
+        if (!staging) return;
+        for (size_t k = 0; k < mbs.size(); ++k) CK(hipStreamWaitEvent(rk.s3, rk.stage_done[k], 0));
+        for (size_t i = 0; i < segs.size(); ++i) {
+            if (stage_off[i] < 0) continue;
+            const Rank::Slot &sl = rk.slots[size_t(segs[i].slot)];
+            const int64_t a = std::max<int64_t>(first_of(i), sl.vt) - sl.vt, e = end_of(i) - sl.vt;
+            if (e <= a) continue;
+            const size_t o = (size_t(stage_off[i]) + size_t(a)) * HEAD_DIM;
+            CK(hipMemcpyAsync(sl.Kh[qi] + size_t(a) * HEAD_DIM, rk.stage_k + o, size_t(e - a) * HEAD_DIM * 2,
+                              hipMemcpyDeviceToHost, rk.s3));
+            CK(hipMemcpyAsync(sl.Vh[qi] + size_t(a) * HEAD_DIM, rk.stage_v + o, size_t(e - a) * HEAD_DIM * 2,
+                              hipMemcpyDeviceToHost, rk.s3));
+        }
+        CK(hipEventRecord(rk.stage_free, rk.s3));
+    };
+    // The KV a sub's kernels use for layer qi: the staging buffer in place of the host part when its segment is staged.
+    auto sub_kv = [&](const Sub &sb, size_t qi) {
+        gpu::KvSplit kv = sb.sl->kv(qi);
+        if (stage_off[size_t(sb.seg)] >= 0) {
+            kv.Kh = rk.stage_k + size_t(stage_off[size_t(sb.seg)]) * HEAD_DIM;
+            kv.Vh = rk.stage_v + size_t(stage_off[size_t(sb.seg)]) * HEAD_DIM;
+        }
+        return kv;
+    };
+    auto mb_index = [&](const MB &m) { return size_t(&m - mbs.data()); };
+
     // B's stream starts after A's (resets, previous chunk's state)
     if (split) {
         CK(hipEventRecord(rk.ev[0], rk.s));
@@ -191,15 +254,15 @@ void Engine::run_prefill_rank(Rank &rk) {
             const size_t qi = size_t(idx);
             constexpr size_t QW = size_t(QH_L) * HEAD_DIM, IW = size_t(IDX_HEADS) * IDX_DIM;
             gemm(m, w.qsa_proj, QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
+            if (staging) CK(hipStreamWaitEvent(s, rk.stage_ready, 0));
             for (const Sub &sb : subs) {
                 const int32_t *r3 = rope3 && l < N_LAYERS ? rope3 + size_t(sb.start - start0) * 3 : nullptr;
                 gpu::qsa_prep_T(b.P + size_t(sb.row) * QSA_PROJ_L, w.qn, w.kn, w.iqn, sb.start, sb.T,
-                                b.q16 + sb.row * QW, b.qgate + sb.row * QW, b.iq16 + sb.row * IW, sb.sl->K[qi],
-                                sb.sl->V[qi], sb.sl->raw_k[qi], s, r3);
+                                b.q16 + sb.row * QW, b.qgate + sb.row * QW, b.iq16 + sb.row * IW, sub_kv(sb, qi), s, r3);
             }
             wait(m, l, 2);  // A's K/V and raw keys (a group can straddle the halves)
             for (const Sub &sb : subs)
-                gpu::qsa_compress_T(sb.sl->raw_k[qi], w.ikn, sb.start, sb.T, sb.sl->ck[qi], s,
+                gpu::qsa_compress_T(sb.sl->kv(qi), w.ikn, sb.start, sb.T, sb.sl->ck[qi], s,
                                     l < N_LAYERS ? rope3 : nullptr, start0);
             record(m, l, 2);
             for (const Sub &sb : subs)
@@ -217,9 +280,10 @@ void Engine::run_prefill_rank(Rank &rk) {
                     } else {
                         gpu::qsa_select_T(b.scores, 0, p0, Q, b.lists, b.lcounts, s);
                     }
-                    gpu::qsa_attend_T(b.q16 + row * QW, b.qgate + row * QW, sb.sl->K[qi], sb.sl->V[qi], b.lists,
+                    gpu::qsa_attend_T(b.q16 + row * QW, b.qgate + row * QW, sub_kv(sb, qi), b.lists,
                                       b.lcounts, Q, b.att_partial, b.act + row * QW, s);
                 }
+            if (staging) CK(hipEventRecord(rk.stage_done[mb_index(m)], s));
             if (calib) cal(m, ln + ".qsa_o", b.act, QH_L * HEAD_DIM, T, QH_L * HEAD_DIM);
             gemm(m, w.qsa_o, H, QH_L * HEAD_DIM, b.act, QH_L * HEAD_DIM, T, b.part16, H, true);
         } else {
@@ -298,8 +362,12 @@ void Engine::run_prefill_rank(Rank &rk) {
                 record(m, l, 3);
             }
             const bool qsa = is_qsa(l);
+            if (qsa && &m == &mbs[0]) stage_in(size_t(qsa_index(l)), [&](size_t i) { return segs[i].start; });
             layer(m, w, l, qsa, qsa ? qsa_index(l) : gdn_index(l), b.X, m.subs, m.T);
         }
+        if (is_qsa(l))
+            stage_out(size_t(qsa_index(l)), [&](size_t i) { return segs[i].start; },
+                      [&](size_t i) { return segs[i].start + segs[i].T; });
     }
     for (auto &m : mbs) {  // complete X: the pre-final-mixer hidden (lm_head and MTP input)
         gpu::hc_combine_T(m.b->X, m.pend, m.b->inj_mlp, m.T, m.s);
@@ -315,6 +383,11 @@ void Engine::run_prefill_rank(Rank &rk) {
     // pairs X[t] with token t + 1. A segment's rows start one early, from the
     // slot's MTP input store (the previous chunk's or micro-batch's last
     // hidden), and its last hidden goes into the store.
+    // the MTP layer's rows of a segment: [start - 1, end - 1) when the slot's MTP input store holds the hidden of the
+    // token before the segment, else [start, end - 1)
+    auto mtp_first = [&](size_t i) { return segs[i].start - (segs[i].mtp_pend ? 1 : 0); };
+    auto mtp_end = [&](size_t i) { return segs[i].start + segs[i].T - 1; };
+    if (mtp_) stage_in(size_t(N_QSA), mtp_first);
     if (mtp_)
         for (auto &m : mbs) {
             PrefillBuf &b = *m.b;
@@ -358,6 +431,7 @@ void Engine::run_prefill_rank(Rank &rk) {
                                   s));
             record(m, N_LAYERS, 3);
         }
+    if (mtp_) stage_out(size_t(N_QSA), mtp_first, mtp_end);
     // final mixer + lm_head: every row in all-logits mode, else each segment's last one
     struct Out {
         MB *m;
@@ -400,6 +474,16 @@ void Engine::run_prefill_rank(Rank &rk) {
         phase_[size_t(r)] = 2;
         CK(hipStreamSynchronize(m.s));
     }
+    if (staging) CK(hipStreamSynchronize(rk.s3));  // the spilled rows are back in host memory before anyone reads them
+    // captures: the raw indexer keys before each one (the rings still hold the whole chunk and RAW_TAIL before it)
+    bool captured = false;
+    for (const PrefillSeg &sg : segs)
+        for (const Capture &cp : sg.captures) {
+            raw_tail_copy(rk.slots[size_t(sg.slot)], N_QSA + int(mtp_), cp.pos, rk.snaps[size_t(cp.snap)].raw_tail, true,
+                          hipMemcpyDeviceToDevice, rk.s);
+            captured = true;
+        }
+    if (captured) CK(hipStreamSynchronize(rk.s));
     for (const Out &o : outs)
         for (int i = 0; i < o.rows; ++i)
             CK(hipMemcpy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,

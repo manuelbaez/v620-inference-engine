@@ -16,6 +16,21 @@
 
 namespace qw {
 
+void raw_tail_copy(const Rank::Slot &sl, int layers, int64_t n, float *tail, bool to_tail, hipMemcpyKind kind,
+                   hipStream_t s) {
+    const int64_t first = n - gpu::RAW_TAIL;  // the tail's row 0
+    for (int i = 0; i < layers; ++i) {
+        float *ring = sl.raw_k[size_t(i)];
+        float *t = tail + size_t(i) * gpu::RAW_TAIL * IDX_DIM;
+        for (int64_t p = std::max<int64_t>(0, first); p < n;) {  // at most two pieces: the ring wraps once
+            const int64_t at = p % sl.raw_ring, run = std::min<int64_t>(n - p, sl.raw_ring - at);
+            float *rp = ring + at * IDX_DIM, *tp = t + (p - first) * IDX_DIM;
+            CK(hipMemcpyAsync(to_tail ? tp : rp, to_tail ? rp : tp, size_t(run) * IDX_DIM * 4, kind, s));
+            p += run;
+        }
+    }
+}
+
 void Engine::snapshot_save(int snap, int slot) {
     QW_CHECK(snap >= 0 && snap < SNAPSHOTS, "bad snapshot index");
     for (auto &rkp : ranks_) {
@@ -27,6 +42,7 @@ void Engine::snapshot_save(int snap, int slot) {
         CK(hipMemcpyAsync(sn.ring, sl.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
         CK(hipMemcpyAsync(sn.ple, sl.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
         CK(hipMemcpyAsync(sn.pend, sl.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
+        raw_tail_copy(sl, N_QSA + int(mtp_), slots_[size_t(slot)].len, sn.raw_tail, true, hipMemcpyDeviceToDevice, rk.s);
     }
     for (auto &rkp : ranks_) CK(hipStreamSynchronize(rkp->s));
 }
@@ -42,6 +58,7 @@ void Engine::snapshot_restore(int snap, int slot, int64_t n, const std::vector<i
         CK(hipMemcpyAsync(sl.ring, sn.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
         CK(hipMemcpyAsync(sl.ple, sn.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
         CK(hipMemcpyAsync(sl.pend, sn.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
+        raw_tail_copy(sl, N_QSA + int(mtp_), n, sn.raw_tail, false, hipMemcpyDeviceToDevice, rk.s);
     }
     for (auto &rkp : ranks_) CK(hipStreamSynchronize(rkp->s));
     SlotHost &sh = slots_[size_t(slot)];

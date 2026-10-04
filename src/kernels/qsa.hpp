@@ -12,16 +12,16 @@ namespace qw::gpu {
 
 // ---- prefill, one sequence
 // P fp16 [T][4224]. Writes q16 [T][6][256], gate fp16 [T][1536], iq16
-// [T][4][128] (normed, roped, fp16 for the score GEMM), K/V/raw_k caches.
+// [T][4][128] (normed, roped, fp16 for the score GEMM), K/V/raw_k caches (kv: VRAM and spilled parts).
 // rope3: optional per-token (t, h, w) rotary positions [T][3] (multimodal
 // RoPE); null: token positions.
 void qsa_prep_T(const uint16_t *P, const float *qn, const float *kn, const float *iqn, int64_t start, int T,
-                uint16_t *q16, uint16_t *gate, uint16_t *iq16, uint16_t *K, uint16_t *V, float *raw_k, hipStream_t s,
+                uint16_t *q16, uint16_t *gate, uint16_t *iq16, const KvSplit &kv, hipStream_t s,
                 const int32_t *rope3 = nullptr);
 // Compressed keys for every group completed inside the chunk (a group's key is
 // rotated by its first token's position; rope3 as in qsa_prep_T, for groups
 // starting inside the chunk).
-void qsa_compress_T(const float *raw_k, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
+void qsa_compress_T(const KvSplit &kv, const float *ikn, int64_t start, int T, uint16_t *ck, hipStream_t s,
                     const int32_t *rope3 = nullptr, int64_t rope_start = 0);
 // From per-head raw scores sc16 [Q][4][ldsc] (fp16, = iq_h . ck[c]) to
 // scores [Q][ldsc] = sum_h relu / sqrt(128); queries are positions q0..q0+Q-1.
@@ -30,7 +30,7 @@ void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float
 // radix-selected top-512 groups plus the tail. lists [Q][LIST_W], counts [Q].
 void qsa_select_T(const float *scores, int ldsc, int64_t q0, int Q, int32_t *lists, int32_t *counts, hipStream_t s);
 // Attention for Q queries (q16/gate rows), partial scratch [Q][33][6][258].
-void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const uint16_t *K, const uint16_t *V, const int32_t *lists,
+void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, const int32_t *lists,
                   const int32_t *counts, int Q, float *partial, uint16_t *out, hipStream_t s);
 
 // ---- batched decode rows (layer index qi into SlotPtrs)
@@ -43,5 +43,17 @@ void qsa_compress_B(const float *ikn, const SlotPtrs *tab, int qi, Rows rows, hi
 // scores [M][ld]; lists [M][LIST_W]; partial [M][33][6][258]; out fp16 [M][1536]
 void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const SlotPtrs *tab, int qi, Rows rows,
                   float *scores, int ld, int32_t *lists, int32_t *counts, float *partial, uint16_t *out, hipStream_t s);
+
+// Experiment (QW_SPILL_LOCALITY): for one-row steps of a spilled slot, how recently each spilled group the row selects
+// was selected before (by the slot's earlier positions), i.e. what a cache keeping the groups of the last K steps would
+// hit. last [slots][QSA_LAYERS_MAX][groups] (position that last selected a group, initialised very negative); stats
+// [QSA_LAYERS_MAX][LOC_STATS]: 0 groups selected, 1 of them spilled, 2.. spilled ones last selected within LOC_K[i] steps.
+// Rows of runs (2+ rows of a slot) count instead, at LOC_RUN: spilled groups summed over the rows, and the distinct ones
+// (run_mark: the first row's position that last marked a group).
+constexpr int LOC_NK = 6;
+constexpr int LOC_RUN = 2 + LOC_NK;
+constexpr int LOC_STATS = LOC_RUN + 2;
+void qsa_locality_B(const SlotPtrs *tab, int qi, Rows rows, const int32_t *lists, const int32_t *counts, int32_t *last,
+                    int32_t *run_mark, int groups, unsigned long long *stats, hipStream_t s);
 
 }  // namespace qw::gpu

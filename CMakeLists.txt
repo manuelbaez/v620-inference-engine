@@ -92,6 +92,7 @@ set(QW_HIP_SOURCES
 set(QW_HIP_HOST_SOURCES
   src/engine/device_mem.cpp
   src/engine/pinned_pool.cpp
+  src/engine/spill.cpp
   src/engine/moe_balance.cpp
   src/engine/weight_convert.cpp
   src/vision/vision_weights.cpp
@@ -129,12 +130,12 @@ qw_gpu_program(qw_vision_pos_eval tools/qw_vision_pos_eval.hip)
 qw_gpu_program(qw_calibrate tools/qw_calibrate.hip)
 set_target_properties(qw_gpu_cli PROPERTIES OUTPUT_NAME qw_gpu)
 
-foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_bench prefill_bench cold_prefill_bench comm_bench pin_bench decode_stall_bench)
+foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_bench prefill_bench cold_prefill_bench comm_bench pin_bench decode_stall_bench spill_bench spill_gather_bench slots_probe logits_dump spill_locality)
   qw_gpu_program(${b} bench/${b}.hip)
 endforeach()
 qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)
 
-foreach(t test_comm test_batch_decode test_batch_prefill test_sampling test_speculative test_host_tier test_snapshot_capture test_block_store test_disk_load test_disk_tier test_pinned_pool test_kv_replicas test_comm_variants test_prefill_pipeline test_vision_encoder test_moe test_gemv)
+foreach(t test_comm test_batch_decode test_batch_prefill test_sampling test_speculative test_host_tier test_snapshot_capture test_block_store test_disk_load test_disk_tier test_pinned_pool test_kv_replicas test_comm_variants test_prefill_pipeline test_vision_encoder test_moe test_gemv test_spill test_spill_coherence)
   qw_gpu_program(${t} tests/gpu/${t}.hip)
 endforeach()
 add_test(NAME comm COMMAND test_comm)

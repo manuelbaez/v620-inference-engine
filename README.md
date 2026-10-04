@@ -52,7 +52,9 @@ vLLM's `/tokenize` exactly on the test conversations (`server/tests/test_text.py
 Requests run concurrently with continuous batching, one per engine slot
 (default slots 262144, 65536, 32768, 32768 tokens; production 262144, 131072,
 65536, 32768 with 4096-token prefill chunks). Each slot keeps its
-conversation's state, and a new request goes to the slot holding the longest
+conversation's state (`--slots` are the tokens each slot keeps in VRAM; with `--kv-spill on` every slot holds up to
+`--slot-max-tokens`, default 524288, the part beyond its VRAM tokens in pinned host RAM that the GPUs read directly:
+docs/DESIGN.md "KV spill"; off by default), and a new request goes to the slot holding the longest
 prefix of its prompt; one that fits no free slot waits without holding up
 later ones that fit.
 
