@@ -1968,3 +1968,26 @@ pinned before the weights (the spill's 70.8 GB took 13.3 s just before it: the t
 `hipHostMallocNonCoherent` on the device's node against `Mapped | Portable | NumaUser` with a bind policy; to
 find out which matters), engine ready in 290.6 s (was ~150 s), the PLE table pinned in 9 s, host 69 GiB available
 (was 91-105), smoke test passed, no pin while serving so far. To watch: pins while serving (expected 0), TTFT outliers.
+
+**The trial's first hour (2026-10-04, 226 requests on the pre-pinned 32 GB cache against 166 before it).** Pins while
+serving 0 (148 in 518 s before, up to 13.5 s); turns with under 3k new tokens: TTFT p90 0.71 s (2.36), p99 1.46 s
+(8.0), 2 over 3 s (13); decode step median / p90 / max 25.7 / 31.7 / 39 ms (30.2 / 38.3 / 113). The 32 GB filled in
+18 minutes (prompts up to 180k tokens) and evicted to disk: 3 requests waited for disk loads, 10 s the longest (3.2 GB at
+322 MB/s). Budget raised to 48 GB the same evening (55.7 GB pinned in 70.8 s, engine ready in 252 s, 51 GiB available
+on the host). Pin time of the same pool varied 15.9-157.6 s between starts with the host's memory state.
+The shared-prefix wait released a request when fewer than `SHARE_MIN` shared tokens were left, before the snapshot at
+the shared part's end was stored: one request waited 1.7 s and restored nothing. Fixed (it waits until the other
+request is past all of it), deployed with the 48 GB. Slot choice: 60 of 158 prompts over 45k tokens ran in the 256k
+slot (9 of 125 before); the others belong to conversations that started small in another slot, three sessions alternating.
+
+**Snapshots are most of the cache (to measure: `QW_SNAP_KEEP_GAP`, off).** On disk on 2026-10-04: 261 snapshots of
+133 MB (34.7 GB) and 1,376 blocks in 43.9 GB. A snapshot is saved at every prompt's end, so a long agent session adds
+one per turn, and at every message boundary (1,024 tokens apart at least) and chunk end of a prefill; each lands on a
+partial leaf beside the path the conversation continues on. To continue, only the newest is needed; the older ones
+serve prompts that branch off earlier. `BlockStore::thin` keeps one per `QW_SNAP_KEEP_GAP` tokens of a conversation
+(on the saved path and among those leaves), the lowest leaf (the system prompt's end) and every snapshot a restore
+ended at; a branch then prefills at most that many tokens more. Not measured yet.
+
+**Slot move, idle guard (`QW_SLOT_MOVE_IDLE_S`, 300).** A slot is free between the turns of the conversation it
+holds, so with the move on, two long conversations would take the big slot from each other on every turn and restore
+their whole state each time. The move now only goes into a slot that is empty or unused for that long. Still off.

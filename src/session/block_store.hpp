@@ -78,7 +78,7 @@ public:
     void wait_reserve(double seconds);
 
     struct Stats {
-        uint64_t hits = 0, tokens_restored = 0, snapshots_saved = 0;
+        uint64_t hits = 0, tokens_restored = 0, snapshots_saved = 0, snapshots_thinned = 0;
         size_t ram_bytes = 0, disk_bytes = 0, blocks = 0, snapshots = 0;
         // the pinned pools, summed: arenas pinned and the time that took (background threads), and the saves and
         // loads that had to wait for an arena (callers' time)
@@ -101,8 +101,9 @@ private:
         bool has_snap = false, snap_logits = false, snap_disk = false;
         std::shared_ptr<Payload> snap;  // in RAM, with its logits
         std::vector<float> logits;
-        size_t disk_bytes = 0;
+        size_t disk_bytes = 0, snap_disk_bytes = 0;  // on disk: all of it, and the snapshot's part
         uint64_t used = 0;
+        uint32_t hits = 0;  // restores that ended at this snapshot (a branch point: never thinned)
         int64_t end() const { return start + int64_t(tokens.size()); }
     };
     static constexpr uint64_t ROOT = 0x9e3779b97f4a7c15ull;
@@ -120,6 +121,15 @@ private:
     bool ensure_kv(Node &nd, uint64_t k);
     bool ensure_snap(Node &nd, uint64_t k);
     void remove_subtree(uint64_t k);
+    void drop_snapshot(uint64_t k);  // a node keeps its block, loses its snapshot
+    // QW_SNAP_KEEP_GAP (tokens; 0: keep every snapshot): after a save, the older snapshots of the same conversation
+    // (on the saved path, and the leaves earlier saves of it left behind: every turn's end, every message boundary of
+    // a long prefill) are thinned to one per that many tokens. A conversation continues from its newest snapshot,
+    // which always stays; the older ones only serve a prompt that branches off earlier, which then prefills at most
+    // that many tokens more. Kept regardless: the lowest leaf (the end of the system prompt, where other
+    // conversations branch) and every snapshot a restore has ended at.
+    void thin(const std::vector<uint64_t> &path, const std::vector<int32_t> &tokens);
+    int64_t keep_gap_ = 0;
     void enforce_budgets();
     // A background load of on-disk entries (load()): the loader threads take
     // the pinned buffers themselves (pinning new arenas can take seconds) and

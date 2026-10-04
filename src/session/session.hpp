@@ -18,6 +18,7 @@
 // positions < n are untouched: rewinding a slot to m drops its snapshots past m.
 #pragma once
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -162,6 +163,7 @@ private:
         int64_t prompt_end = 0;  // generated tokens start here
         bool busy = false;
         uint64_t used = 0;
+        std::chrono::steady_clock::time_point last_use{};  // acquired or released last (slot moves wait for idle slots)
         std::vector<int32_t> stop;    // stop tokens of the current request
         std::vector<int32_t> drafts;  // MTP drafts following drafts_for
         int32_t drafts_for = -1;

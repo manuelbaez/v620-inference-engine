@@ -112,9 +112,17 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     static const int64_t move_slack = std::getenv("QW_SLOT_MOVE_SLACK") ? std::atoll(std::getenv("QW_SLOT_MOVE_SLACK")) : 4096;
     if (move_on && store_ && best >= 0 && best_reuse > 0 && e_.slot_vram_tokens(best) < soon) {
         int to = -1;
+        // only into a slot nobody used for a while (QW_SLOT_MOVE_IDLE_S, default 300): a slot is free between the
+        // turns of the conversation it holds, and two long conversations taking the big slot from each other on
+        // every turn would each pay a full restore every turn
+        static const double idle_s = std::getenv("QW_SLOT_MOVE_IDLE_S") ? std::atof(std::getenv("QW_SLOT_MOVE_IDLE_S")) : 300.0;
+        const auto now = std::chrono::steady_clock::now();
         for (int i = 0; i < num_slots(); ++i) {
             if (i == best || slots_[size_t(i)].busy || e_.slot_capacity(i) < need) continue;
             if (e_.slot_vram_tokens(i) <= e_.slot_vram_tokens(best)) continue;
+            if (!slots_[size_t(i)].hist.empty() &&
+                std::chrono::duration<double>(now - slots_[size_t(i)].last_use).count() < idle_s)
+                continue;
             if (to < 0 || vram_better(i, to)) to = i;
         }
         if (to >= 0) {
@@ -131,6 +139,7 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     if (best >= 0) {
         slots_[size_t(best)].busy = true;
         slots_[size_t(best)].used = ++clock_;
+        slots_[size_t(best)].last_use = std::chrono::steady_clock::now();
     }
     return best;
 }
@@ -146,6 +155,7 @@ void Session::save_to_store(int slot, int snap, const std::vector<int32_t> &toke
 void Session::release(int slot) {
     SlotInfo &si = slots_[size_t(slot)];
     si.busy = false;
+    si.last_use = std::chrono::steady_clock::now();
     si.stop.clear();
     si.drafts_for = -1;
     si.pending.clear();  // an unfinished prefill: the slot keeps what went in

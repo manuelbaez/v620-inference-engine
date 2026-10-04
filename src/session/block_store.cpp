@@ -44,6 +44,7 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     if (const char *t = std::getenv("QW_LOAD_THREADS")) load_threads_ = std::max(1, std::atoi(t));
     if (const char *t = std::getenv("QW_KV_PAIRS")) kv_pairs_ = std::atoi(t) != 0;
     if (const char *t = std::getenv("QW_KV_PAIR_CHECK")) pair_check_ = std::max(0, std::atoi(t));
+    if (const char *t = std::getenv("QW_SNAP_KEEP_GAP")) keep_gap_ = std::max<int64_t>(0, std::atoll(t));
     kv_copies_ = kv_pairs_ ? RANKS / cfg::KV_REPLICAS : RANKS;
     // QW_POOL_RESERVE_GB: pinned memory kept free for a burst of saves. The pools pin it a while after start and top it
     // up one arena at a time after a quiet period, never while a prefill is taking buffers: pinning holds the
@@ -135,6 +136,7 @@ void BlockStore::load_index() {
         nd.has_snap = nd.snap_disk = true;
         nd.snap_logits = m->logits;
         nd.disk_bytes += m->bytes;
+        nd.snap_disk_bytes = m->bytes;
         nd.used = std::max(nd.used, uint64_t(m->used));
         ++snaps_used;
     }
@@ -386,6 +388,7 @@ bool BlockStore::restore(const Hit &h, const std::vector<int32_t> &prompt, int s
                                     prompt.begin() + ptrdiff_t(h.n));
     e_.import_recurrent(slot, target.snap->p, h.n, tail);
     if (logits) *logits = target.logits;
+    ++target.hits;
     ++stats_.hits;
     stats_.tokens_restored += uint64_t(h.n);
     log("prefix cache: restored %lld tokens into slot %d (%lld imported) in %.3f s", (long long)h.n, slot,
@@ -469,10 +472,69 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
             const size_t b = disk_->write(m, target.logits, target.snap->p, Engine::recurrent_rank_bytes(), target.snap);
             target.snap_disk = true;
             target.disk_bytes += b;
+            target.snap_disk_bytes = b;
             disk_bytes_ += b;
         }
     }
+    if (keep_gap_ > 0) thin(path, tokens);
     enforce_budgets();
+}
+
+void BlockStore::drop_snapshot(uint64_t k) {
+    Node &nd = nodes_.at(k);
+    if (nd.snap) ram_bytes_ -= snap_bytes() + nd.logits.size() * 4;
+    nd.snap.reset();
+    nd.logits = {};
+    if (disk_ && nd.snap_disk) {
+        disk_->remove(k, true);
+        disk_bytes_ -= nd.snap_disk_bytes;
+        nd.disk_bytes -= nd.snap_disk_bytes;
+    }
+    nd.snap_disk_bytes = 0;
+    nd.has_snap = nd.snap_disk = nd.snap_logits = false;
+}
+
+void BlockStore::thin(const std::vector<uint64_t> &path, const std::vector<int32_t> &tokens) {
+    struct Cand {
+        int64_t pos;
+        uint64_t k;
+        bool leaf;
+        uint32_t hits;
+    };
+    std::vector<Cand> cands;
+    const int64_t n = int64_t(tokens.size());
+    uint64_t h = ROOT;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const uint64_t k = path[i];
+        // leaves earlier saves of this conversation left beside the path: a partial block whose tokens the path continues
+        for (uint64_t s : nodes_.at(h).children) {
+            if (s == k) continue;
+            const Node &sn = nodes_.at(s);
+            if (!sn.has_snap || !sn.children.empty() || sn.end() >= n) continue;
+            if (!std::equal(sn.tokens.begin(), sn.tokens.end(), tokens.begin() + ptrdiff_t(sn.start))) continue;
+            cands.push_back({sn.end(), s, true, sn.hits});
+        }
+        const Node &nd = nodes_.at(k);
+        if (i + 1 < path.size() && nd.has_snap) cands.push_back({nd.end(), k, false, nd.hits});
+        h = k;
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.pos < b.pos; });
+    bool first_leaf = true;
+    int64_t last = INT64_MIN / 2;
+    for (const Cand &c : cands) {
+        bool keep = c.hits > 0 || c.pos - last >= keep_gap_;
+        if (c.leaf && first_leaf) {
+            keep = true;
+            first_leaf = false;
+        }
+        if (keep) {
+            last = c.pos;
+            continue;
+        }
+        if (c.leaf) remove_subtree(c.k);
+        else drop_snapshot(c.k);
+        ++stats_.snapshots_thinned;
+    }
 }
 
 bool BlockStore::has_snapshot(const std::vector<int32_t> &tokens) const {
