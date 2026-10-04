@@ -192,6 +192,11 @@ public:
     // VRAM pool. KV is position-indexed and needs no copy: restoring a slot to
     // n tokens is valid while its positions < n were not overwritten since the
     // save (the caller enforces that).
+    // Makes slot dst hold exactly what slot src holds (its tokens' KV, compressed and raw indexer keys, recurrent
+    // state, MTP inputs), copied on the cards; positions either slot keeps in host memory (KV spill) go between VRAM
+    // and the pinned spill pool as each slot's VRAM part requires. src is unchanged. dst must have room for src's
+    // tokens. Waits for the copies.
+    void slot_copy(int dst, int src);
     void snapshot_save(int snap, int slot);
     void snapshot_restore(int snap, int slot, int64_t n, const std::vector<int32_t> &tail);
 

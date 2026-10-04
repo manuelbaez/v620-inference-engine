@@ -2025,3 +2025,15 @@ ready in 514 s (71 s and 252 s the start before): the pin time follows the host'
 48 GB cache, the shared-prefix wait and the slot choice by VRAM fit; the slot move stays off (it would also have to
 check that the conversation's blocks are in RAM: restoring one that was evicted to the HDDs took 10 s for 3.2 GB). That
 start: 55.7 GB pinned in 124.8 s, ready in 300 s, 55 GiB available on the host.
+
+**The slot move copies the slot (2026-10-04, `Engine::slot_copy`).** The move used to rebuild the conversation in the
+new slot from the block store: host RAM back to VRAM for data the cards already held, the tokens generated since the
+last stored snapshot prefilled again, and a disk read whenever the cache had dropped part of it from RAM (10 s for
+3.2 GB on the HDDs). `slot_copy(dst, src)` copies the slot on the cards instead: K and V (VRAM to VRAM below both
+slots' VRAM parts, between VRAM and the pinned spill pool where exactly one of them spills, host to host where both
+do), compressed keys, the raw keys' ring, recurrent state and MTP inputs; the session copies its own bookkeeping and
+the conversation continues in place. No dependence on the cache. `test_spill`: a slot copied spilled(4096) ->
+spilled(8192), resident -> spilled(8192) and spilled(8192) -> resident decodes bit-identically to its source (12
+steps each, verification runs with rollback, an appended prefill). Server test (as above, idle guard 20 s): 51,379
+tokens moved from the 44k slot to the 256k slot in 0.012 s (0.19 s through the store), everything cached afterwards.
+Still off (`QW_SLOT_MOVE=1`); the idle guard stays.

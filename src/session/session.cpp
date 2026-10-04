@@ -105,17 +105,16 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
         }
     }
     // A conversation about to run past its slot's VRAM part moves to a free slot that holds it in VRAM (or, when none
-    // does, to one with a larger VRAM part), when the block store can restore it there: the snapshot at the end of its
-    // last prompt is there, so the move costs importing those blocks and prefilling what came after (measured: 0.17 s
-    // of restore, once). Off by default (the conversation stays and spills, which costs 1-3% of decode);
-    // QW_SLOT_MOVE=1 turns it on. QW_SLOT_MOVE_SLACK: the tokens the move may have to prefill again (default 4096).
+    // does, to one with a larger VRAM part): Engine::slot_copy copies its state there on the cards (milliseconds; what
+    // already spilled comes from the pinned spill pool, never from the cache or the disk) and the conversation
+    // continues in place. Off by default (it then stays and spills, which costs 1-3% of decode); QW_SLOT_MOVE=1.
     static const bool move_on = std::getenv("QW_SLOT_MOVE") && std::atoi(std::getenv("QW_SLOT_MOVE")) != 0;
-    static const int64_t move_slack = std::getenv("QW_SLOT_MOVE_SLACK") ? std::atoll(std::getenv("QW_SLOT_MOVE_SLACK")) : 4096;
-    if (move_on && store_ && best >= 0 && best_reuse > 0 && e_.slot_vram_tokens(best) < soon) {
+    if (move_on && best >= 0 && best_reuse > 0 && best_reuse == slots_[size_t(best)].hist.size() &&
+        e_.slot_vram_tokens(best) < soon) {
         int to = -1;
         // only into a slot nobody used for a while (QW_SLOT_MOVE_IDLE_S, default 300): a slot is free between the
         // turns of the conversation it holds, and two long conversations taking the big slot from each other on
-        // every turn would each pay a full restore every turn
+        // every turn would each be copied every turn
         static const double idle_s = std::getenv("QW_SLOT_MOVE_IDLE_S") ? std::atof(std::getenv("QW_SLOT_MOVE_IDLE_S")) : 300.0;
         const auto now = std::chrono::steady_clock::now();
         for (int i = 0; i < num_slots(); ++i) {
@@ -127,14 +126,27 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
             if (to < 0 || vram_better(i, to)) to = i;
         }
         if (to >= 0) {
-            const BlockStore::Hit hit = store_->lookup(prompt, 0);
-            if (hit.n + move_slack >= int64_t(best_reuse)) {
-                log("slot move: a prompt of %zu tokens leaves slot %d (%lld tokens in VRAM, %zu reusable there) for slot %d "
-                    "(%lld in VRAM): %lld tokens come from the block store",
-                    prompt.size(), best, (long long)e_.slot_vram_tokens(best), best_reuse, to,
-                    (long long)e_.slot_vram_tokens(to), (long long)hit.n);
-                best = to;
-            }
+            const auto t0 = std::chrono::steady_clock::now();
+            e_.slot_copy(to, best);
+            const SlotInfo &from = slots_[size_t(best)];
+            SlotInfo &si = slots_[size_t(to)];
+            drop_snapshots_after(to, 0);  // the VRAM snapshots of what it held
+            si.hist = from.hist;
+            si.prompt_end = from.prompt_end;
+            si.logits = from.logits;
+            si.accept = from.accept;
+            si.plain_left = from.plain_left;
+            si.plain_len = from.plain_len;
+            si.mtp_lag = from.mtp_lag;
+            si.drafts_for = -1;
+            si.drafts.clear();
+            si.pending.clear();
+            si.pending_media.clear();
+            ++si.epoch;
+            log("slot move: %zu tokens copied from slot %d (%lld tokens in VRAM) to slot %d (%lld in VRAM) in %.3f s",
+                from.hist.size(), best, (long long)e_.slot_vram_tokens(best), to, (long long)e_.slot_vram_tokens(to),
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            best = to;
         }
     }
     if (best >= 0) {

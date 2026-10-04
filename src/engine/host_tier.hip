@@ -165,6 +165,74 @@ void Engine::import_recurrent(int slot, const RankBufs &src, int64_t n, const st
     sh.run_first = -1;
 }
 
+namespace {
+
+// Positions [0, n) of a per-position array of `row` bytes from one slot to another. Each slot keeps positions below
+// its vt in VRAM and the rest in mapped host memory (indexed from vt); the four combinations: VRAM to VRAM, the
+// source's host part into the destination's VRAM (or the other way round), host to host (a memcpy after the stream).
+void copy_slot_rows(const uint8_t *sdev, const uint8_t *shost, int64_t svt, uint8_t *ddev, uint8_t *dhost, int64_t dvt,
+                    int64_t n, size_t row, hipStream_t s) {
+    const int64_t a = std::min({svt, dvt, n}), b = std::min(std::max(svt, dvt), n);
+    if (a > 0) CK(hipMemcpyAsync(ddev, sdev, size_t(a) * row, hipMemcpyDeviceToDevice, s));
+    if (b > a) {
+        if (svt < dvt)  // the source spilled here, the destination holds it in VRAM
+            CK(hipMemcpyAsync(ddev + size_t(a) * row, shost + size_t(a - svt) * row, size_t(b - a) * row,
+                              hipMemcpyHostToDevice, s));
+        else
+            CK(hipMemcpyAsync(dhost + size_t(a - dvt) * row, sdev + size_t(a) * row, size_t(b - a) * row,
+                              hipMemcpyDeviceToHost, s));
+    }
+    if (n > b) {
+        CK(hipStreamSynchronize(s));
+        std::memcpy(dhost + size_t(b - dvt) * row, shost + size_t(b - svt) * row, size_t(n - b) * row);
+    }
+}
+
+}  // namespace
+
+void Engine::slot_copy(int dst, int src) {
+    QW_CHECK(dst >= 0 && dst < num_slots() && src >= 0 && src < num_slots() && dst != src, "slot_copy: bad slots");
+    const SlotHost &from = slots_[size_t(src)];
+    const int64_t n = from.len;
+    QW_CHECK(!from.reset && n <= slot_capacity(dst), "slot_copy: the source is empty or does not fit the destination");
+    spill_cache_bump(dst);  // its cached spilled rows are another conversation's
+    constexpr int64_t none = INT64_MAX / 2;
+    const auto u8 = [](auto *p) { return reinterpret_cast<uint8_t *>(p); };
+    for (auto &rkp : ranks_) {
+        Rank &rk = *rkp;
+        CK(hipSetDevice(rk.dev));
+        const Rank::Slot &a = rk.slots[size_t(src)];
+        Rank::Slot &b = rk.slots[size_t(dst)];
+        const int64_t avt = a.Kh.empty() ? none : a.vt, bvt = b.Kh.empty() ? none : b.vt;
+        const hipMemcpyKind d2d = hipMemcpyDeviceToDevice;
+        for (int i = 0; i < N_QSA + int(mtp_); ++i) {
+            const size_t qi = size_t(i);
+            copy_slot_rows(u8(a.K[qi]), a.Kh.empty() ? nullptr : u8(a.Kh[qi]), avt, u8(b.K[qi]),
+                           b.Kh.empty() ? nullptr : u8(b.Kh[qi]), bvt, n, HEAD_DIM * 2, rk.s);
+            copy_slot_rows(u8(a.V[qi]), a.Vh.empty() ? nullptr : u8(a.Vh[qi]), avt, u8(b.V[qi]),
+                           b.Vh.empty() ? nullptr : u8(b.Vh[qi]), bvt, n, HEAD_DIM * 2, rk.s);
+            // compressed keys of the complete groups; the raw keys' ring whole (the same row for a position in both)
+            if (n / IDX_RATIO)
+                CK(hipMemcpyAsync(b.ck[qi], a.ck[qi], size_t(n / IDX_RATIO) * IDX_DIM * 2, d2d, rk.s));
+            CK(hipMemcpyAsync(b.raw_k[qi], a.raw_k[qi], size_t(a.raw_ring) * IDX_DIM * 4, d2d, rk.s));
+        }
+        CK(hipMemcpyAsync(b.S, a.S, SLOT_S * 4, d2d, rk.s));
+        CK(hipMemcpyAsync(b.ring, a.ring, SLOT_RING * 4, d2d, rk.s));
+        CK(hipMemcpyAsync(b.ple, a.ple, SLOT_PLE * 4, d2d, rk.s));
+        CK(hipMemcpyAsync(b.pend, a.pend, XW * 4, d2d, rk.s));
+        if (mtp_) CK(hipMemcpyAsync(b.hist, a.hist, size_t(gpu::MTP_HIST) * XW * 4, d2d, rk.s));
+    }
+    host_copies_wait();
+    SlotHost &to = slots_[size_t(dst)];
+    to.len = n;
+    to.hist = from.hist;
+    to.reset = false;
+    to.pend_valid = from.pend_valid;
+    to.run_first = -1;
+    to.run_len = 0;
+    pen_[size_t(dst)] = PenState{};  // the penalties' token counts on the cards are rebuilt for it
+}
+
 std::array<unsigned long long, 2> Engine::spill_cache_stats() {
     std::array<unsigned long long, 2> v{};
     Rank &rk = *ranks_[0];

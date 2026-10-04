@@ -182,6 +182,54 @@ int main(int argc, char **argv) {
             const auto after = dump(3, r);
             check(after == from && bytes == from[0].size(), "import_kv across the boundary, read back: == source");
         }
+        // ---- 4. slot_copy: a slot copied into one with another VRAM part decodes exactly like its source
+        {
+            // slot 1 (spilled at 4096) into slot 3 (spilled at 8192): VRAM to VRAM, host to VRAM, host to host
+            e.slot_copy(3, 1);
+            check(e.slot_len(3) == e.slot_len(1), "slot_copy 1 -> 3: lengths");
+            int t = 1234;
+            bool eq = true;
+            for (int i = 0; i < 12 && eq; ++i) {
+                const auto &d = e.decode({{1, t}, {3, t}});
+                eq = same(d.data(), d.data() + cfg::VOCAB);
+                t = argmax(d.data());
+            }
+            check(eq, "slot_copy spilled(4096) -> spilled(8192): 12 decode steps identical");
+            for (int i = 0; i < 3 && eq; ++i) {  // runs of 4 with a rollback
+                std::vector<Engine::Row> rows;
+                for (int sl : {1, 3})
+                    for (int k = 0; k < 4; ++k) rows.push_back({sl, t + k});
+                const auto &d = e.decode(rows);
+                for (int r = 0; r < 4; ++r) eq = eq && same(d.data() + size_t(r) * cfg::VOCAB, d.data() + size_t(r + 4) * cfg::VOCAB);
+                t = argmax(d.data() + 3 * size_t(cfg::VOCAB));
+                e.accept(1, 2);
+                e.accept(3, 2);
+            }
+            check(eq, "... and verification runs with rollback identical");
+            // slot 0 (resident) into slot 2 (spilled at 8192): VRAM to VRAM, VRAM to host; and back into slot 0 from 3
+            e.slot_copy(2, 0);
+            eq = true;
+            for (int i = 0; i < 12 && eq; ++i) {
+                const auto &d = e.decode({{0, t}, {2, t}});
+                eq = same(d.data(), d.data() + cfg::VOCAB);
+                t = argmax(d.data());
+            }
+            check(eq, "slot_copy resident -> spilled(8192): 12 decode steps identical");
+            e.slot_copy(0, 3);  // spilled(8192) -> resident: host to VRAM for everything past 8192
+            eq = true;
+            for (int i = 0; i < 12 && eq; ++i) {
+                const auto &d = e.decode({{3, t}, {0, t}});
+                eq = same(d.data(), d.data() + cfg::VOCAB);
+                t = argmax(d.data());
+            }
+            check(eq, "slot_copy spilled(8192) -> resident: 12 decode steps identical");
+            // a prefill appended to both after the copy (the raw keys' ring and the recurrent state came along)
+            const auto more2 = text(700, 11);
+            e.prefill(3, more2);
+            const std::vector<float> l3 = e.logits();
+            e.prefill(0, more2);
+            check(l3 == e.logits(), "... and a prefill appended to both: identical logits");
+        }
         std::printf("%s\n", fails ? "FAILED" : "all spill checks passed");
         return fails ? 1 : 0;
     } catch (const std::exception &ex) {
