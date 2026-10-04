@@ -238,6 +238,7 @@ size_t slot_vram_bytes(const EngineOptions &opt, bool mtp) {
         total += (SLOT_S + SLOT_RING + SLOT_PLE + XW) * 4 + (mtp ? size_t(gpu::MTP_HIST) * XW * 4 : 0) +
                  size_t(2) * VOCAB_L * 4;
     }
+    if (const size_t e = spill_cache_entries(opt)) total += e * (2 * HEAD_DIM * 2 + 8) + size_t(SPILL_MISS_CAP) * 8;
     return total + spill_stage_tokens(opt) * 2 * HEAD_DIM * 2;  // the prefill staging of the spill (K, V)
 }
 
@@ -280,6 +281,19 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spi
         rk.loc_run = zeros<int32_t>(n);
         CK(hipMemset(rk.loc_run, 0xC0, n * 4));
         rk.loc_stats = zeros<unsigned long long>(size_t(gpu::QSA_LAYERS_MAX) * gpu::LOC_STATS);
+    }
+    if (const size_t e = spill_cache_entries(opt)) {
+        gpu::SpillCache &c = rk.cache;
+        c.entries = uint32_t(e);
+        c.tags = zeros<unsigned long long>(e);
+        c.K = zeros<uint16_t>(e * HEAD_DIM);
+        c.V = zeros<uint16_t>(e * HEAD_DIM);
+        rk.cache_epoch = upload(std::vector<uint32_t>(opt.slot_tokens.size(), 1u));
+        c.epoch = rk.cache_epoch;
+        c.miss_cap = SPILL_MISS_CAP;
+        c.miss = zeros<uint2>(SPILL_MISS_CAP);
+        c.miss_n = zeros<uint32_t>(1);
+        if (std::getenv("QW_SPILL_CACHE_STATS")) c.stats = zeros<unsigned long long>(2);
     }
     if (const size_t n = spill_stage_tokens(opt)) {
         rk.stage_tokens = n;

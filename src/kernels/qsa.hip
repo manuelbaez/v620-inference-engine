@@ -135,7 +135,7 @@ void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, 
 // ---- batched decode rows
 __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, const float *qn, const float *kn,
                                                          const float *iqn, const SlotPtrs *tab, int qi, Rows rows,
-                                                         __half *q16, float *gate, float *iq) {
+                                                         __half *q16, float *gate, float *iq, SpillCache c) {
     __shared__ float buf[HEAD_DIM], red[8];
     const int r = blockIdx.x, t = threadIdx.x;
     const SlotPtrs &sp = tab[rows.slot[r]];
@@ -152,6 +152,10 @@ __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, 
     }
     norm_shared(kp, kn, buf, HEAD_DIM, red);
     rope_shared(buf, pos);
+    if (c.tags && t == 0 && pos >= sp.vt) {  // this position's cached rows, if any, are stale from now on
+        const uint32_t e = cache_entry(rows.slot[r], qi, pos, c.entries);
+        if ((c.tags[e] & 0xffffffffull) == (cache_tag(0, rows.slot[r], qi, pos) & 0xffffffffull)) c.tags[e] = 0;
+    }
     kv_row(sp.K[qi], sp.Kh[qi], sp.vt, pos, HEAD_DIM)[t] = __half_as_ushort(__float2half(buf[t]));
     kv_row(sp.V[qi], sp.Vh[qi], sp.vt, pos, HEAD_DIM)[t] = __half_as_ushort(__float2half(vp[t]));
     __syncthreads();
@@ -165,9 +169,9 @@ __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, 
 }
 
 void qsa_prep_B(const float *proj, const float *qn, const float *kn, const float *iqn, const SlotPtrs *tab, int qi,
-                Rows rows, uint16_t *q16, float *gate, float *iq, hipStream_t s) {
+                Rows rows, uint16_t *q16, float *gate, float *iq, hipStream_t s, const SpillCache *cache) {
     qsa_prep_B_kernel<<<rows.M, 256, 0, s>>>(proj, qn, kn, iqn, tab, qi, rows, reinterpret_cast<__half *>(q16), gate,
-                                             iq);
+                                             iq, cache ? *cache : SpillCache{});
 }
 
 __global__ __launch_bounds__(128) void qsa_compress_B_kernel(const float *ikn, const SlotPtrs *tab, int qi, Rows rows) {
@@ -228,14 +232,44 @@ __global__ __launch_bounds__(1024) void qsa_select_B_kernel(const float *scores,
 
 __global__ __launch_bounds__(256) void qsa_attend_B_kernel(const uint4 *q16, const SlotPtrs *tab, int qi, Rows rows,
                                                            const int32_t *lists, const int32_t *counts,
-                                                           float *partial) {
+                                                           float *partial, SpillCache c) {
     const int r = blockIdx.y;
     QW_DCHECK(rows.slot[r] >= 0 && rows.slot[r] < 8 && counts[r] <= rows.pos[r] + 1);
     const SlotPtrs &sp = tab[rows.slot[r]];
     attend_body(q16 + size_t(r) * QSA_LOCAL_HEADS * (HEAD_DIM / 8), reinterpret_cast<const uint4 *>(sp.K[qi]),
                 reinterpret_cast<const uint4 *>(sp.V[qi]), reinterpret_cast<const uint4 *>(sp.Kh[qi]),
                 reinterpret_cast<const uint4 *>(sp.Vh[qi]), sp.vt, lists + size_t(r) * LIST_W, counts[r],
-                partial + size_t(r) * ATT_PART + size_t(blockIdx.x) * QSA_LOCAL_HEADS * ATT_REC);
+                partial + size_t(r) * ATT_PART + size_t(blockIdx.x) * QSA_LOCAL_HEADS * ATT_REC, c, rows.slot[r], qi);
+}
+
+// A warp per listed miss: claim the entry (skip it when another warp has it or it already holds the row), copy the
+// position's K and V rows from host memory, then publish the tag.
+__global__ __launch_bounds__(256) void spill_cache_fill_kernel(const SlotPtrs *tab, SpillCache c) {
+    constexpr int RW = HEAD_DIM / 8;
+    const uint32_t n = min(*c.miss_n, c.miss_cap);
+    const int lane = threadIdx.x % WAVE;
+    for (uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) / WAVE; i < n; i += gridDim.x * blockDim.x / WAVE) {
+        const uint2 m = c.miss[i];
+        const int pos = int(m.y & 0x1ffffffu), slot = int((m.y >> 25) & 7u), layer = int(m.y >> 28);
+        const unsigned long long want = cache_tag(c.epoch[slot], slot, layer, pos);
+        int claimed = 0;
+        if (lane == 0) {
+            const unsigned long long old = c.tags[m.x];
+            claimed = old != want && old != CACHE_LOCK && atomicCAS(c.tags + m.x, old, CACHE_LOCK) == old;
+        }
+        if (!__shfl(claimed, 0, WAVE)) continue;
+        const SlotPtrs &sp = tab[slot];
+        const size_t src = size_t(pos - sp.vt) * RW + size_t(lane), dst = size_t(m.x) * RW + size_t(lane);
+        reinterpret_cast<uint4 *>(c.K)[dst] = reinterpret_cast<const uint4 *>(sp.Kh[layer])[src];
+        reinterpret_cast<uint4 *>(c.V)[dst] = reinterpret_cast<const uint4 *>(sp.Vh[layer])[src];
+        __threadfence();
+        if (lane == 0) atomicExch(c.tags + m.x, want);
+    }
+}
+
+void spill_cache_fill(const SlotPtrs *tab, const SpillCache &cache, hipStream_t s) {
+    spill_cache_fill_kernel<<<256, 256, 0, s>>>(tab, cache);
+    (void)hipMemsetAsync(cache.miss_n, 0, 4, s);
 }
 
 __global__ __launch_bounds__(256) void qsa_combine_B_kernel(const float *partial, const float *gate, __half *out) {
@@ -246,11 +280,12 @@ __global__ __launch_bounds__(256) void qsa_combine_B_kernel(const float *partial
 
 void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const SlotPtrs *tab, int qi, Rows rows,
                   float *scores, int ld, int32_t *lists, int32_t *counts, float *partial, uint16_t *out,
-                  hipStream_t s) {
+                  hipStream_t s, const SpillCache *cache) {
     qsa_scores_B_kernel<<<dim3(SCORE_BLOCKS_B, rows.M), 256, 0, s>>>(iq, tab, qi, rows, scores, ld);
     qsa_select_B_kernel<<<rows.M, 1024, 0, s>>>(scores, ld, rows, lists, counts);
     qsa_attend_B_kernel<<<dim3(ATT_BLOCKS, rows.M), 256, 0, s>>>(reinterpret_cast<const uint4 *>(q16), tab, qi, rows,
-                                                                 lists, counts, partial);
+                                                                 lists, counts, partial,
+                                                                 cache ? *cache : SpillCache{});
     qsa_combine_B_kernel<<<dim3(rows.M, QSA_LOCAL_HEADS), HEAD_DIM, 0, s>>>(partial, gate,
                                                                             reinterpret_cast<__half *>(out));
 }

@@ -543,6 +543,7 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
                                           const std::function<void(int64_t)> &after_chunk,
                                           const std::vector<Capture> &captures,
                                           const std::vector<EmbedSpan> &embeds, const std::vector<int32_t> *rope3) {
+    if (slot >= 0 && slot < num_slots()) spill_cache_bump(slot);  // its spilled rows are about to change
     QW_CHECK(!tokens.empty(), "empty prefill");
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
     SlotHost &sh = slots_[size_t(slot)];
@@ -633,6 +634,8 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
 }
 
 const std::vector<std::vector<float>> &Engine::prefill_batch(const std::vector<Segment> &segs) {
+    for (const Segment &g : segs)
+        if (g.slot >= 0 && g.slot < num_slots()) spill_cache_bump(g.slot);
     QW_CHECK(!segs.empty() && int(segs.size()) <= MAX_SEGMENTS, "prefill_batch: 1.." + std::to_string(MAX_SEGMENTS) +
                                                                      " segments");
     int T = 0;

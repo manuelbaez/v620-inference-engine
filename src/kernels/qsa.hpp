@@ -36,13 +36,18 @@ void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, 
 // ---- batched decode rows (layer index qi into SlotPtrs)
 // proj f32 [M][4224]; writes q16 [M][1536], gate f32 [M][1536], iq f32 [M][512],
 // and the slot's K/V/raw_k at each row's position.
+// cache: non-null to clear the SpillCache entries of the spilled positions the rows rewrite.
 void qsa_prep_B(const float *proj, const float *qn, const float *kn, const float *iqn, const SlotPtrs *tab, int qi,
-                Rows rows, uint16_t *q16, float *gate, float *iq, hipStream_t s);
+                Rows rows, uint16_t *q16, float *gate, float *iq, hipStream_t s, const SpillCache *cache = nullptr);
 // Compressed key for rows that complete a group (after qsa_prep_B).
 void qsa_compress_B(const float *ikn, const SlotPtrs *tab, int qi, Rows rows, hipStream_t s);
 // scores [M][ld]; lists [M][LIST_W]; partial [M][33][6][258]; out fp16 [M][1536]
+// cache: non-null to read spilled rows through the SpillCache (and list the misses).
 void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const SlotPtrs *tab, int qi, Rows rows,
-                  float *scores, int ld, int32_t *lists, int32_t *counts, float *partial, uint16_t *out, hipStream_t s);
+                  float *scores, int ld, int32_t *lists, int32_t *counts, float *partial, uint16_t *out, hipStream_t s,
+                  const SpillCache *cache = nullptr);
+// End of a decode step: copies the rows the step's attention listed as misses into the SpillCache, and empties the list.
+void spill_cache_fill(const SlotPtrs *tab, const SpillCache &cache, hipStream_t s);
 
 // Experiment (QW_SPILL_LOCALITY): for one-row steps of a spilled slot, how recently each spilled group the row selects
 // was selected before (by the slot's earlier positions), i.e. what a cache keeping the groups of the last K steps would

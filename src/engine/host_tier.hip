@@ -92,6 +92,7 @@ void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
 }
 
 void Engine::import_kv(int slot, int64_t p0, int64_t n, const RankBufs &src) {
+    if (slot >= 0 && slot < num_slots()) spill_cache_bump(slot);
     QW_CHECK(slot >= 0 && slot < num_slots() && p0 % IDX_RATIO == 0 && n > 0 && p0 + n <= slot_capacity(slot),
              "import_kv: bad range");
     const KvLayout lay(n);
@@ -137,6 +138,7 @@ void Engine::export_recurrent(int snap, const RankBufs &dst) {
 }
 
 void Engine::import_recurrent(int slot, const RankBufs &src, int64_t n, const std::vector<int32_t> &tail) {
+    if (slot >= 0 && slot < num_slots()) spill_cache_bump(slot);
     QW_CHECK(slot >= 0 && slot < num_slots() && n > 0 && n <= slot_capacity(slot), "import_recurrent: bad slot");
     for (size_t r = 0; r < ranks_.size(); ++r) {
         Rank &rk = *ranks_[r];
@@ -161,6 +163,17 @@ void Engine::import_recurrent(int slot, const RankBufs &src, int64_t n, const st
     sh.reset = false;
     sh.pend_valid = mtp_;
     sh.run_first = -1;
+}
+
+std::array<unsigned long long, 2> Engine::spill_cache_stats() {
+    std::array<unsigned long long, 2> v{};
+    Rank &rk = *ranks_[0];
+    if (!rk.cache.stats) return v;
+    CK(hipSetDevice(rk.dev));
+    CK(hipStreamSynchronize(rk.s));
+    CK(hipMemcpy(v.data(), rk.cache.stats, 16, hipMemcpyDeviceToHost));
+    CK(hipMemset(rk.cache.stats, 0, 16));
+    return v;
 }
 
 std::vector<unsigned long long> Engine::spill_locality() {

@@ -68,12 +68,14 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
             opt_.slot_spill[i] = std::max(0, opt_.slot_max_tokens - opt_.slot_tokens[i]);
     }
     if (const char *st = std::getenv("QW_SPILL_STAGE")) opt_.spill_stage = std::atoi(st) != 0;
+    if (const char *cm = std::getenv("QW_SPILL_CACHE_MB")) opt_.spill_cache_mb = std::atoi(cm);
     bool any_spill = false;
     for (int c : opt_.slot_spill) {
         QW_CHECK(c >= 0 && c % 256 == 0, "slot spill must be a multiple of 256");
         any_spill |= c > 0;
     }
     slots_.resize(opt_.slot_tokens.size());
+    cache_epoch_.assign(opt_.slot_tokens.size(), 1u);
     pen_.resize(opt_.slot_tokens.size());
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
@@ -98,10 +100,10 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
             size_t free_b = 0, total_b = 0;
             if (!(std::getenv("QW_VRAM_CHECK") && std::atoi(std::getenv("QW_VRAM_CHECK")) == 0) &&
                 hipSetDevice(opt_.devices[0]) == hipSuccess && hipMemGetInfo(&free_b, &total_b) == hipSuccess) {
-                // measured at a 4096-token chunk: weights, vision tower, collectives and buffers take 19.4 GiB; the prefill
+                // measured at a 4096-token chunk: weights, vision tower, collectives and buffers take 19.7 GiB (recalibrated 2026-10-04); the prefill
                 // scoring buffers (two micro-batches) 6144 B per compressed-key group of the longest slot
                 const double gib = double(1ull << 30);
-                const double base = 19.43 + double(opt_.prefill_chunk - 4096) * 0.0003;
+                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003;
                 const double scoring = 6144.0 * double(max_slot_tokens() / IDX_RATIO) / gib;
                 const double est = double(total_b) / gib - base - double(slot_vram_bytes(opt_, mtp_)) / gib - scoring;
                 const double need = opt_.warmup ? 1.6 : 0.6;  // warmup (graphs, rocBLAS kernels) takes ~1.1 GiB; keep 0.5 free
@@ -369,8 +371,19 @@ std::string Engine::failure() const {
     return {};
 }
 
+void Engine::spill_cache_bump(int slot) {
+    if (opt_.slot_spill[size_t(slot)] == 0 || ranks_.empty() || !ranks_[0]->cache.tags) return;
+    ++cache_epoch_[size_t(slot)];
+    for (auto &rkp : ranks_) {
+        CK(hipSetDevice(rkp->dev));
+        CK(hipMemcpyAsync(rkp->cache_epoch, cache_epoch_.data(), cache_epoch_.size() * 4, hipMemcpyHostToDevice,
+                          rkp->s));
+    }
+}
+
 void Engine::slot_reset(int slot) {
     QW_CHECK(slot >= 0 && slot < num_slots(), "bad slot");
+    spill_cache_bump(slot);
     SlotHost &sh = slots_[size_t(slot)];
     sh.len = 0;
     sh.hist.clear();

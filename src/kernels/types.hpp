@@ -45,6 +45,30 @@ struct KvSplit {
     int32_t vt, raw_ring;
 };
 
+// Decode-time VRAM cache of spilled K/V rows (EngineOptions::spill_cache_mb): one direct-mapped table shared by every
+// slot and QSA layer, an entry per position (its K and V rows) tagged (slot epoch, slot, layer, position). Attention
+// reads a spilled row there when the tag matches, else from host memory, and lists the miss; one kernel at the end of
+// the step copies the listed rows in, so the table is read-only while attention runs. A slot's epoch moves when its
+// spilled rows change other than through decode (prefill, an import, a reset); decode clears an entry it rewrites.
+struct SpillCache {
+    unsigned long long *tags = nullptr;   // [entries]; 0: empty (epochs start at 1)
+    uint16_t *K = nullptr, *V = nullptr;  // [entries][HEAD_DIM]
+    uint32_t entries = 0;
+    const uint32_t *epoch = nullptr;  // [slots]
+    uint2 *miss = nullptr;            // [miss_cap]: (entry, position | slot << 25 | layer << 28)
+    uint32_t *miss_n = nullptr;
+    uint32_t miss_cap = 0;
+    unsigned long long *stats = nullptr;  // [2] hits, misses (QW_SPILL_CACHE_STATS), or null
+};
+constexpr unsigned long long CACHE_LOCK = ~0ull;
+__host__ __device__ inline unsigned long long cache_tag(uint32_t epoch, int slot, int layer, int64_t pos) {
+    return (static_cast<unsigned long long>(epoch) << 32) | (static_cast<unsigned long long>(slot) << 29) |
+           (static_cast<unsigned long long>(layer) << 25) | static_cast<unsigned long long>(pos);
+}
+__host__ __device__ inline uint32_t cache_entry(int slot, int layer, int64_t pos, uint32_t entries) {
+    return (static_cast<uint32_t>(pos) + static_cast<uint32_t>(slot * 16 + layer) * 2654435761u) % entries;
+}
+
 struct SlotPtrs {
     uint16_t *K[QSA_LAYERS_MAX], *V[QSA_LAYERS_MAX], *ck[QSA_LAYERS_MAX];
     float *raw_k[QSA_LAYERS_MAX];  // rings of raw_ring rows

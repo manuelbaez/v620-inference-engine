@@ -46,6 +46,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
     auto reduce_scatter = [&](const float *src, float *dst) { comm_->reduce_scatter(r, src, dst, SH, ++k, s, M); };
     auto allgather = [&](const void *src, void *dst, size_t bytes) { comm_->allgather(r, src, dst, bytes, ++k, s, M); };
     const gpu::Rows rows{b.row_slot, b.row_pos, b.row_first, M};
+    const gpu::SpillCache *cache = rk.cache.tags ? &rk.cache : nullptr;
     static const int moe_pair_max = std::getenv("QW_MOE_PAIR_MAX") ? std::atoi(std::getenv("QW_MOE_PAIR_MAX")) : 16;
 
     auto mix = [&](const HcW &w, const float *pend, const float *pend_inj, float *inj_out) {
@@ -74,10 +75,10 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         mix(w.attn_hc, pend, b.inj_mlp, b.inj_attn);
         if (qsa) {
             gemv(w.qsa_proj, w.qsa_proj8, QSA_PROJ_L, H, b.bin, b.proj);
-            gpu::qsa_prep_B(b.proj, w.qn, w.kn, w.iqn, rk.dtab, idx, rows, b.q16, b.gate, b.iq, s);
+            gpu::qsa_prep_B(b.proj, w.qn, w.kn, w.iqn, rk.dtab, idx, rows, b.q16, b.gate, b.iq, s, cache);
             gpu::qsa_compress_B(w.ikn, rk.dtab, idx, rows, s);
             gpu::qsa_attend_B(b.q16, b.gate, b.iq, rk.dtab, idx, rows, b.scores, b.score_ld, b.lists, b.counts,
-                              b.att_partial, b.act16, s);
+                              b.att_partial, b.act16, s, cache);
             if (rk.loc_stats && kind != 2)
                 gpu::qsa_locality_B(rk.dtab, idx, rows, b.lists, b.counts, rk.loc_last, rk.loc_run, rk.loc_groups,
                                     rk.loc_stats, s);
@@ -131,6 +132,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         mix(rk.mtp_final, pend, b.inj_mlp, nullptr);
         gemv(rk.lm_head, rk.lm_head8, VOCAB_L, H, b.bin, b.logits);
         gpu::row_argmax(b.logits, VOCAB_L, M, b.amax, s);
+        if (cache) gpu::spill_cache_fill(rk.dtab, *cache, s);
         return k;
     }
 
@@ -156,6 +158,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
     }
     gemv(rk.lm_head, rk.lm_head8, VOCAB_L, H, b.bin, b.logits);
     gpu::row_lse(b.logits, VOCAB_L, M, b.lse, s);
+    if (cache) gpu::spill_cache_fill(rk.dtab, *cache, s);
     return k;
 }
 

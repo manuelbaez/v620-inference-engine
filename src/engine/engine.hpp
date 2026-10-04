@@ -32,6 +32,7 @@ struct Rank;  // per-GPU state (rank.hpp)
 class SpillPool;  // KV beyond a slot's VRAM tokens (spill.hpp)
 
 #define QW_HAVE_SPILL 1  // EngineOptions::slot_spill exists (benchmarks that also build on older trees test for it)
+#define QW_HAVE_SPILL_CACHE 1  // Engine::spill_cache_stats exists
 
 struct EngineOptions {
     std::string model_dir = "/mnt/llms/qwen3.8-flash-next-awq";
@@ -51,6 +52,9 @@ struct EngineOptions {
     // the layers before it run, and the chunk's new rows go back to host memory after. QW_SPILL_STAGE=0: off (the
     // attention reads host memory directly, 2.2-2.6x slower prefill there).
     bool spill_stage = true;
+    // Decode-time VRAM cache of spilled K/V rows, shared by all slots (kernels/types.hpp SpillCache): MB per card, 0 off
+    // (QW_SPILL_CACHE_MB). Allocated only when some slot spills.
+    int spill_cache_mb = 256;
     int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion
@@ -211,6 +215,9 @@ public:
     void host_copies_wait();
     // QW_SPILL_LOCALITY experiment: the counters per QSA layer ([QSA_LAYERS_MAX][gpu::LOC_STATS]), then zeroed.
     std::vector<unsigned long long> spill_locality();
+    // QW_SPILL_CACHE_STATS: spilled rows decode found in the spill cache, and the ones it read from host memory, since
+    // the last call (rank 0).
+    std::array<unsigned long long, 2> spill_cache_stats();
     int rank_device(int r) const;  // HIP device of rank r (the order of RankBufs)
     // Identifies the state layout (shapes, ring sizes, MTP layer): a saved
     // state is only loadable by an engine with the same id.
@@ -307,6 +314,9 @@ private:
     uint16_t *embed_ = nullptr;
     std::unique_ptr<PleTable> ple_;
     std::unique_ptr<SpillPool> spill_;
+    std::vector<uint32_t> cache_epoch_;  // per slot, mirrored on every rank (SpillCache::epoch)
+    // A slot's spilled rows are about to change other than through decode: its cached rows become stale.
+    void spill_cache_bump(int slot);
     NgramHasher hasher_;
     std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch
     std::vector<std::unique_ptr<Rank>> ranks_;

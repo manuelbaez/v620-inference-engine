@@ -178,8 +178,11 @@ __device__ __forceinline__ T *raw_row(T *ring, int32_t rows, int64_t pos) {
 
 // Block b (256 threads) covers list entries [64b, 64b+64); writes one
 // partial record (m, l, acc[256]) per head. K and V rows below vt are read from K / V, the others from Kh / Vh.
+// With a SpillCache (c.tags non-null), spilled rows are read from it when cached, else from the host part and listed for
+// the step's fill (slot and layer identify the rows' tags).
 __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *V, const uint4 *Kh, const uint4 *Vh,
-                                   int32_t vt, const int32_t *list, int n, float *partial) {
+                                   int32_t vt, const int32_t *list, int n, float *partial,
+                                   const SpillCache &c = SpillCache{}, int slot = 0, int layer = 0) {
     QW_DCHECK(n >= 0 && n <= LIST_W);
     constexpr int NH = QSA_LOCAL_HEADS;
     __shared__ float sh[8][NH][ATT_REC];
@@ -202,11 +205,26 @@ __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *
         for (int i = 0; i < 8; ++i) acc[h][i] = 0.f;
     }
     const int base = blockIdx.x * ATT_CHUNK;
+    const uint32_t epoch = c.tags && Kh ? c.epoch[slot] : 0;
     for (int i = base + w; i < min(n, base + ATT_CHUNK); i += 8) {
         const int tok = list[i];
         QW_DCHECK(tok >= 0 && tok < (1 << 20));
-        uint4 kv = kv_row(K, Kh, vt, tok, HEAD_DIM / 8)[lane];
-        uint4 vv = kv_row(V, Vh, vt, tok, HEAD_DIM / 8)[lane];
+        const uint4 *kp = kv_row(K, Kh, vt, tok, HEAD_DIM / 8), *vp = kv_row(V, Vh, vt, tok, HEAD_DIM / 8);
+        if (tok >= vt && epoch) {
+            const uint32_t e = cache_entry(slot, layer, tok, c.entries);
+            if (c.tags[e] == cache_tag(epoch, slot, layer, tok)) {
+                kp = reinterpret_cast<const uint4 *>(c.K) + size_t(e) * (HEAD_DIM / 8);
+                vp = reinterpret_cast<const uint4 *>(c.V) + size_t(e) * (HEAD_DIM / 8);
+                if (c.stats && lane == 0) atomicAdd(c.stats, 1ull);
+            } else if (lane == 0) {
+                const uint32_t i = atomicAdd(c.miss_n, 1u);
+                if (i < c.miss_cap)
+                    c.miss[i] = make_uint2(e, uint32_t(tok) | (uint32_t(slot) << 25) | (uint32_t(layer) << 28));
+                if (c.stats) atomicAdd(c.stats + 1, 1ull);
+            }
+        }
+        uint4 kv = kp[lane];
+        uint4 vv = vp[lane];
         const __half *kh = reinterpret_cast<const __half *>(&kv);
         const __half *vh = reinterpret_cast<const __half *>(&vv);
         float kf[8], vf[8];

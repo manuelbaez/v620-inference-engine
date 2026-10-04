@@ -49,6 +49,7 @@ void Engine::snapshot_save(int snap, int slot) {
 
 void Engine::snapshot_restore(int snap, int slot, int64_t n, const std::vector<int32_t> &tail) {
     QW_CHECK(snap >= 0 && snap < SNAPSHOTS, "bad snapshot index");
+    spill_cache_bump(slot);
     for (auto &rkp : ranks_) {
         Rank &rk = *rkp;
         CK(hipSetDevice(rk.dev));

@@ -203,6 +203,9 @@ struct Rank {
     } bt;
     // QW_SPILL_LOCALITY experiment (rank 0 only): last selecting position per slot, layer and spilled group; counters
     int32_t *loc_last = nullptr, *loc_run = nullptr;
+    // decode-time cache of spilled rows (EngineOptions::spill_cache_mb; tags null: off) and its per-slot epochs
+    gpu::SpillCache cache{};
+    uint32_t *cache_epoch = nullptr;
     unsigned long long *loc_stats = nullptr;
     int loc_groups = 0;
     // captured graphs per row count: [kind][M], kind 0 decode, 1 decode + GDN state save, 2 MTP
@@ -223,6 +226,13 @@ constexpr size_t RAW_TAIL_FLOATS = size_t(gpu::QSA_LAYERS_MAX) * gpu::RAW_TAIL *
 void raw_tail_copy(const Rank::Slot &sl, int layers, int64_t n, float *tail, bool to_tail, hipMemcpyKind kind,
                    hipStream_t s);
 // Positions the prefill staging buffer of the spill holds: the largest slot's spill (0: no spill or staging off).
+inline size_t spill_cache_entries(const EngineOptions &opt) {  // 0: no cache
+    bool any = false;
+    for (int s : opt.slot_spill) any |= s > 0;
+    if (!any || opt.spill_cache_mb <= 0) return 0;
+    return (size_t(opt.spill_cache_mb) << 20) / (2 * HEAD_DIM * 2 + 8);
+}
+constexpr uint32_t SPILL_MISS_CAP = uint32_t(gpu::MAX_ROWS) * gpu::LIST_W * gpu::QSA_LAYERS_MAX;
 inline size_t spill_stage_tokens(const EngineOptions &opt) {
     if (!opt.spill_stage) return 0;
     int m = 0;

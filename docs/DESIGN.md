@@ -1827,4 +1827,34 @@ spilled rows in VRAM would serve ~3/4 of the reads at ~50 MB per spilled slot, a
 within a run; to pay, it has to live inside the attention kernel (a tag check per row, fill on miss), not in extra
 kernels.
 
-**Not done.** That cache; one host copy shared with the block store.
+**Decode cache of spilled rows (2026-10-04, `EngineOptions::spill_cache_mb`, default 256 MB per card; `QW_SPILL_CACHE_MB`,
+0 off).** One direct-mapped table per card shared by every slot and QSA layer: an entry holds one position's K and V
+rows (1 KiB + an 8-byte tag: slot epoch, slot, layer, position). The attention kernel checks the tag of each spilled row
+it reads: a hit reads VRAM (and so the Infinity Cache), a miss reads host memory as before and is listed. One kernel at
+the end of the step (every decode, verification and MTP graph) copies the listed rows in, claiming an entry with a
+compare-and-swap so concurrent misses for one entry do not mix rows; the table is never written while attention reads
+it. `qsa_prep_B` clears the entry of a spilled position it rewrites (a verification row after a rollback), and a slot's
+epoch moves on prefill, `import_kv`, `import_recurrent`, `snapshot_restore` and `slot_reset`, which drops all its rows.
+Bit-identical (`bench/logits_dump` against the original build; `test_spill`, including the batched hash).
+
+Measured with real text (`spill_bench --tokens-file`, the prompt and the decoded tokens from this repository's docs and
+sources; B = 32k in VRAM; ms per step):
+
+| context | 1 row: A / B no cache / B cache | hits | 4-row runs: A / B no cache / B cache | hits |
+|---|---|---|---|---|
+| 65k | 17.32 / 18.55 / **17.52** | 87.5% | 24.52 / 29.93 / **25.00** | 89.7% |
+| 131k | 17.83 / 19.69 / **18.45** | 79.1% | 25.20 / 32.42 / **26.26** | 86.0% |
+| 200k | 18.61 / 20.34 / **18.91** | 86.8% | 26.21 / 33.44 / **26.72** | 91.5% |
+
+The cost of a spilled row drops 70-84% for one-row steps and 85-93% for verification runs (a run's rows hit what earlier
+steps filled; within a step the table does not change). Resident slot A is the same
+with and without the cache (the fill kernel exits at once). With real text the uncached cost is higher than with the
+random-token prompts above (+1.2-1.9 ms per row against +0.5-1.0). The 6-slot plan with the cache: 1 x 256k + 5 x 44k
+in VRAM (1.81 GiB free after the load, 0.71 after warmup); 5 x 48k is refused (1.56 GiB after the load, 1.6 needed).
+
+Cache size (4-row runs, real text, one spilled slot decoding; B's cost over A at 131k / 200k): no cache +7.2 / +7.2 ms;
+64 MB 72-76% hits, +1.9 / +1.5 ms; 128 MB 85%, +0.7 / +0.8; 256 MB 86-92%, +1.1 / +0.5; 512 MB 94%, +0.3 / +0.2. Most of
+it comes by 128 MB; the pool is shared, so several spilled slots decoding at once divide it, which is why the default
+is 256 MB (VRAM for ~19k resident tokens across the slots).
+
+**Not done.** One host copy shared with the block store; the staging buffer (idle during decode) as cache space.
