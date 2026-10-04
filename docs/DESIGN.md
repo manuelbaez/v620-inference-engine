@@ -2020,3 +2020,8 @@ on, both took the 256k slot from each other every turn, each restoring from the 
 256k slot again (the slot choice by VRAM fit, not the move; restore 0.18 s) and Y continued in its old slot from the
 store (restore 0.24 s): one restore each, then stable. Production's restart after these tests: 55.7 GB pinned in 316 s,
 ready in 514 s (71 s and 252 s the start before): the pin time follows the host's memory state.
+
+**Production since 2026-10-04 21:08 UTC (image `qw-engine:181aa20`):** `QW_SNAP_KEEP_GAP=8192` next to the pre-pinned
+48 GB cache, the shared-prefix wait and the slot choice by VRAM fit; the slot move stays off (it would also have to
+check that the conversation's blocks are in RAM: restoring one that was evicted to the HDDs took 10 s for 3.2 GB). That
+start: 55.7 GB pinned in 124.8 s, ready in 300 s, 55 GiB available on the host.
