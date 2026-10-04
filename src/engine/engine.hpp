@@ -30,6 +30,7 @@ namespace qw {
 
 struct Rank;  // per-GPU state (rank.hpp)
 class SpillPool;  // KV beyond a slot's VRAM tokens (spill.hpp)
+class ArenaBank;  // pinned arenas for the prefix cache's pools (pinned_pool.hpp)
 
 #define QW_HAVE_SPILL 1  // EngineOptions::slot_spill exists (benchmarks that also build on older trees test for it)
 #define QW_HAVE_SPILL_CACHE 1  // Engine::spill_cache_stats exists
@@ -219,6 +220,10 @@ public:
     void host_copies_wait();
     // QW_SPILL_LOCALITY experiment: the counters per QSA layer ([QSA_LAYERS_MAX][gpu::LOC_STATS]), then zeroed.
     std::vector<unsigned long long> spill_locality();
+    // QW_POOL_PREPIN=1: the prefix cache's RAM budget (QW_HOST_CACHE_GB), pinned when the engine starts, before the
+    // weights and the PLE table fill the host's memory (pinned after them it took 335-570 s for 64 GB; the KV spill,
+    // pinned first, takes 10-60 s for 71 GB). Null without it; the block store's pools draw their arenas from it.
+    ArenaBank *cache_bank() const { return cache_bank_.get(); }
     // QW_SPILL_CACHE_STATS: spilled rows decode found in the spill cache, and the ones it read from host memory, since
     // the last call (rank 0).
     std::array<unsigned long long, 2> spill_cache_stats();
@@ -318,6 +323,7 @@ private:
     uint16_t *embed_ = nullptr;
     std::unique_ptr<PleTable> ple_;
     std::unique_ptr<SpillPool> spill_;
+    std::unique_ptr<ArenaBank> cache_bank_;
     std::vector<uint32_t> cache_epoch_;  // per slot, mirrored on every rank (SpillCache::epoch)
     // A slot's spilled rows are about to change other than through decode: its cached rows become stale.
     void spill_cache_bump(int slot);

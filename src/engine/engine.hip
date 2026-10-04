@@ -16,6 +16,7 @@
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
+#include "engine/pinned_pool.hpp"
 #include "engine/rank.hpp"
 #include "engine/spill.hpp"
 #include "vision/vision_weights.hpp"
@@ -163,6 +164,20 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         }
     }
     if (any_spill) spill_ = std::make_unique<SpillPool>(opt_.slot_spill, N_QSA + int(mtp_), opt_.devices);
+    if (const char *pp = std::getenv("QW_POOL_PREPIN"); pp && std::atoi(pp) != 0) {
+        const char *gb = std::getenv("QW_HOST_CACHE_GB");
+        const double budget = (gb ? std::atof(gb) : 128.0) * 1e9;
+        if (budget > 0) {
+            // an arena fits either pool of the block store: 48 blocks of 256 tokens, or 8 snapshots (the larger)
+            const size_t arena = (std::max(kv_rank_bytes(256) * 48, recurrent_rank_bytes() * 8) + 4095) / 4096 * 4096;
+            // an arena holds units of one kind at a time, so part of the budget sits in half-empty arenas: 12% more
+            const size_t count = size_t(budget * 1.12 / double(arena)) + 2 * RANKS;
+            cache_bank_ = std::make_unique<ArenaBank>(arena, count, std::vector<int>(opt_.devices.begin(), opt_.devices.end()),
+                                                      PoolOptions::from_env());
+            log("prefix cache: %.1f GB pinned at start for its pools (%zu arenas of %.0f MB) in %.1f s",
+                double(arena * count) / 1e9, count, double(arena) / 1e6, cache_bank_->pin_s);
+        }
+    }
     // The ranks load in parallel, each on its own thread with its own pool
     // (the checkpoint is a read-only mapping; everything else is per rank):
     // reading, converting and uploading one rank's shard overlaps the others'.
