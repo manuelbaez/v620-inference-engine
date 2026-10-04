@@ -23,6 +23,7 @@ Session::Session(Engine &e)
         store_->wait_reserve(30);  // the first request after a start (llama-swap sends it the moment /health is up)
     }
     if (const char *g = std::getenv("QW_SNAP_MIN_GAP")) min_gap_ = std::max<int64_t>(1, std::atoll(g));
+    if (const char *g = std::getenv("QW_SNAP_SYSTEM_MIN")) sys_min_ = std::max<int64_t>(1, std::atoll(g));
     if (const char *a = std::getenv("QW_RESERVE_AHEAD")) reserve_ahead_ = std::max(0, std::atoi(a));
     const char *vgb = std::getenv("QW_VISION_CACHE_GB");
     vision_budget_ = size_t((vgb ? std::atof(vgb) : 2.0) * 1e9);
@@ -144,11 +145,19 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     return best;
 }
 
-void Session::save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits) {
+int64_t Session::system_end(const std::vector<int32_t> &prompt) const {
+    if (boundary_ < 0) return -1;
+    for (size_t p = 1; p < prompt.size(); ++p)
+        if (prompt[p] == boundary_) return int64_t(p);
+    return -1;
+}
+
+void Session::save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits,
+                            bool anchor) {
     Timing &t = slots_[size_t(slot)].timing;
     Stopwatch save_time(&t.save_s);
     const double waited = PinnedPool::thread_wait_s();
-    store_->save(slot, snap, tokens, logits);
+    store_->save(slot, snap, tokens, logits, anchor);
     t.pin_wait_s += PinnedPool::thread_wait_s() - waited;
 }
 

@@ -397,7 +397,8 @@ bool BlockStore::restore(const Hit &h, const std::vector<int32_t> &prompt, int s
     return true;
 }
 
-void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits) {
+void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits,
+                      bool anchor) {
     static const bool trace = std::getenv("QW_TRACE") != nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     const int64_t n = int64_t(tokens.size());
@@ -428,6 +429,7 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
         pos += int64_t(len);
     }
     Node &target = nodes_.at(h);
+    target.anchor = target.anchor || anchor;
     const bool new_snap = !target.has_snap;
     if (new_snap) {
         target.snap = alloc(true);
@@ -500,6 +502,7 @@ void BlockStore::thin(const std::vector<uint64_t> &path, const std::vector<int32
         uint64_t k;
         bool leaf;
         uint32_t hits;
+        bool anchor;
     };
     std::vector<Cand> cands;
     const int64_t n = int64_t(tokens.size());
@@ -512,17 +515,17 @@ void BlockStore::thin(const std::vector<uint64_t> &path, const std::vector<int32
             const Node &sn = nodes_.at(s);
             if (!sn.has_snap || !sn.children.empty() || sn.end() >= n) continue;
             if (!std::equal(sn.tokens.begin(), sn.tokens.end(), tokens.begin() + ptrdiff_t(sn.start))) continue;
-            cands.push_back({sn.end(), s, true, sn.hits});
+            cands.push_back({sn.end(), s, true, sn.hits, sn.anchor});
         }
         const Node &nd = nodes_.at(k);
-        if (i + 1 < path.size() && nd.has_snap) cands.push_back({nd.end(), k, false, nd.hits});
+        if (i + 1 < path.size() && nd.has_snap) cands.push_back({nd.end(), k, false, nd.hits, nd.anchor});
         h = k;
     }
     std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) { return a.pos < b.pos; });
     bool first_leaf = true;
     int64_t last = INT64_MIN / 2;
     for (const Cand &c : cands) {
-        bool keep = c.hits > 0 || c.pos - last >= keep_gap_;
+        bool keep = c.anchor || c.hits > 0 || c.pos - last >= keep_gap_;
         if (c.leaf && first_leaf) {
             keep = true;
             first_leaf = false;

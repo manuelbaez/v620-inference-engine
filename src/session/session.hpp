@@ -190,7 +190,13 @@ private:
     // Returns the VRAM snapshot index; logits: after the slot's last token (default: the engine's)
     int save_snapshot(int slot, const std::vector<float> *logits = nullptr);
     // store_->save, timed into the slot's Timing
-    void save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits);
+    void save_to_store(int slot, int snap, const std::vector<int32_t> &tokens, const std::vector<float> *logits,
+                       bool anchor = false);
+    // Where a prompt's first message ends (the next message's start token): the end of the system prompt, which
+    // every conversation with that system prompt shares. Always snapshotted when it holds sys_min_ tokens or more
+    // (QW_SNAP_SYSTEM_MIN, default 256; the other boundaries need min_gap_), and kept by the cache's thinning. -1: none.
+    int64_t system_end(const std::vector<int32_t> &prompt) const;
+    int64_t sys_min_ = 256;
     void set_prompt_logits(int slot, const std::vector<float> &l);  // the prompt's logits come from a cache
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);
     // vision (vision_cache.cpp): the prompt with its media tokens as content-derived ids, and the

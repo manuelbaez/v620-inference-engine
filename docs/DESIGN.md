@@ -1991,3 +1991,32 @@ ended at; a branch then prefills at most that many tokens more. Not measured yet
 **Slot move, idle guard (`QW_SLOT_MOVE_IDLE_S`, 300).** A slot is free between the turns of the conversation it
 holds, so with the move on, two long conversations would take the big slot from each other on every turn and restore
 their whole state each time. The move now only goes into a slot that is empty or unused for that long. Still off.
+
+**Snapshot thinning measured (2026-10-04, server test: a 3,098-token system prompt, a conversation of 15 turns to
+67.5k tokens, then branches; `QW_SNAP_KEEP_GAP` 0 against 8192).** The session now marks the snapshot at the end of a
+prompt's first message (the system prompt) as an anchor that the thinning never removes, and takes it whenever the
+system prompt has 256 tokens or more (`QW_SNAP_SYSTEM_MIN`; other boundaries need 1,024).
+
+| | every snapshot | one per 8,192 tokens |
+|---|---|---|
+| cache after the conversation | 7.33 GB, 39 snapshots, 295 blocks | **3.07 GB, 9 snapshots, 259 blocks** |
+| ... after a second conversation with the same system prompt | 10.24 GB, 53 snapshots | **4.79 GB, 14 snapshots** |
+| the last request again | 67,515 of 67,515 cached, 0.01 s | the same |
+| a new conversation with the same system prompt | 3,098 of 3,122 cached, 0.11 s | the same |
+| the second conversation's first turn | 3,098 cached | the same |
+| a branch after turn 5 | 43,501 of 43,592 cached, TTFT 0.30 s | 37,571 cached, 6,021 prefilled, **3.09 s** |
+| a branch after turn 10 | 56,596 of 56,687 cached, 0.16 s | 56,589 cached, 0.29 s |
+| arenas pinned while serving | 31 | 8 |
+
+`test_block_store` and `test_host_tier` pass with it on. Saves took 1.35 s over the 15 turns against 0.46 s (the removed
+entries' files). So: less than half the cache for the same conversations, continuing and system-prompt reuse
+unchanged, and a prompt that branches from the middle of a conversation prefills up to 8k tokens more (3 s).
+
+**Slot move guard measured (same day; X at 49k tokens in the 256k slot, Y growing from 30k in a 44k slot, alternating;
+`QW_SLOT_MOVE=1`).** With `QW_SLOT_MOVE_IDLE_S=20`: while X took turns, Y stayed in its slot past 45k (TTFT 1.46-1.55 s,
+X 0.09-0.10 s); after X paused 25 s, Y moved to the 256k slot once (restore 0.19 s). With the guard at 0: from Y's 45k
+on, both took the 256k slot from each other every turn, each restoring from the store: X's TTFT 0.33-0.53 s instead of
+0.09, Y's 1.75-2.18 s instead of ~1.5 (restores 0.15-0.39 s per turn). When X came back after its pause it took the
+256k slot again (the slot choice by VRAM fit, not the move; restore 0.18 s) and Y continued in its old slot from the
+store (restore 0.24 s): one restore each, then stable. Production's restart after these tests: 55.7 GB pinned in 316 s,
+ready in 514 s (71 s and 252 s the start before): the pin time follows the host's memory state.
