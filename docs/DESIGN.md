@@ -550,6 +550,18 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          `/health`, which llama-swap polls) only after the PLE table is in RAM; the table reads
          while the ranks load, and warmup waits for it (a cold start used to serve requests while
          rows still came from disk, warmup 28-35 s)
+   - [x] sampling defaults from the model's `generation_config.json` (2026-10-05): the server used
+         temperature 1, top-p 1 and no top-k for whatever a request did not send, and opencode
+         sends none of them, so production sampled the whole vocabulary. Seen as replies that
+         turn into word salad, emit a literal `<|im_start|>` and end, twice in one conversation
+         at 152k and 155k tokens (finish `stop`, no engine error). Measured in production with
+         `top_logprobs` 20 over 350-token thinking replies, 3 each: the mass outside the top 20
+         is 0.04-0.08% per token (mean) at 7.1k tokens of context and 0.24-0.44% at 165.8k, so
+         a reply has a 12-24% and a 58-79% chance of at least one such token. Not shown: that
+         one such token caused the two collapses (the 6 probe replies stayed coherent; the 4
+         sampled without top-k drew none outside the top 20), so a transient decode fault is not ruled out. Now the settings a
+         request does not send come from the file (temperature 1.0, top-k 20, top-p 0.95), as
+         vLLM does; `server/tests/test_sampling_defaults.py`. Not deployed yet
    - [x] admission: a request that fits no free slot waits without holding up later ones that
          fit the free slots; freed slots are offered in arrival order, so it is not starved
          (`server/tests/test_admission.py`)

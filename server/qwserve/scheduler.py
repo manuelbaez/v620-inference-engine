@@ -1,5 +1,6 @@
 """Continuous batching over the engine's sequence slots."""
 
+import json
 import os
 import sys
 import threading
@@ -34,8 +35,24 @@ class _Watched:
         return call
 
 
+SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty",
+                 "repetition_penalty")
+
+
+def sampling_defaults(model_dir):
+    """The sampling values of the model's generation_config.json: what a request gets for the ones
+    it does not set (as vLLM does). Without them a client that sends none samples the whole
+    vocabulary at temperature 1."""
+    try:
+        with open(os.path.join(model_dir, "generation_config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: cfg[k] for k in SAMPLING_KEYS if isinstance(cfg.get(k), (int, float)) and not isinstance(cfg[k], bool)}
+
+
 class Request:
-    def __init__(self, prompt_ids, body, emit, eos_ids, media=None):
+    def __init__(self, prompt_ids, body, emit, eos_ids, media=None, defaults=None):
         self.prompt = Tokens(prompt_ids)  # its int32 array is built once, not on every pass
         self.media = media or []  # vision.Media items of the prompt
         self.emit = emit
@@ -43,13 +60,19 @@ class Request:
         mt = body.get("max_completion_tokens") or body.get("max_tokens")
         self.max_new = int(mt) if mt else None
         s = Sampling()
-        s.temperature = float(body.get("temperature", 1.0) if body.get("temperature") is not None else 1.0)
-        s.top_p = float(body.get("top_p") or 1.0)
-        s.top_k = int(body.get("top_k") or 0)
-        s.min_p = float(body.get("min_p") or 0.0)
-        s.presence_penalty = float(body.get("presence_penalty") or 0.0)
-        s.frequency_penalty = float(body.get("frequency_penalty") or 0.0)
-        s.repetition_penalty = float(body.get("repetition_penalty") or 1.0)
+        d = defaults or {}
+
+        def val(key, off):  # the request's value, else the model's default; 0 means off
+            v = body.get(key)
+            return (d.get(key) if v is None else v) or off
+        t = body.get("temperature")
+        s.temperature = float(d.get("temperature", 1.0) if t is None else t)
+        s.top_p = float(val("top_p", 1.0))
+        s.top_k = int(val("top_k", 0))
+        s.min_p = float(val("min_p", 0.0))
+        s.presence_penalty = float(val("presence_penalty", 0.0))
+        s.frequency_penalty = float(val("frequency_penalty", 0.0))
+        s.repetition_penalty = float(val("repetition_penalty", 1.0))
         s.seed = int(body.get("seed") or 0)
         self.sampling = s
         self.want_top = int(body.get("top_logprobs") or 0) if body.get("logprobs") else 0

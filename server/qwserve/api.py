@@ -15,11 +15,13 @@ from .detok import Detok
 from .engine import Engine
 from .output_parser import OutputParser
 from .prompt import ChatPrompt
-from .scheduler import Request, Scheduler
+from .scheduler import Request, Scheduler, sampling_defaults
 from . import vision
 
 
 class Server:
+    sampling_defaults = {}  # the model's generation_config.json, for what a request does not set
+
     def __init__(self, args):
         self.args = args
         self.model_name = args.served_model_name
@@ -41,6 +43,8 @@ class Server:
             self.engine.set_boundary_token(im_start)
         self.vision = vision.VisionPreprocessor(args.model_dir) if self.engine.has_vision else None
         self.sched = Scheduler(self.engine, args.mtp)
+        self.sampling_defaults = sampling_defaults(args.model_dir)
+        print(f"sampling defaults (generation_config.json): {self.sampling_defaults or 'none'}", flush=True)
         # thinking: server defaults, and what ends a thinking section cut short by its budget
         # (Qwen's recommended wording, then the closing tag)
         self.prompt.default_effort = args.reasoning_effort
@@ -91,7 +95,7 @@ class Server:
         def emit(kind, payload):
             loop.call_soon_threadsafe(q.put_nowait, (kind, payload))
 
-        req = Request(prompt_ids, body, emit, self.eos_ids, media)
+        req = Request(prompt_ids, body, emit, self.eos_ids, media, self.sampling_defaults)
         req.rid = rid
         if think_budget is not None:  # the prompt ends inside <think>: cap the thinking
             req.think_left = think_budget

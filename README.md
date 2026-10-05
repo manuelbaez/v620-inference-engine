@@ -63,6 +63,9 @@ none turns it off) and a thinking-token budget (`thinking_token_budget`,
 `thinking_budget_tokens` or Anthropic's `thinking.budget_tokens`) per request;
 defaults `--reasoning-effort` (xhigh; production sets medium) and `--thinking-budget`
 (-1, unlimited).
+Sampling: the settings a request does not send (temperature, top_p, top_k, min_p, the
+penalties) come from the model's `generation_config.json` (temperature 1.0, top-k 20,
+top-p 0.95), as with vLLM; without that file: temperature 1, nothing else.
 All settings and their defaults: docs/ENGINE_GUIDE.md, section 4.
 
 `/health` answers 503 with a reason when the engine can no longer serve (a rank
