@@ -561,7 +561,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          one such token caused the two collapses (the 6 probe replies stayed coherent; the 4
          sampled without top-k drew none outside the top 20), so a transient decode fault is not ruled out. Now the settings a
          request does not send come from the file (temperature 1.0, top-k 20, top-p 0.95), as
-         vLLM does; `server/tests/test_sampling_defaults.py`. Not deployed yet
+         vLLM does; `server/tests/test_sampling_defaults.py`. In production since 2026-10-05 (`qw-engine:8f8a464`)
    - [x] admission: a request that fits no free slot waits without holding up later ones that
          fit the free slots; freed slots are offered in arrival order, so it is not starved
          (`server/tests/test_admission.py`)
