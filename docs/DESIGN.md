@@ -753,7 +753,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          did all of it. Each card now scores a quarter of the groups and the cards merge their candidates, from
          65,536 tokens of context on (`idx_shard_min`, `QW_IDX_SHARD_MIN`): prefill +7% at 100k, +26% at 230k,
          +46% at 360k (1,386 -> 2,022 tok/s), 450 -> 320 mJ per token at 320k; same selection for the same scores,
-         score rounding as between two widths of the unsharded matrix. Not deployed yet. A fused score+select
+         score rounding as between two widths of the unsharded matrix. In production since 2026-10-07 23:57 UTC
+         (`qw-engine:3c9b61e`: ready in 298 s, smoke test passed, 1.80 GiB of VRAM free per card as before). A fused score+select
          kernel (the selection that is left is ~5% at 320k) is not worth building
 
 ## Disk-tier loads and host memory (analysis 2026-10-01)
