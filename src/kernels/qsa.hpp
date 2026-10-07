@@ -25,10 +25,16 @@ void qsa_compress_T(const KvSplit &kv, const float *ikn, int64_t start, int T, u
                     const int32_t *rope3 = nullptr, int64_t rope_start = 0);
 // From per-head raw scores sc16 [Q][4][ldsc] (fp16, = iq_h . ck[c]) to
 // scores [Q][ldsc] = sum_h relu / sqrt(128); queries are positions q0..q0+Q-1.
-void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float *scores, hipStream_t s);
+// With c0 and n: the columns are the groups [c0, c0 + n) (a rank's shard).
+void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float *scores, hipStream_t s, int c0 = 0,
+                        int n = -1);
 // Token lists for queries q0..q0+Q-1: dense 0..pos when nb <= 512, else the
 // radix-selected top-512 groups plus the tail. lists [Q][LIST_W], counts [Q].
 void qsa_select_T(const float *scores, int ldsc, int64_t q0, int Q, int32_t *lists, int32_t *counts, hipStream_t s);
+// Sharded selection: this rank's candidates cand [Q][512] among the groups [c0, c0 + n) (scores [Q][ldsc], column i
+// = group c0 + i), and the token lists from every rank's candidates cand_all [Q][RANKS][512].
+void qsa_select_local_T(const float *scores, int ldsc, int c0, int n, int64_t q0, int Q, IdxCand *cand, hipStream_t s);
+void qsa_select_merge_T(const IdxCand *cand_all, int64_t q0, int Q, int32_t *lists, int32_t *counts, hipStream_t s);
 // Attention for Q queries (q16/gate rows), partial scratch [Q][33][6][258].
 void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, const int32_t *lists,
                   const int32_t *counts, int Q, float *partial, uint16_t *out, hipStream_t s);

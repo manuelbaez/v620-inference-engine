@@ -135,7 +135,7 @@ foreach(b p2p_bench gemm_bench uncached_bench prefix_cache_bench graph_launch_be
 endforeach()
 qw_gpu_program(stress_comm tests/gpu/stress_comm.hip)
 
-foreach(t test_comm test_batch_decode test_batch_prefill test_sampling test_speculative test_host_tier test_snapshot_capture test_block_store test_disk_load test_disk_tier test_pinned_pool test_kv_replicas test_comm_variants test_prefill_pipeline test_vision_encoder test_moe test_gemv test_spill test_spill_coherence)
+foreach(t test_comm test_batch_decode test_batch_prefill test_sampling test_speculative test_host_tier test_snapshot_capture test_block_store test_disk_load test_disk_tier test_pinned_pool test_kv_replicas test_comm_variants test_prefill_pipeline test_vision_encoder test_moe test_gemv test_spill test_spill_coherence test_idx_shard)
   qw_gpu_program(${t} tests/gpu/${t}.hip)
 endforeach()
 add_test(NAME comm COMMAND test_comm)

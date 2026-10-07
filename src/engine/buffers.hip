@@ -68,6 +68,8 @@ void alloc_prefill(PrefillBuf &b, int C, int max_slot_tokens, bool mtp) {
     b.att_partial = zeros<float>(size_t(b.Qb) * 33 * QH_L * (HEAD_DIM + 2));
     b.lists = zeros<int32_t>(size_t(b.Qb) * gpu::LIST_W);
     b.lcounts = zeros<int32_t>(b.Qb);
+    b.cand = zeros<gpu::IdxCand>(size_t(b.Qb) * IDX_TOPK_BLOCKS);
+    b.cand_all = zeros<gpu::IdxCand>(size_t(b.Qb) * RANKS * IDX_TOPK_BLOCKS);
     b.lm_logits = zeros<float>(size_t(Engine::MAX_SEGMENTS) * VOCAB_L);  // grown on demand for all-logits
     b.xg = zeros<float>(size_t(Engine::MAX_SEGMENTS) * XW);
     if (mtp) {

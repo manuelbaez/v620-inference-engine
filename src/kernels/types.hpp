@@ -22,7 +22,14 @@ constexpr int MAX_ROWS = 16;
 constexpr int QSA_LAYERS_MAX = N_QSA + 1;  // + the MTP layer
 constexpr int D_PAD = 328;                 // HC down outputs (320 + 4 inject) padded to 16 bytes
 constexpr int LIST_W = 2052;               // QSA attention token-list width (512 groups x 4 + tail)
-constexpr int MTP_HIST = 256;              // decoded rows' hiddens kept per slot (MTP catch-up)
+constexpr int MTP_HIST = 256;
+constexpr int PREFILL_QB = 256;            // queries per indexer-score batch of a prefill chunk
+
+// A candidate group of the sharded indexer selection (EngineOptions::idx_shard_min); group -1: none.
+struct IdxCand {
+    float score;
+    int32_t group;
+};              // decoded rows' hiddens kept per slot (MTP catch-up)
 
 // K/V/ck hold fp16 bits: store with __half_as_ushort (assigning a __half to a
 // uint16_t converts the value to an integer).

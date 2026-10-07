@@ -5,9 +5,13 @@
 //   steps, 4 verification-shaped runs of 4 rows each rolled back to 2 (accept), a snapshot at a length that is not a
 //   multiple of 4, 6,000 more tokens and 8 steps, then the snapshot restored and 32 steps from it.
 //   logits_dump OUT_FILE
+// With --deep N the script is instead N tokens prefilled into one resident slot in pieces of 32,768 (the logits after
+// each piece) and 16 greedy steps: for changes that only act at long context (the sharded indexer selection).
+//   logits_dump OUT_FILE --deep N
 // Prints one line per phase with the argmax tokens; the file holds the rows' fp32 logits in order.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -29,16 +33,19 @@ static std::vector<int32_t> text(int n, int seed) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: logits_dump OUT_FILE\n");
+        std::fprintf(stderr, "usage: logits_dump OUT_FILE [--deep N]\n");
         return 2;
     }
     try {
+        const int deep = argc >= 4 && std::string(argv[2]) == "--deep" ? std::atoi(argv[3]) : 0;
         EngineOptions opt;
         opt.prefill_chunk = 4096;
-        opt.slot_tokens = {32768};
+        opt.slot_tokens = {deep ? (deep + 4096 + 255) / 256 * 256 : 32768};
 #ifdef QW_HAVE_SPILL
-        opt.slot_tokens.push_back(8192);
-        opt.slot_spill = {0, 24576};
+        if (!deep) {
+            opt.slot_tokens.push_back(8192);
+            opt.slot_spill = {0, 24576};
+        }
 #endif
         Engine e(opt);
         FILE *f = std::fopen(argv[1], "wb");
@@ -49,7 +56,27 @@ int main(int argc, char **argv) {
             rows += size_t(n);
         };
         const auto argmax = [](const float *l) { return int(std::max_element(l, l + cfg::VOCAB) - l); };
-        for (int slot = 0; slot < e.num_slots(); ++slot) {
+        if (deep) {
+            const std::vector<int32_t> all = text(deep, 3);
+            e.slot_reset(0);
+            int tok = 0;
+            for (int at = 0; at < deep; at += 32768) {
+                const int n = std::min(32768, deep - at);
+                const auto &l = e.prefill(0, std::vector<int32_t>(all.begin() + at, all.begin() + at + n));
+                put(l.data(), 1);
+                tok = argmax(l.data());
+                std::printf("%d tokens -> %d\n", at + n, tok);
+            }
+            std::string toks;
+            for (int i = 0; i < 16; ++i) {
+                const auto &d = e.decode({{0, tok}});
+                put(d.data(), 1);
+                tok = argmax(d.data());
+                toks += " " + std::to_string(tok);
+            }
+            std::printf("decode:%s\n", toks.c_str());
+        }
+        for (int slot = 0; !deep && slot < e.num_slots(); ++slot) {
             e.slot_reset(slot);
             const auto &l0 = e.prefill(slot, text(13001, 1));
             put(l0.data(), 1);

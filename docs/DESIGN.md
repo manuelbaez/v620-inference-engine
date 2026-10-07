@@ -748,6 +748,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          n-gram table locked), a standing reserve that refills only while idle, per-request timing in the request
          log, the QSA attention kernel (20.7% of
          GPU time at 60k of context), the SSD move for disk loads (23% of the TTFT time)
+   - [x] indexer selection at long context (2026-10-07, section "Indexer selection at long context"): the
+         top-512 selection and its scores were 27% of GPU kernel time at 320k tokens of context and every card
+         did all of it. Each card now scores a quarter of the groups and the cards merge their candidates, from
+         65,536 tokens of context on (`idx_shard_min`, `QW_IDX_SHARD_MIN`): prefill +7% at 100k, +26% at 230k,
+         +46% at 360k (1,386 -> 2,022 tok/s), 450 -> 320 mJ per token at 320k; same selection for the same scores,
+         score rounding as between two widths of the unsharded matrix. Not deployed yet. A fused score+select
+         kernel (the selection that is left is ~5% at 320k) is not worth building
 
 ## Disk-tier loads and host memory (analysis 2026-10-01)
 
@@ -2049,3 +2056,77 @@ spilled(8192), resident -> spilled(8192) and spilled(8192) -> resident decodes b
 steps each, verification runs with rollback, an appended prefill). Server test (as above, idle guard 20 s): 51,379
 tokens moved from the 44k slot to the 256k slot in 0.012 s (0.19 s through the store), everything cached afterwards.
 Still off (`QW_SLOT_MOVE=1`); the idle guard stays.
+
+## Indexer selection at long context (built and measured 2026-10-07)
+
+**Why.** Production's log of 2026-10-05..07 (1,311 requests): prefill runs at ~2,100 tok/s with under 16k tokens of
+context and ~1,340 beyond 262k, and the requests that recompute most of a long conversation (the client changed its
+system prompt: a new date, an edited AGENTS.md) hold 63% of all uncached tokens; one of them took 198 s for 310,748
+tokens. The attention itself reads at most 2,048 tokens per query; what grows with the context is choosing them: per
+query and QSA layer a score for every group of 4 earlier tokens (a GEMM of the 4 indexer heads against the compressed
+keys, a relu-sum over the heads) and a radix select of the best 512, and each of the four cards computed all of it.
+
+**Profile** (`rocprofv3 --kernel-trace`, `prefill_bench --ctx 320000 8192`, real text, chunk 4096; share of the kernel
+time of the timed 8,192 tokens, the four ranks summed, 43.4 s): the collectives 22.4%, `qsa_attend` 18.9%,
+**`qsa_select` 18.7%** (4.9 ms per 256 queries), the routed experts 13.7%, **the score GEMM ~5.8%** (rocBLAS
+`MT128x256x16`, 1.5 ms per batch), GDN 4.1%, **the score reduction 2.4%**: 27% for the selection. At 60k it was not
+visible as such (the selection was part of "QSA attention 20.7%").
+
+**Sharded selection (`EngineOptions::idx_shard_min`, `QW_IDX_SHARD_MIN`; 65,536 tokens, 0 off).** For a batch of 256
+queries at that context or more, rank r scores only the groups of its quarter (`ck + c0`, a GEMM a quarter as wide),
+selects its 512 best per query in group order (`qsa_select_local_T`; all of them where the query sees 512 or fewer
+there), the ranks all-gather those candidates (score and group, 4 KB per query and rank, on the micro-batch's own
+collective channel) and every rank selects the 512 best of the 2,048 (`qsa_select_merge_T`). A group among the best
+512 of all is among the best 512 of its quarter, and the tie-break (lowest group) is the same in both steps, so the
+list is the one the full selection gives for the same scores: `tests/gpu/test_idx_shard` (continuous scores and
+scores with 1-50 distinct values, 516 to 65,552 groups) and, in the engine, `logits_dump` with the full score matrix
+computed on every rank and only the selection sharded: bit-identical to the unsharded build. `select_body` (decode
+uses it too) is now the dense case, `top_groups_1024` and the tail; the decode path is otherwise untouched.
+
+**What is not bit-identical: the scores.** rocBLAS picks its fp16 GEMM kernel by the matrix width, and two kernels
+round ~0.05% of the outputs differently (`cols [0, 20000)` of an 80,000-wide product: 10,286 of 20.5 M entries differ;
+40,000 or more columns: none; so the unsharded path itself changes rounding class somewhere between 102k and 160k
+tokens of context). A quarter-wide score matrix is the other class, a near-tie at the 512th place can fall the other
+way, and the logits move at the level other shape changes move them:
+
+| 20,000 tokens of real text, logprob of the next token, positions >= 2,048 | mean \|dlogprob\| | median | same top-1 |
+|---|---|---|---|
+| chunk 8,192 against chunk 4,096, unsharded (the accepted floor) | 0.093 | 0.030 | 95.2% |
+| the same, both sharded | 0.093 | 0.030 | |
+| sharded against unsharded, chunk 4,096 (production's) | 0.023 | 0.0015 | 98.9% |
+| sharded against unsharded, chunk 8,192 | 0.049 | 0.0053 | |
+
+On the 4,000-token set against the fp32 reference (bf16 table) sharding everything (`QW_IDX_SHARD_MIN=1`) gives the
+same logprobs as the unsharded engine at every position (mean |dlogprob| 0.0441, top-1 97.6%, difference 0, CI
+[0, 0]); that set does not reach 65,536 tokens, so with the default it is untouched by construction. With sharding
+forced on: `test_spill` (resident against spilled slots, bit-exact) passes, `test_snapshot_capture` and
+`test_batch_prefill` (four prompts of 3-7k tokens in one pass and in two) pass within their noise checks, the 6-repeat
+greedy determinism run passes, and two sharded `logits_dump` runs are bit-identical to each other.
+
+**Speed** (`spill_bench --no-b --cap 393216`, real text, chunk 4096; tok/s of the increment up to each context, two
+alternating runs each):
+
+| context up to | 16k | 65k | 131k | 196k | 262k | 328k | 389k |
+|---|---|---|---|---|---|---|---|
+| unsharded | 2,425 / 2,367 | 2,313 / 2,268 | 2,051 / 2,017 | 1,717 / 1,699 | 1,663 / 1,639 | 1,506 / 1,489 | 1,393 / 1,379 |
+| sharded everywhere | 2,288 / 2,309 | 2,246 / 2,235 | 2,191 / 2,178 | 2,136 / 2,136 | 2,110 / 2,102 | 2,078 / 2,065 | 2,024 / 2,020 |
+| sharded from 65,536 (the default) | 2,359 | 2,243 | 2,174 | 2,132 | 2,097 | 2,061 | 2,010 |
+| gain | -4% | -2% | +7% | +25% | +28% | +38% | +46% |
+
+Below ~65k the extra exchange (8 per micro-batch and QSA layer) costs more than the narrower matrix saves, hence the
+threshold. A slot spilled at 45,056 tokens (production's small slots; `spill_bench --cap 262144 --vram 45056`):
+1,962 / 1,632 / 1,565 tok/s up to 131k / 200k / 258k unsharded, 2,105 / 2,060 / 1,978 with the default (+7 / +26 /
++26%); the resident slot next to it 2,009 / 1,681 / 1,609 against 2,163 / 2,114 / 2,070. Energy for 8,192 tokens after
+320,000: 3.69 kJ (450 mJ per token) -> 2.62 kJ (320). Decode is unchanged (it does not use the path). Memory: 10 MB of
+candidate buffers per card.
+
+**The profile after** (the same trace, sharded; 30.9 s of kernel time, 1,983 tok/s under the profiler against
+1,420): the collectives 35% (mostly waiting for the peers), rocBLAS `MT128x128x16` 14.1% (the quarter-wide score GEMM
+is now in it), `qsa_attend` 13.3% (2.5 ms per batch, was 4.9 next to the selection), the experts 19%, GDN 5.8%,
+`qsa_select_local` 3.4%, `qsa_select_merge` 1.7%, the reduction 0.4%. A fused score-and-select kernel could remove
+part of ~5%: not worth building. What is left at depth is mostly the fixed cost of a chunk.
+
+**A first run that misled.** The first sharded curve read 1,020-1,410 tok/s below 131k: a production engine start
+that had failed was tearing down on the same host (unpinning ~180 GB) while it ran. Something polls
+`/upstream/qw/qwen3.8-flash-next/metrics.json` on llama-swap once a minute and that starts the model after an unload;
+the clean runs above were taken with the production container stopped.

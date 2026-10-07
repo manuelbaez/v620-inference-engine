@@ -81,21 +81,42 @@ void qsa_compress_T(const KvSplit &kv, const float *ikn, int64_t start, int T, u
                                                                     reinterpret_cast<__half *>(ck), rope_start, rope3);
 }
 
-__global__ void qsa_score_reduce_kernel(const __half *sc16, int ldsc, int64_t q0, float *scores) {
+__global__ void qsa_score_reduce_kernel(const __half *sc16, int ldsc, int64_t q0, float *scores, int c0, int n) {
     const int q = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int nb = int((q0 + q + 1) / IDX_RATIO);
-    if (c >= nb) return;
+    if (c >= n || c0 + c >= nb) return;
     float s = 0.f;
 #pragma unroll
     for (int h = 0; h < IDX_HEADS; ++h) s += fmaxf(__half2float(sc16[(size_t(q) * IDX_HEADS + h) * ldsc + c]), 0.f);
     scores[size_t(q) * ldsc + c] = s * rsqrtf(float(IDX_DIM));
 }
 
-void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float *scores, hipStream_t s) {
-    const int nb_max = int((q0 + Q) / IDX_RATIO);
-    qsa_score_reduce_kernel<<<dim3((nb_max + 255) / 256, Q), 256, 0, s>>>(reinterpret_cast<const __half *>(sc16), ldsc,
-                                                                          q0, scores);
+void qsa_score_reduce_T(const uint16_t *sc16, int ldsc, int64_t q0, int Q, float *scores, hipStream_t s, int c0,
+                        int n) {
+    if (n < 0) n = int((q0 + Q) / IDX_RATIO);
+    qsa_score_reduce_kernel<<<dim3((n + 255) / 256, Q), 256, 0, s>>>(reinterpret_cast<const __half *>(sc16), ldsc, q0,
+                                                                     scores, c0, n);
+}
+
+__global__ __launch_bounds__(1024) void qsa_select_local_T_kernel(const float *scores, int ldsc, int c0, int n,
+                                                                  int64_t q0, IdxCand *cand) {
+    const int q = blockIdx.x;
+    select_local_body(scores + size_t(q) * ldsc, c0, n, q0 + q, cand + size_t(q) * IDX_TOPK_BLOCKS);
+}
+
+void qsa_select_local_T(const float *scores, int ldsc, int c0, int n, int64_t q0, int Q, IdxCand *cand, hipStream_t s) {
+    qsa_select_local_T_kernel<<<Q, 1024, 0, s>>>(scores, ldsc, c0, n, q0, cand);
+}
+
+__global__ __launch_bounds__(1024) void qsa_select_merge_T_kernel(const IdxCand *cand_all, int64_t q0, int32_t *lists,
+                                                                  int32_t *counts) {
+    const int q = blockIdx.x;
+    select_merge_body(cand_all + size_t(q) * RANKS * IDX_TOPK_BLOCKS, q0 + q, lists + size_t(q) * LIST_W, counts + q);
+}
+
+void qsa_select_merge_T(const IdxCand *cand_all, int64_t q0, int Q, int32_t *lists, int32_t *counts, hipStream_t s) {
+    qsa_select_merge_T_kernel<<<Q, 1024, 0, s>>>(cand_all, q0, lists, counts);
 }
 
 __global__ __launch_bounds__(1024) void qsa_select_T_kernel(const float *scores, int ldsc, int64_t q0, int32_t *lists,

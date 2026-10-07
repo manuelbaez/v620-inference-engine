@@ -39,7 +39,9 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         const char *pin = std::getenv("QW_PLE_PIN");
         ple_->pin_in_background(!(pin && std::string(pin) == "0"));
     }
-    const size_t slot = std::max<size_t>(64 * 1024, size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096);
+    // the largest payloads: half a chunk's HC down outputs, a score batch's indexer candidates
+    const size_t slot = std::max({size_t(64 * 1024), size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096,
+                                  size_t(gpu::PREFILL_QB) * IDX_TOPK_BLOCKS * sizeof(gpu::IdxCand) + 4096});
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
     comm2_ = std::make_unique<Comm>(opt_.devices, slot);
     QW_CHECK(!opt_.slot_tokens.empty() && opt_.slot_tokens.size() <= size_t(MAX_SLOTS), "1..8 slots");
@@ -71,6 +73,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     if (const char *wd = std::getenv("QW_WEIGHT_CACHE_DIR"); wd && opt_.weight_cache_dir.empty()) opt_.weight_cache_dir = wd;
     if (const char *st = std::getenv("QW_SPILL_STAGE")) opt_.spill_stage = std::atoi(st) != 0;
     if (const char *cm = std::getenv("QW_SPILL_CACHE_MB")) opt_.spill_cache_mb = std::atoi(cm);
+    if (const char *im = std::getenv("QW_IDX_SHARD_MIN")) opt_.idx_shard_min = std::atoi(im);
     bool any_spill = false;
     for (int c : opt_.slot_spill) {
         QW_CHECK(c >= 0 && c % 256 == 0, "slot spill must be a multiple of 256");

@@ -49,7 +49,7 @@ struct HcW {
 
 // Prefill scratch for one rank, sized for opt.prefill_chunk tokens.
 struct PrefillBuf {
-    int C = 0, Qb = 256, nb_pad = 0;
+    int C = 0, Qb = gpu::PREFILL_QB, nb_pad = 0;
     float *X, *ssq, *ssq_red, *d, *d_red, *out_attn, *out_moe, *inj_attn, *inj_mlp, *emb;
     uint16_t *xn, *u, *g, *bin_local, *bin, *P, *act, *part16, *ple_e, *kv;
     float *qkv, *gb, *o_raw, *logits, *tok_w, *shp, *ple_send, *ple_red, *ncbuf;
@@ -60,6 +60,7 @@ struct PrefillBuf {
     uint16_t *q16, *qgate, *iq16, *sc16;
     float *scores, *att_partial;
     int32_t *lists, *lcounts;
+    gpu::IdxCand *cand, *cand_all;  // [Qb][512] this rank's, [Qb][RANKS][512] every rank's (sharded selection)
     float *lm_logits;  // [C][VOCAB_L] fp32 (all-logits mode)
     // MTP pass over the chunk: its rows' hidden [C][XW], norm/fc work rows [5][C]
     float *Xm = nullptr, *m_out = nullptr, *m_send = nullptr, *m_red = nullptr;

@@ -56,6 +56,14 @@ struct EngineOptions {
     // Decode-time VRAM cache of spilled K/V rows, shared by all slots (kernels/types.hpp SpillCache): MB per card, 0 off
     // (QW_SPILL_CACHE_MB). Allocated only when some slot spills.
     int spill_cache_mb = 256;
+    // Sharded indexer selection in prefill: for queries at this many tokens of context or more, each card scores a
+    // quarter of the compressed keys and keeps its 512 best per query, the cards exchange those and every card takes
+    // the top 512 of them: the same set as scoring every key on every card (what happens below this context, and
+    // everywhere when this is 0) for the same scores. The scores themselves differ in rounding for ~0.05% of the
+    // entries, as they do between two widths of the unsharded matrix (rocBLAS picks its kernel by width). Costs one
+    // small exchange per 256 queries and layer: -2 to -4% below 65k tokens of context, +7% at 100k, +26% at 230k,
+    // +46% at 360k (docs/DESIGN.md "Indexer selection at long context"). QW_IDX_SHARD_MIN.
+    int idx_shard_min = 65536;
     int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion

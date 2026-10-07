@@ -271,7 +271,19 @@ void Engine::run_prefill_rank(Rank &rk) {
                     const int64_t p0 = sb.start + q0;
                     const size_t row = size_t(sb.row + q0);
                     const int nb_max = int((p0 + Q) / IDX_RATIO);
-                    if (nb_max > IDX_TOPK_BLOCKS) {
+                    if (nb_max > IDX_TOPK_BLOCKS && opt_.idx_shard_min > 0 && p0 + Q >= opt_.idx_shard_min) {
+                        // this rank's quarter of the groups, then the top 512 of every rank's candidates
+                        const int per = ((nb_max + RANKS - 1) / RANKS + 7) / 8 * 8;
+                        const int c0 = std::min(nb_max, r * per), n = std::min(per, nb_max - c0);
+                        if (n > 0) {
+                            gemm(m, sb.sl->ck[qi] + size_t(c0) * IDX_DIM, n, IDX_DIM, b.iq16 + row * IW, IDX_DIM,
+                                 Q * IDX_HEADS, b.sc16, per, true);
+                            gpu::qsa_score_reduce_T(b.sc16, per, p0, Q, b.scores, s, c0, n);
+                        }
+                        gpu::qsa_select_local_T(b.scores, per, c0, n, p0, Q, b.cand, s);
+                        allgather(m, b.cand, b.cand_all, IDX_TOPK_BLOCKS * sizeof(gpu::IdxCand), Q);
+                        gpu::qsa_select_merge_T(b.cand_all, p0, Q, b.lists, b.lcounts, s);
+                    } else if (nb_max > IDX_TOPK_BLOCKS) {
                         const int ld = (nb_max + 7) / 8 * 8;
                         gemm(m, sb.sl->ck[qi], nb_max, IDX_DIM, b.iq16 + row * IW, IDX_DIM, Q * IDX_HEADS, b.sc16, ld,
                              true);

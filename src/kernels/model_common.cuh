@@ -86,16 +86,11 @@ __device__ inline int block_exscan_1024(int v, int *sh, int *total) {
     return incl - v;
 }
 
-// One block of 1024 threads. Radix-select the 512th largest key, then an
-// ordered compaction: everything above the threshold, plus ties by lowest
-// group index, matching the reference's tie-break.
-__device__ inline void select_body(const float *scores, int64_t pos, int32_t *list, int32_t *count) {
-    const int nb = int((pos + 1) / IDX_RATIO);
-    if (nb <= IDX_TOPK_BLOCKS) {  // dense: every token so far
-        for (int i = threadIdx.x; i <= pos; i += blockDim.x) list[i] = i;
-        if (threadIdx.x == 0) *count = int32_t(pos + 1);
-        return;
-    }
+// One block of 1024 threads. Radix-select the 512th largest of the keys key(i), i < n (more than 512 of them, 0 for an
+// entry that cannot be taken), then an ordered compaction: emit(o, i), o = 0..511 in increasing i, for everything
+// above the threshold plus ties by lowest i, matching the reference's tie-break.
+template <class Key, class Emit>
+__device__ inline void top_groups_1024(int n, Key key, Emit emit) {
     __shared__ int hist[256];
     __shared__ int scan[1024];
     __shared__ uint32_t s_prefix;
@@ -106,9 +101,9 @@ __device__ inline void select_body(const float *scores, int64_t pos, int32_t *li
     for (int shift = 24; shift >= 0; shift -= 8) {
         for (int i = t; i < 256; i += 1024) hist[i] = 0;
         __syncthreads();
-        for (int i = t; i < nb; i += 1024) {
-            const uint32_t key = order_key(scores[i]);
-            if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 0xff], 1);
+        for (int i = t; i < n; i += 1024) {
+            const uint32_t ky = key(i);
+            if ((ky & mask) == prefix) atomicAdd(&hist[(ky >> shift) & 0xff], 1);
         }
         __syncthreads();
         if (t == 0) {
@@ -127,35 +122,83 @@ __device__ inline void select_body(const float *scores, int64_t pos, int32_t *li
         __syncthreads();
     }
     const uint32_t thr = prefix;  // the 512th largest key; take k ties
-    const int per = (nb + 1023) / 1024;
-    const int b0 = t * per, b1 = min(nb, b0 + per);
+    const int per = (n + 1023) / 1024;
+    const int b0 = t * per, b1 = min(n, b0 + per);
     int n_eq = 0;
-    for (int i = b0; i < b1; ++i) n_eq += order_key(scores[i]) == thr;
+    for (int i = b0; i < b1; ++i) n_eq += key(i) == thr;
     const int eq_before = block_exscan_1024(n_eq, scan, nullptr);
     int n_sel = 0, eq_seen = eq_before;
     for (int i = b0; i < b1; ++i) {
-        const uint32_t key = order_key(scores[i]);
-        if (key > thr)
+        const uint32_t ky = key(i);
+        if (ky > thr)
             ++n_sel;
-        else if (key == thr && eq_seen++ < k)
+        else if (ky == thr && eq_seen++ < k)
             ++n_sel;
     }
     const int out0 = block_exscan_1024(n_sel, scan, nullptr);
     int o = out0;
     eq_seen = eq_before;
     for (int i = b0; i < b1; ++i) {
-        const uint32_t key = order_key(scores[i]);
-        const bool take = key > thr || (key == thr && eq_seen++ < k);
-        if (take) {
+        const uint32_t ky = key(i);
+        if (ky > thr || (ky == thr && eq_seen++ < k)) emit(o++, i);
+    }
+}
+
+// A query's token list when it sees 512 groups or fewer: every token so far.
+__device__ inline void list_dense(int64_t pos, int32_t *list, int32_t *count) {
+    for (int i = threadIdx.x; i <= pos; i += blockDim.x) list[i] = i;
+    if (threadIdx.x == 0) *count = int32_t(pos + 1);
+}
+
+// The open tail group after the 512 selected ones.
+__device__ inline void list_tail(int nb, int64_t pos, int32_t *list, int32_t *count) {
+    if (threadIdx.x != 0) return;
+    int n = IDX_TOPK_BLOCKS * IDX_RATIO;
+    for (int64_t p = int64_t(nb) * IDX_RATIO; p <= pos; ++p) list[n++] = int32_t(p);
+    *count = n;
+}
+
+// One block of 1024 threads: the token list of the query at pos from its groups' scores.
+__device__ inline void select_body(const float *scores, int64_t pos, int32_t *list, int32_t *count) {
+    const int nb = int((pos + 1) / IDX_RATIO);
+    if (nb <= IDX_TOPK_BLOCKS) return list_dense(pos, list, count);
+    top_groups_1024(
+        nb, [&](int i) { return order_key(scores[i]); },
+        [&](int o, int i) {
             for (int r = 0; r < IDX_RATIO; ++r) list[o * IDX_RATIO + r] = i * IDX_RATIO + r;
-            ++o;
-        }
+        });
+    list_tail(nb, pos, list, count);
+}
+
+// Sharded selection (prefill, EngineOptions::idx_shard_min): each rank scores a quarter of the groups and keeps its
+// candidates, the ranks' candidates are gathered, and every rank takes the top 512 of them: the same set as over all
+// the groups, since a group among the best 512 is among the best 512 of its shard, in the same order (ties by index).
+//
+// One block of 1024 threads: the candidates of one query among the shard's groups [c0, c0 + n), scores[i] being group
+// c0 + i's: the top 512 of those the query sees (all of them when it sees 512 or fewer; group -1 pads), in group order.
+__device__ inline void select_local_body(const float *scores, int c0, int n, int64_t pos, IdxCand *cand) {
+    const int nb = int((pos + 1) / IDX_RATIO);
+    n = max(0, min(n, nb - c0));
+    if (n <= IDX_TOPK_BLOCKS) {
+        for (int i = threadIdx.x; i < IDX_TOPK_BLOCKS; i += blockDim.x)
+            cand[i] = i < n ? IdxCand{scores[i], c0 + i} : IdxCand{0.f, -1};
+        return;
     }
-    if (t == 0) {
-        int n = IDX_TOPK_BLOCKS * IDX_RATIO;
-        for (int64_t p = int64_t(nb) * IDX_RATIO; p <= pos; ++p) list[n++] = int32_t(p);
-        *count = n;
-    }
+    top_groups_1024(
+        n, [&](int i) { return order_key(scores[i]); }, [&](int o, int i) { cand[o] = IdxCand{scores[i], c0 + i}; });
+}
+
+// One block of 1024 threads: the token list of the query at pos from the ranks' candidates [RANKS][512] (the shards
+// are in group order, so the candidates are too; the scores are sums of relu, so a real key is never 0).
+__device__ inline void select_merge_body(const IdxCand *cand, int64_t pos, int32_t *list, int32_t *count) {
+    const int nb = int((pos + 1) / IDX_RATIO);
+    if (nb <= IDX_TOPK_BLOCKS) return list_dense(pos, list, count);
+    top_groups_1024(
+        RANKS * IDX_TOPK_BLOCKS, [&](int i) { return cand[i].group < 0 ? 0u : order_key(cand[i].score); },
+        [&](int o, int i) {
+            for (int r = 0; r < IDX_RATIO; ++r) list[o * IDX_RATIO + r] = cand[i].group * IDX_RATIO + r;
+        });
+    list_tail(nb, pos, list, count);
 }
 
 constexpr int ATT_CHUNK = 64;
