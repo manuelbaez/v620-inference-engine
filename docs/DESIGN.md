@@ -682,6 +682,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          (layout `f8e4m3_tensorscale`, decoded through a 256-entry table). Accuracy against
          the fp32 reference: 0.050 mean |dlogprob| (int8 0.048, bf16 0.044; see "PLE n-gram
          table precision")
+   - [~] the int4 experts against the original (2026-10-08, section of that name): four layers' original bf16
+         experts downloaded and swapped into the fp32 reference. The int4 experts are 11-17% off the original
+         weights and one layer of them moves the outputs more (0.055 mean |dlogprob|) than all of the engine's
+         fp16 arithmetic (0.044); in four layers 0.071, where plain 6-bit rounding gives 0.051 and 8-bit 0.045
+         (the floor of the measure). The text's own log-likelihood is the same with every format (no sign that
+         int4 predicts worse, only differently). Open: the task scores of the original model (a hosted endpoint)
+         against ours, before any 6-bit expert path is built (+7 GiB per card)
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -2263,4 +2270,63 @@ input, a block's output, the stored K and V, the attention queries, the activati
 Conclusion: fp16 arithmetic is at its floor here; nothing to build. What still moves the outputs is what the weights
 are: the n-gram table (above: int8 or bf16 instead of fp8) and the routed experts' int4, which has never been compared
 with the original (roadmap, NVFP4 note: it needs the original experts of some layers).
+
+## The int4 experts against the original (measured 2026-10-08)
+
+The routed experts are the one part of the weights the engine does not run as released: the checkpoint in use holds
+them as int4 with a bf16 scale per 128 inputs (62 of the model's bytes in VRAM), and the fp32 reference uses the same
+ones, so nothing so far said how far they are from the original. `tools/expert_download.py` fetches the original
+bf16 experts of chosen layers (`mlp.experts.gate_up_proj` [512][1280][2560], gate rows first, and `down_proj`
+[512][2560][640]; 5.0 GB per layer by HTTP ranges); layers 2, 15, 30 and 44 are on the dev box (`~/orig_experts`).
+
+**Weights** (`tools/expert_compare.py`, relative error of a matrix against the original, 16-24 experts per layer;
+the four layers agree within 0.01):
+
+| | gate | up | down |
+|---|---|---|---|
+| the int4 checkpoint | 0.115 | 0.167 (0.12-0.35) | 0.143 (0.11-0.25) |
+| original rounded to 4 bits, scale per 128 (best of six clips) | 0.106 | 0.106 | 0.103 |
+| ... 4 bits, scale per 16 | 0.080 | 0.081 | 0.079 |
+| ... 5 bits | 0.054 | 0.054 | 0.053 |
+| ... 6 bits, scale per 128 / per 16 | 0.027 / 0.020 | 0.027 / 0.020 | 0.027 / 0.019 |
+| ... 8 bits | 0.007 | 0.007 | 0.007 |
+
+For scale: fp16 rounding is 0.0002. The checkpoint's int4 is further from the original weights than plain rounding
+(its calibration trades weight error for output error).
+
+**Outputs.** The fp32 reference with the original experts in some layers (`QW_REF_EXPERTS_DIR`,
+`QW_REF_EXPERT_LAYERS`; `QW_REF_EXPERT_BITS` / `_GROUP` round them first), the 4,000-token set:
+
+| against the reference with int4 everywhere | mean \|dlogprob\| | top-1 agreement |
+|---|---|---|
+| original experts in layer 15 | 0.055 | 97.2% |
+| original experts in layers 2, 15, 30, 44 | 0.071 | 96.5% |
+| (the engine's fp16 arithmetic, all layers, for comparison) | 0.044 | 97.6-98.0% |
+
+| in those four layers, against the original experts there | mean \|dlogprob\| | top-1 | minus int4 (95% CI) | log-likelihood of the text |
+|---|---|---|---|---|
+| original | 0 | | | -0.880 |
+| the int4 checkpoint | 0.071 | 96.5% | | -0.873 |
+| rounded to 4 bits | 0.070 | 96.4% | -0.001 (-0.006, +0.005) | -0.884 |
+| rounded to 6 bits, scale per 128 | 0.051 | 97.5% | -0.020 (-0.025, -0.015) | -0.882 |
+| rounded to 6 bits, scale per 16 | 0.049 | 97.3% | -0.022 (-0.027, -0.017) | -0.880 |
+| rounded to 8 bits | 0.045 | 97.9% | -0.026 (-0.031, -0.022) | -0.879 |
+
+- **The int4 experts are the largest difference from the original model.** One layer of them moves the next-token
+  distributions more than all of the engine's fp16 arithmetic, four layers 0.071, and the effect grows slowly with
+  the number of layers (it saturates, as every perturbation of this model does: section "How much precision the
+  outputs can use"), so 48 layers cannot be read off four.
+- **The calibrated int4 is no closer at the outputs than plain 4-bit rounding** (0.071 against 0.070).
+- **6 bits recover most of what can be recovered**: 0.051, with 8 bits at 0.045, which is about the floor any change
+  of the weights gives on this measure; a finer scale adds little (0.049).
+- **No sign of worse predictions.** The mean log-likelihood of the text is the same for every format within noise
+  (-0.873 to -0.884, standard error ~0.003 for a pair): the int4 model is different at the tokens where the model is
+  unsure, not measurably worse at predicting. That fits the task results so far (changes of this size in the
+  n-gram table moved no task score).
+
+What it would take: 6-bit experts are 1.5 times the bytes, ~+7 GiB per card where 1.8 GiB is free, so nearly all KV
+would spill to host memory (untested as a configuration; the compressed keys and the staging buffer cannot spill),
+plus a 6-bit expert path in the decode pair kernel and the prefill expert GEMM. Before that: whether the original
+model scores higher on the tasks at all (GSM8K / MMLU / ARC through a hosted endpoint of the original, against our
+92.3%); if it does not, the difference above is one that does not matter.
 

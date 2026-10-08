@@ -4,6 +4,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <numeric>
 #include <string>
 
@@ -116,6 +120,77 @@ void Model::expert_linear(const TensorView &packed, const TensorView &scale, con
                 uint32_t word = p[c];
                 for (int i = 0; i < 8; ++i) row[size_t(c * 8 + i)] = float(int((word >> (4 * i)) & 0xf) - 8) * sc;
             }
+            for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
+        }
+    });
+}
+
+// QW_REF_EXPERTS_DIR=DIR (experiment): the layers that have DIR/L<layer>.gate_up_proj.bf16 and .down_proj.bf16 (the
+// original checkpoint's routed experts, tools/expert_download.py) use those instead of the int4 experts, to measure
+// what the int4 experts cost against the original model. QW_REF_EXPERT_BITS=b rounds them to b bits first (symmetric,
+// a scale per QW_REF_EXPERT_GROUP inputs, default 128, the best of a few clips per group): a b-bit format without
+// calibration. QW_REF_EXPERT_LAYERS=a,b,.. limits the swap to those layers.
+struct OrigExperts {
+    const uint16_t *gate_up = nullptr, *down = nullptr;  // [512][2 * FFN][H] (gate rows, then up rows), [512][H][FFN]
+};
+static const uint16_t *map_file(const std::string &path, size_t bytes) {
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return nullptr;
+    struct stat st {};
+    void *p = fstat(fd, &st) == 0 && size_t(st.st_size) == bytes ? mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    return p == MAP_FAILED ? nullptr : static_cast<const uint16_t *>(p);
+}
+static const OrigExperts *orig_experts(int layer) {
+    static std::vector<OrigExperts> all(N_LAYERS);
+    static std::vector<int> state(N_LAYERS, 0);  // 0 not looked at, 1 there, 2 not there
+    const char *dir = std::getenv("QW_REF_EXPERTS_DIR");
+    if (!dir) return nullptr;
+    if (state[size_t(layer)] == 0) {
+        bool want = true;
+        if (const char *only = std::getenv("QW_REF_EXPERT_LAYERS"))
+            want = (std::string(",") + only + ",").find("," + std::to_string(layer) + ",") != std::string::npos;
+        OrigExperts &o = all[size_t(layer)];
+        const std::string base = std::string(dir) + "/L" + std::to_string(layer);
+        if (want) {
+            o.gate_up = map_file(base + ".gate_up_proj.bf16", size_t(N_EXPERTS) * 2 * FFN * H * 2);
+            o.down = map_file(base + ".down_proj.bf16", size_t(N_EXPERTS) * H * FFN * 2);
+        }
+        state[size_t(layer)] = o.gate_up && o.down ? 1 : 2;
+        if (state[size_t(layer)] == 1) log("reference: layer %d uses the original experts", layer);
+    }
+    return state[size_t(layer)] == 1 ? &all[size_t(layer)] : nullptr;
+}
+static void round_bits(float *w, int n, int bits, int group) {
+    const float lv = float((1 << (bits - 1)) - 1);
+    std::vector<float> q(static_cast<size_t>(group)), best(static_cast<size_t>(group));
+    for (int g0 = 0; g0 < n; g0 += group) {
+        float m = 0.f;
+        for (int i = 0; i < group; ++i) m = std::max(m, std::fabs(w[g0 + i]));
+        if (m == 0.f) continue;
+        double best_e = 1e300;
+        for (float clip : {1.f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f}) {
+            const float s = m * clip / lv;
+            double e = 0;
+            for (int i = 0; i < group; ++i) {
+                q[size_t(i)] = std::min(lv, std::max(-lv - 1.f, std::nearbyint(w[g0 + i] / s))) * s;
+                e += double(q[size_t(i)] - w[g0 + i]) * (q[size_t(i)] - w[g0 + i]);
+            }
+            if (e < best_e) best_e = e, best = q;
+        }
+        std::copy(best.begin(), best.end(), w + g0);
+    }
+}
+
+// y[t][o] = sum_i W[o][i] * x[t][i] for raw bf16 rows (the original experts), rounded to QW_REF_EXPERT_BITS if set.
+void Model::raw_linear(const uint16_t *W, int out, int in, const float *x, int T, int ldx, float *y, int ldy) {
+    static const int bits = std::getenv("QW_REF_EXPERT_BITS") ? std::atoi(std::getenv("QW_REF_EXPERT_BITS")) : 0;
+    static const int group = std::getenv("QW_REF_EXPERT_GROUP") ? std::atoi(std::getenv("QW_REF_EXPERT_GROUP")) : QGROUP;
+    pool_.parallel_for(out, 16, [&](int64_t b, int64_t e) {
+        std::vector<float> row(static_cast<size_t>(in));
+        for (int64_t o = b; o < e; ++o) {
+            bf16_row(W + o * in, row.data(), in);
+            if (bits) round_bits(row.data(), in, bits, group);
             for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
         }
     });
@@ -487,6 +562,7 @@ void Model::moe(int layer, const float *x, int T, float *out) {
 
     std::fill(out, out + size_t(T) * H, 0.f);
     std::vector<float> xs, g, u, y;
+    const OrigExperts *orig = orig_experts(layer);
     for (int e = 0; e < N_EXPERTS; ++e) {
         auto &toks = by_expert[size_t(e)];
         if (toks.empty()) continue;
@@ -499,16 +575,26 @@ void Model::moe(int layer, const float *x, int T, float *out) {
         g.resize(size_t(n) * FFN);
         u.resize(size_t(n) * FFN);
         y.resize(size_t(n) * H);
-        expert_linear(st_.get(ep + "gate_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                      st_.get(ep + "gate_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, g.data(),
-                      FFN);
-        expert_linear(st_.get(ep + "up_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                      st_.get(ep + "up_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, u.data(),
-                      FFN);
+        if (orig) {
+            const uint16_t *gu = orig->gate_up + size_t(e) * 2 * FFN * H;
+            raw_linear(gu, FFN, H, xs.data(), n, H, g.data(), FFN);
+            raw_linear(gu + size_t(FFN) * H, FFN, H, xs.data(), n, H, u.data(), FFN);
+        } else {
+            expert_linear(st_.get(ep + "gate_proj.weight_packed", DType::I32, {FFN, H / 8}),
+                          st_.get(ep + "gate_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, g.data(),
+                          FFN);
+            expert_linear(st_.get(ep + "up_proj.weight_packed", DType::I32, {FFN, H / 8}),
+                          st_.get(ep + "up_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, u.data(),
+                          FFN);
+        }
         for (size_t i = 0; i < g.size(); ++i) g[i] = siluf(g[i]) * u[i];
-        expert_linear(st_.get(ep + "down_proj.weight_packed", DType::I32, {H, FFN / 8}),
-                      st_.get(ep + "down_proj.weight_scale", DType::BF16, {H, FFN / QGROUP}), g.data(), n, FFN,
-                      y.data(), H);
+        if (orig) {
+            raw_linear(orig->down + size_t(e) * H * FFN, H, FFN, g.data(), n, FFN, y.data(), H);
+        } else {
+            expert_linear(st_.get(ep + "down_proj.weight_packed", DType::I32, {H, FFN / 8}),
+                          st_.get(ep + "down_proj.weight_scale", DType::BF16, {H, FFN / QGROUP}), g.data(), n, FFN,
+                          y.data(), H);
+        }
         for (int i = 0; i < n; ++i) {
             float w = toks[size_t(i)].second;
             float *o = out + size_t(toks[size_t(i)].first) * H;

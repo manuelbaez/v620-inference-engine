@@ -63,6 +63,7 @@ private:
     std::string lp(int layer) const;  // "model.language_model.layers.<L>."
 
     void linear(const TensorView &w, const float *x, int T, int ldx, float *y, int ldy);
+    void raw_linear(const uint16_t *W, int out, int in, const float *x, int T, int ldx, float *y, int ldy);
     void expert_linear(const TensorView &packed, const TensorView &scale, const float *x, int T, int ldx, float *y,
                        int ldy);
 
