@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -64,6 +65,7 @@ size_t Engine::recurrent_rank_bytes() {
 void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
     QW_CHECK(slot >= 0 && slot < num_slots() && p0 % IDX_RATIO == 0 && n > 0 && p0 + n <= slots_[size_t(slot)].len,
              "export_kv: bad range");
+    static const bool pack = !(std::getenv("QW_KV_PACK") && std::atoi(std::getenv("QW_KV_PACK")) == 0);
     const KvLayout lay(n);
     const hipMemcpyKind d2h = hipMemcpyDeviceToHost;
     for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -75,10 +77,17 @@ void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
         CK(hipSetDevice(rk.dev));
         uint8_t *p = dst[r];
         const auto &sl = rk.slots[size_t(slot)];
-        for (int i = 0; i < N_QSA + int(mtp_); ++i) {
+        const bool sp = !sl.Kh.empty();
+        const int64_t vt = sp ? sl.vt : INT64_MAX / 2;
+        const int layers = N_QSA + int(mtp_);
+        // a block in VRAM: laid out on the card, then one copy (39 copies of 16-128 KB otherwise; QW_KV_PACK=0)
+        if (pack && p0 + n <= vt && size_t(layers) * lay.per_layer <= rk.pack_bytes) {
+            gpu::kv_pack(rk.dtab, slot, layers, p0, int(n), rk.pack, rk.s);
+            CK(hipMemcpyAsync(p, rk.pack, size_t(layers) * lay.per_layer, d2h, rk.s));
+            continue;
+        }
+        for (int i = 0; i < layers; ++i) {
             const size_t qi = size_t(i);
-            const bool sp = !sl.Kh.empty();
-            const int64_t vt = sp ? sl.vt : INT64_MAX / 2;
             copy_split_out(p, reinterpret_cast<const uint8_t *>(sl.K[qi]), sp ? reinterpret_cast<const uint8_t *>(sl.Kh[qi]) : nullptr,
                            vt, p0, n, HEAD_DIM * 2, rk.s);
             copy_split_out(p + lay.k, reinterpret_cast<const uint8_t *>(sl.V[qi]), sp ? reinterpret_cast<const uint8_t *>(sl.Vh[qi]) : nullptr,

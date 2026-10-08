@@ -134,6 +134,8 @@ private:
     // every snapshot a restore has ended at.
     void thin(const std::vector<uint64_t> &path, const std::vector<int32_t> &tokens);
     int64_t keep_gap_ = 0;
+    std::vector<std::vector<uint64_t>> cursors_;  // per slot: the full blocks its last save walked (save resumes there)
+    bool save_resume_ = true;  // QW_SAVE_RESUME=0: every save hashes the prompt from its start
     void enforce_budgets();
     // A background load of on-disk entries (load()): the loader threads take
     // the pinned buffers themselves (pinning new arenas can take seconds) and
@@ -176,6 +178,11 @@ private:
     std::unordered_map<uint64_t, Node> nodes_;
     uint64_t clock_ = 0;
     Stats stats_;
+    // Where the saves' time goes, summed until reported (save() logs it once it reaches a second).
+    struct SaveProf {
+        uint64_t saves = 0, blocks = 0, ram_evictions = 0, disk_evictions = 0;
+        double total_s = 0, export_s = 0, copies_s = 0, queue_s = 0, thin_s = 0, evict_ram_s = 0, evict_disk_s = 0;
+    } save_prof_;
     std::unique_ptr<Load> load_;
     std::unique_ptr<DiskTier> disk_;  // declared last: destroyed (writes finished) before the pools
 };

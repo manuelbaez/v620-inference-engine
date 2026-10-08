@@ -3,6 +3,9 @@
 // restart; a freed Session gives its arenas back). Measures what the saves cost the prefill: the same prompt with no
 // store at all is the floor.
 //   cold_prefill_bench [--tokens N=65536] [--reps R=2] [--host-gb G=48] [--hog-gb H=0] [--configs name,name,...]
+//                      [--disk DIR]
+// --disk DIR keeps the disk tier (QW_DISK_CACHE_DIR=DIR, budget QW_DISK_CACHE_GB), which is off otherwise: with a
+// small --host-gb and disk budget the saves evict as they do in production, where both tiers are full.
 // --hog-gb H holds H GB of memory during the runs, so that pinning has to find pages in a nearly full host, as on
 // the production box. Only with the PLE table mlocked (ulimit -l unlimited): otherwise the table is page cache, the
 // hog evicts it, and every token's gather becomes a disk read (the dev box's user has an 8 MB limit: do not use it
@@ -123,7 +126,7 @@ int main(int argc, char **argv) {
     try {
         int tokens = 65536, reps = 2;
         double host_gb = 48, hog_gb = 0;
-        std::string only;
+        std::string only, disk;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             if (a == "--tokens" && i + 1 < argc) tokens = std::atoi(argv[++i]);
@@ -131,13 +134,15 @@ int main(int argc, char **argv) {
             else if (a == "--host-gb" && i + 1 < argc) host_gb = std::atof(argv[++i]);
             else if (a == "--hog-gb" && i + 1 < argc) hog_gb = std::atof(argv[++i]);
             else if (a == "--configs" && i + 1 < argc) only = argv[++i];
+            else if (a == "--disk" && i + 1 < argc) disk = argv[++i];
         }
         EngineOptions opt;
         opt.slot_tokens = {(tokens + 512 + 255) / 256 * 256};  // slot sizes are multiples of 256
         if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;  // production runs ples_fp8
         opt.prefill_chunk = std::getenv("QW_PREFILL_CHUNK") ? std::atoi(std::getenv("QW_PREFILL_CHUNK")) : 4096;
         Engine e(opt);
-        unsetenv("QW_DISK_CACHE_DIR");
+        if (disk.empty()) unsetenv("QW_DISK_CACHE_DIR");
+        else setenv("QW_DISK_CACHE_DIR", disk.c_str(), 1);
         Hog hog;
         if (hog_gb > 0) hog.take(hog_gb);
         std::vector<Config> cfgs = all_configs(host_gb);

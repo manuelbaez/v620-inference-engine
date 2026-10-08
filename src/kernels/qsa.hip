@@ -293,6 +293,26 @@ void spill_cache_fill(const SlotPtrs *tab, const SpillCache &cache, hipStream_t 
     (void)hipMemsetAsync(cache.miss_n, 0, 4, s);
 }
 
+// One thread per 16 bytes of a layer's part.
+__global__ __launch_bounds__(256) void kv_pack_kernel(const SlotPtrs *tab, int slot, int64_t p0, int n, uint4 *dst) {
+    const SlotPtrs &sp = tab[slot];
+    const int l = blockIdx.y;
+    const size_t ku = size_t(n) * (HEAD_DIM / 8), cu = size_t(n / IDX_RATIO) * (IDX_DIM / 8), per = 2 * ku + cu;
+    const size_t u = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (u >= per) return;
+    const uint4 *src = u < ku       ? reinterpret_cast<const uint4 *>(sp.K[l]) + size_t(p0) * (HEAD_DIM / 8) + u
+                       : u < 2 * ku ? reinterpret_cast<const uint4 *>(sp.V[l]) + size_t(p0) * (HEAD_DIM / 8) + (u - ku)
+                                    : reinterpret_cast<const uint4 *>(sp.ck[l]) + size_t(p0 / IDX_RATIO) * (IDX_DIM / 8) +
+                                          (u - 2 * ku);
+    dst[size_t(l) * per + u] = *src;
+}
+
+void kv_pack(const SlotPtrs *tab, int slot, int layers, int64_t p0, int n, uint8_t *dst, hipStream_t s) {
+    const size_t per = 2 * size_t(n) * (HEAD_DIM / 8) + size_t(n / IDX_RATIO) * (IDX_DIM / 8);
+    kv_pack_kernel<<<dim3(unsigned((per + 255) / 256), unsigned(layers)), 256, 0, s>>>(tab, slot, p0, n,
+                                                                                    reinterpret_cast<uint4 *>(dst));
+}
+
 __global__ __launch_bounds__(256) void qsa_combine_B_kernel(const float *partial, const float *gate, __half *out) {
     const int r = blockIdx.x;
     combine_body(partial + size_t(r) * ATT_PART, gate + size_t(r) * QSA_LOCAL_HEADS * HEAD_DIM,

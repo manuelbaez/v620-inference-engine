@@ -748,6 +748,21 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          n-gram table locked), a standing reserve that refills only while idle, per-request timing in the request
          log, the QSA attention kernel (20.7% of
          GPU time at 60k of context), the SSD move for disk loads (23% of the TTFT time)
+   - [x] saves to the prefix cache (2026-10-08, section "What a save costs"): a block in VRAM is packed on the card
+         and copied once (39 copies before), a save resumes from the blocks the slot's last save walked instead of
+         hashing the prompt from its start, and eviction takes one pass over the nodes per save instead of one per
+         victim per tier. Bit-exact (the store tests). On the dev box the foreground time of a 200k-token prompt's
+         saves goes 1.12 -> 0.52 s; production's 60-120 ms per chunk is expected to be mostly the eviction scans
+         (both tiers full there): the new log line "prefix cache: N saves took ..." says where it goes. Open:
+         removing a disk victim waits for its pending write (seconds when the disk budget is smaller than a prefill)
+   - [x] fp8 against bf16 n-gram table, tasks and prefill (2026-10-08, "PLE n-gram table precision"): no task
+         difference (92.3% against 92.4% of 3,916, McNemar p = 0.73); next-token distributions: fp8 +0.006 (decode)
+         and +0.010 (prefill) mean |dlogprob| over bf16, int8 +0.003 and -0.0005 for 6 GB more than fp8
+   - [x] how much precision the outputs can use (2026-10-08, section of that name): the fp32 reference with the
+         engine's fp16 roundings is as far from fp32 as the engine is (0.042 against 0.044), any one rounding alone
+         costs half to three quarters of all of them, and a token computed in fp32 on a history built with fp16 is as
+         far off as one computed with fp16 (0.055 against 0.056). The arithmetic is at the floor of fp16 state;
+         a more precise decode path would buy nothing
    - [x] indexer selection at long context (2026-10-07, section "Indexer selection at long context"): the
          top-512 selection and its scores were 27% of GPU kernel time at 320k tokens of context and every card
          did all of it. Each card now scores a quarter of the groups and the cards merge their candidates, from
@@ -1410,7 +1425,28 @@ McNemar's exact test):
 | MMLU (1,425) | 86.6% | 86.0% | 14 / 6 | 0.12 |
 | ARC-Challenge (1,172) | 97.2% | 97.2% | 2 / 2 | 1.00 |
 | all (3,916) | 92.5% | 92.3% | 26 / 16 | 0.16 |
-| bf16 table | (to run) | | | |
+
+The fp8 and bf16 tables (2026-10-08, the current engine, the same questions, 4 at a time, chunk 4096):
+
+| task | fp8 table | bf16 table | right only with fp8 / bf16 | McNemar p |
+|---|---|---|---|---|
+| GSM8K (1,319) | 94.5% | 94.5% | 8 / 8 | 1.00 |
+| MMLU (1,425) | 86.2% | 86.7% | 3 / 10 | 0.09 |
+| ARC-Challenge (1,172) | 97.4% | 97.0% | 4 / 0 | 0.13 |
+| all (3,916) | 92.3% | 92.4% | 15 / 18 | 0.73 |
+
+and the distributions again, now also through prefill (all logits of one 4,000-token prefill, chunk 4096; decode is
+teacher-forced from 16 tokens as before; paired against the bf16 table, 95% CI):
+
+| table | decode | prefill |
+|---|---|---|
+| bf16 | 0.0444, 98.0% | 0.0441 |
+| int8 | 0.0476, 97.4%: +0.0032 (+0.0002, +0.0062) | 0.0436, 97.7%: -0.0005 (-0.0034, +0.0025) |
+| fp8 | 0.0503, 97.3%: +0.0059 (+0.0025, +0.0096) | 0.0535, 97.3%: +0.0095 (+0.0056, +0.0134) |
+
+The decode column reproduces 2026-09-28 to the digit. fp8 is the one table that is measurably off the original in
+both paths; int8 is not distinguishable from bf16 in prefill and half-way in decode, for 57.6 GB against 51.2. No task
+shows it (33 of 3,916 answers differ between fp8 and bf16, split 15 / 18).
 
 With ~1,200-1,400 questions per task, only accuracy differences of about 1-2
 points can show. The int8 table changed 42 of 3,916 outcomes, split 26/16:
@@ -2131,3 +2167,87 @@ part of ~5%: not worth building. What is left at depth is mostly the fixed cost 
 that had failed was tearing down on the same host (unpinning ~180 GB) while it ran. Something polls
 `/upstream/qw/qwen3.8-flash-next/metrics.json` on llama-swap once a minute and that starts the model after an unload;
 the clean runs above were taken with the production container stopped.
+
+## What a save costs (measured 2026-10-08)
+
+Production's request log books 60-120 ms of saves per 4,096-token chunk of a long prefill, more the deeper the
+conversation (6.9 s of a 166 s prefill of 312k tokens, 4%). Three things were in it.
+
+**Many small copies.** A chunk is 16 blocks of 256 tokens; `export_kv` copied each block per replica group, QSA
+layer and array: 78 `hipMemcpyAsync` of 16-128 KB per block, ~1,250 per chunk. Now a block that lies in VRAM is laid
+out on the card by one kernel (`kv_pack`, the block store's layout, a 3.7 MB scratch per card) and moved by one copy
+(`QW_KV_PACK=0`: as before). Blocks in a slot's spilled part keep the old path (they are in host memory already).
+
+**Hashing the prompt from its start.** `BlockStore::save` found its place by hashing every block of the prompt from
+the root (FNV over each token's bytes) and comparing it with the stored one: at 380k tokens, 1.5 MB hashed and ~1,500
+lookups per save, several saves per chunk. A slot now remembers the keys of the full blocks its last save walked;
+the next save takes them over while each is still in the store, has the expected parent and holds the prompt's
+tokens at its position (a memory compare), and hashes only what follows (`QW_SAVE_RESUME=0`: as before). The keys are
+the ones the full walk gives; a rewound slot or an evicted block ends the takeover at that block.
+
+`cold_prefill_bench --tokens 200000` (158 saves, no eviction, `QW_TRACE` times; two runs each):
+
+| | finding and exporting, per save below 50k / above 150k | waiting for the copies | all saves |
+|---|---|---|---|
+| before | 3.8 / 5.5 ms (5.0) | 2.8-3.3 ms | 1.12 s |
+| resume | 3.6 / 3.5 ms | | 0.99 s |
+| packed | 0.5 / 1.5 ms | | 0.61 s |
+| both | 0.4 / 0.4 ms | 2.8-3.3 ms | 0.52 s |
+
+That is 7 ms per save and ~22 ms per chunk before, a quarter of what production shows.
+
+**Eviction scanned every node for every victim.** With the RAM budget full, `enforce_budgets` looked for the least
+recently used node that could go by iterating all of `nodes_`, once per victim, and again per victim for the disk
+budget: in production both tiers are full (48 GB, 200 GB; ~17k nodes), so every saved block cost two passes over the
+map. Now one pass per call builds a heap of the candidates and an eviction can only add the victim's nearest remaining
+ancestor to it (the same order: least recently used, deeper first). 238 RAM evictions took 0.01 s in the run below.
+This is the part the dev runs above do not have, and by its size the likely bulk of production's figure; `save()` now
+logs where its time went once it adds up to a second ("prefix cache: N saves (B blocks) took ...: finding and
+exporting, waiting for the copies, queueing disk writes, thinning, evicting from RAM, from disk"), which will say.
+
+Tests (bit-exact): `test_kv_replicas`, `test_block_store` (also with both switches off), `test_host_tier`,
+`test_disk_tier`, `test_disk_load`, `test_spill` pass with all three changes.
+
+**Found on the way, open.** `DiskTier::remove` waits for the victim's pending write before it unlinks. With a disk
+budget smaller than what one prefill writes (`cold_prefill_bench --disk DIR`, 12 GB, RAM 2 GB) the victims are the
+prompt's own newest files, still queued: 0.3-2.5 s per eviction, 186 s for the 200k prompt against 88 without a store.
+Production's tier holds many conversations and evicts old files, so it should not meet this, but the unlink itself
+also runs in the prefill's thread; removals belong in the writer's queue.
+
+## How much precision the outputs can use (measured 2026-10-08)
+
+The question: can the engine get closer to the fp32 reference than 0.044 mean |dlogprob| without giving up speed?
+The fp32 CPU reference got switches for experiments (`src/ref/ref_model.cpp`): `QW_REF_NOISE=eps` scales every block
+output by 1 + eps * u, `QW_REF_F16=in,out,kv,q,act` rounds the named tensors to fp16 as the engine does (a block's
+input, a block's output, the stored K and V, the attention queries, the activations entering an output projection),
+`QW_REF_F16_ROWS=a:b` only at those positions. Each run is the 4,000-token set against the plain reference.
+
+| the reference with | mean \|dlogprob\| | median |
+|---|---|---|
+| noise 6e-8 (fp32-sized) | 0.0000-0.0009 | < 1e-5 |
+| noise 1e-5 | 0.0009 | 1e-5 |
+| noise 2.4e-4 (fp16-sized) | 0.037 | 7e-5 |
+| fp16: block inputs / block outputs / activations / K and V / queries, one at a time | 0.034 / 0.034 / 0.031 / 0.027 / 0.021 | 6-8e-5 |
+| fp16: inputs and outputs | 0.045 | |
+| fp16: everything but the block outputs (the decode path) | 0.039 | |
+| fp16: all five (the prefill path) | 0.042 | 8e-5 |
+| the engine, bf16 table: prefill / decode | 0.0441 / 0.0444 | 8e-5 / 7e-5 |
+
+- **The engine adds nothing of its own.** The reference with the engine's roundings is as far from fp32 as the engine
+  (0.042 against 0.044), and at the same positions: the correlation of the log errors of the engine and of the
+  reference with fp16-sized noise is 0.95.
+- **The error is a few large deviations.** The median is 1e-4; 12-14% of the positions are off by more than 0.1 and
+  hold 84% of the sum; they are where the model is unsure (reference top-1 below 0.9: 0.12-0.16, above: 0.003), in
+  runs of 1.5 tokens on average.
+- **It grows with the size of the rounding and saturates in the number of places**: 24 times the noise gives 43 times
+  the error, but one fp16 tensor alone costs half to three quarters of all five. Removing some roundings buys little.
+- **A history built with fp16 decides.** Rounding only the first 1,000 tokens leaves the tokens 1,000-2,047, computed
+  in fp32 on that history, 0.055 off; rounding everything gives 0.056 there. So decode in fp32 (cheap: its GEMVs are
+  bound by the weights' bytes, not the activations') would change nothing while the KV and the recurrent state come
+  from fp16 arithmetic, and those would need fp32 K/V (twice the KV memory) and fp32 GEMM outputs in prefill (rocBLAS
+  is 3-5 times slower there).
+
+Conclusion: fp16 arithmetic is at its floor here; nothing to build. What still moves the outputs is what the weights
+are: the n-gram table (above: int8 or bf16 instead of fp8) and the routed experts' int4, which has never been compared
+with the original (roadmap, NVFP4 note: it needs the original experts of some layers).
+

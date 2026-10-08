@@ -55,6 +55,10 @@ void qsa_attend_B(const uint16_t *q16, const float *gate, const float *iq, const
 // End of a decode step: copies the rows the step's attention listed as misses into the SpillCache, and empties the list.
 void spill_cache_fill(const SlotPtrs *tab, const SpillCache &cache, hipStream_t s);
 
+// The KV of positions [p0, p0 + n) of a slot, all of them in VRAM, in the block store's layout (per layer: K, V, the
+// compressed keys of the n / 4 groups) into dst: one copy then moves a block to host memory instead of three per layer.
+void kv_pack(const SlotPtrs *tab, int slot, int layers, int64_t p0, int n, uint8_t *dst, hipStream_t s);
+
 // Experiment (QW_SPILL_LOCALITY): for one-row steps of a spilled slot, how recently each spilled group the row selects
 // was selected before (by the slot's earlier positions), i.e. what a cache keeping the groups of the last K steps would
 // hit. last [slots][QSA_LAYERS_MAX][groups] (position that last selected a group, initialised very negative); stats

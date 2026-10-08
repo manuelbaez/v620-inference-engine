@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <queue>
 #include <thread>
 
 #include "core/common.hpp"
@@ -45,6 +46,7 @@ BlockStore::BlockStore(Engine &e, size_t ram_budget, const std::string &disk_dir
     if (const char *t = std::getenv("QW_KV_PAIRS")) kv_pairs_ = std::atoi(t) != 0;
     if (const char *t = std::getenv("QW_KV_PAIR_CHECK")) pair_check_ = std::max(0, std::atoi(t));
     if (const char *t = std::getenv("QW_SNAP_KEEP_GAP")) keep_gap_ = std::max<int64_t>(0, std::atoll(t));
+    if (const char *t = std::getenv("QW_SAVE_RESUME")) save_resume_ = std::atoi(t) != 0;
     kv_copies_ = kv_pairs_ ? RANKS / cfg::KV_REPLICAS : RANKS;
     // QW_POOL_RESERVE_GB: pinned memory kept free for a burst of saves. The pools pin it a while after start and top it
     // up one arena at a time after a quiet period, never while a prefill is taking buffers: pinning holds the
@@ -405,7 +407,22 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
     QW_CHECK(n > 0, "BlockStore::save: no tokens");
     std::vector<uint64_t> path, fresh;
     uint64_t h = ROOT;
-    for (int64_t pos = 0; pos < n;) {
+    int64_t pos = 0;
+    // The full blocks this slot's last save walked, while they are still stored and still hold this prompt's tokens:
+    // their keys are known, so only the blocks after them are hashed (a save used to hash the whole prompt).
+    if (cursors_.size() <= size_t(slot)) cursors_.resize(size_t(slot) + 1);
+    std::vector<uint64_t> &cur = cursors_[size_t(slot)];
+    for (size_t i = 0; save_resume_ && i < cur.size() && pos + BLOCK <= n; ++i) {
+        const Node *nd = find(cur[i]);
+        if (!nd || nd->parent != h || nd->tokens.size() != size_t(BLOCK) ||
+            !std::equal(nd->tokens.begin(), nd->tokens.end(), tokens.begin() + ptrdiff_t(pos)))
+            break;
+        path.push_back(cur[i]);
+        h = cur[i];
+        pos += BLOCK;
+    }
+    cur.clear();
+    while (pos < n) {
         const size_t len = size_t(std::min<int64_t>(BLOCK, n - pos));
         uint64_t k = child(h, tokens.data() + pos, len);
         if (!k) {
@@ -428,6 +445,7 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
         h = k;
         pos += int64_t(len);
     }
+    cur.assign(path.begin(), path.begin() + ptrdiff_t(n / BLOCK));
     Node &target = nodes_.at(h);
     target.anchor = target.anchor || anchor;
     const bool new_snap = !target.has_snap;
@@ -442,6 +460,7 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
     }
     const auto t1 = std::chrono::steady_clock::now();
     e_.host_copies_wait();
+    const auto t2 = std::chrono::steady_clock::now();
     if (kv_pairs_ && pair_check_ > 0)
         for (uint64_t k : fresh)
             if (++pair_checked_ % uint64_t(pair_check_) == 0) {
@@ -478,8 +497,28 @@ void BlockStore::save(int slot, int snap, const std::vector<int32_t> &tokens, co
             disk_bytes_ += b;
         }
     }
+    const auto t3 = std::chrono::steady_clock::now();
     if (keep_gap_ > 0) thin(path, tokens);
+    const auto t4 = std::chrono::steady_clock::now();
     enforce_budgets();
+    // where the saves' time went, once they add up to a second (a long prefill; QW_TRACE: always)
+    const auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
+    SaveProf &sp = save_prof_;
+    ++sp.saves;
+    sp.blocks += fresh.size();
+    sp.export_s += secs(t0, t1);
+    sp.copies_s += secs(t1, t2);
+    sp.queue_s += secs(t2, t3);
+    sp.thin_s += secs(t3, t4);
+    sp.total_s += secs(t0, std::chrono::steady_clock::now());
+    if (sp.total_s >= 1.0 || (trace && sp.saves >= 64)) {
+        log("prefix cache: %llu saves (%llu blocks) took %.2f s: finding and exporting %.2f, waiting for the copies %.2f, "
+            "queueing disk writes %.2f, thinning %.2f, evicting from RAM %.2f (%llu), from disk %.2f (%llu)",
+            (unsigned long long)sp.saves, (unsigned long long)sp.blocks, sp.total_s, sp.export_s, sp.copies_s, sp.queue_s,
+            sp.thin_s, sp.evict_ram_s, (unsigned long long)sp.ram_evictions, sp.evict_disk_s,
+            (unsigned long long)sp.disk_evictions);
+        sp = SaveProf{};
+    }
 }
 
 void BlockStore::drop_snapshot(uint64_t k) {
@@ -583,36 +622,90 @@ void BlockStore::remove_subtree(uint64_t k) {
 // its RAM copies up (kept on disk, or removed without a disk tier). Disk: the
 // least recently used leaf is removed. Deeper nodes go first on ties.
 void BlockStore::enforce_budgets() {
-    auto older = [](const Node &a, const Node &b) {
-        return a.used < b.used || (a.used == b.used && a.start > b.start);
+    if (ram_bytes_ <= ram_budget_ && !(disk_ && disk_bytes_ > disk_budget_)) return;
+    // The victims in order, oldest first: one pass over the nodes builds the heap of those that can go now, and
+    // evicting one can only make its nearest remaining ancestor a candidate (the store used to scan every node for
+    // every victim: with the RAM and disk budgets full, each saved block cost two scans of ~17k nodes in production).
+    struct Cand {
+        uint64_t used;
+        int64_t start;
+        uint64_t k;
     };
-    while (ram_bytes_ > ram_budget_) {
-        uint64_t victim = 0;
-        for (const auto &[k, nd] : nodes_) {
-            if (k == ROOT || (!nd.kv && !nd.snap)) continue;
-            bool leaf = true;
-            for (uint64_t c : nd.children) leaf = leaf && !nodes_.at(c).kv && !nodes_.at(c).snap;
-            if (leaf && (!victim || older(nd, nodes_.at(victim)))) victim = k;
+    const auto later = [](const Cand &a, const Cand &b) {
+        if (a.used != b.used) return a.used > b.used;
+        return a.start != b.start ? a.start < b.start : a.k > b.k;
+    };
+    using Heap = std::priority_queue<Cand, std::vector<Cand>, decltype(later)>;
+    const auto in_ram = [](const Node &nd) { return nd.kv || nd.snap; };
+    const auto ram_leaf = [&](const Node &nd) {
+        for (uint64_t c : nd.children)
+            if (in_ram(nodes_.at(c))) return false;
+        return true;
+    };
+    // the ancestors a removal of k can erase (remove_subtree drops those left without children or a snapshot), up
+    // to and including the first that stays
+    const auto chain = [&](uint64_t k) {
+        std::vector<uint64_t> up;
+        for (uint64_t p = nodes_.at(k).parent; p != ROOT; p = nodes_.at(p).parent) {
+            up.push_back(p);
+            const Node &nd = nodes_.at(p);
+            if (nd.children.size() > 1 || nd.has_snap) break;
         }
-        if (!victim) break;
-        Node &nd = nodes_.at(victim);
-        if (disk_) {
-            ram_bytes_ -= ram_size(nd);
-            nd.kv.reset();
-            nd.snap.reset();
-            nd.logits = {};
-            nd.logits.shrink_to_fit();
-        } else {
-            remove_subtree(victim);
-        }
-    }
-    while (disk_ && disk_bytes_ > disk_budget_) {
-        uint64_t victim = 0;
+        return up;
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    if (ram_bytes_ > ram_budget_) {
+        Heap heap(later);
         for (const auto &[k, nd] : nodes_)
-            if (k != ROOT && nd.children.empty() && (!victim || older(nd, nodes_.at(victim)))) victim = k;
-        if (!victim) break;
-        remove_subtree(victim);
+            if (k != ROOT && in_ram(nd) && ram_leaf(nd)) heap.push({uint64_t(nd.used), nd.start, k});
+        while (ram_bytes_ > ram_budget_ && !heap.empty()) {
+            const uint64_t victim = heap.top().k;
+            heap.pop();
+            const auto it = nodes_.find(victim);
+            if (it == nodes_.end() || !in_ram(it->second) || !ram_leaf(it->second)) continue;
+            Node &nd = it->second;
+            const std::vector<uint64_t> up = disk_ ? std::vector<uint64_t>{nd.parent} : chain(victim);
+            if (disk_) {
+                ram_bytes_ -= ram_size(nd);
+                nd.kv.reset();
+                nd.snap.reset();
+                nd.logits = {};
+                nd.logits.shrink_to_fit();
+            } else {
+                remove_subtree(victim);
+            }
+            ++save_prof_.ram_evictions;
+            for (uint64_t a : up) {  // the nearest ancestor still there may hold the deepest RAM copy now
+                const auto ai = nodes_.find(a);
+                if (a == ROOT || ai == nodes_.end()) continue;
+                if (in_ram(ai->second) && ram_leaf(ai->second)) heap.push({uint64_t(ai->second.used), ai->second.start, a});
+                break;
+            }
+        }
     }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (disk_ && disk_bytes_ > disk_budget_) {
+        Heap heap(later);
+        for (const auto &[k, nd] : nodes_)
+            if (k != ROOT && nd.children.empty()) heap.push({uint64_t(nd.used), nd.start, k});
+        while (disk_bytes_ > disk_budget_ && !heap.empty()) {
+            const uint64_t victim = heap.top().k;
+            heap.pop();
+            const auto it = nodes_.find(victim);
+            if (it == nodes_.end() || !it->second.children.empty()) continue;
+            const std::vector<uint64_t> up = chain(victim);
+            remove_subtree(victim);
+            ++save_prof_.disk_evictions;
+            for (uint64_t a : up) {  // the nearest ancestor still there is a leaf now, unless it has other children
+                const auto ai = nodes_.find(a);
+                if (ai == nodes_.end()) continue;
+                if (ai->second.children.empty()) heap.push({uint64_t(ai->second.used), ai->second.start, a});
+                break;
+            }
+        }
+    }
+    save_prof_.evict_ram_s += std::chrono::duration<double>(t1 - t0).count();
+    save_prof_.evict_disk_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
 }
 
 void BlockStore::reserve(size_t blocks, size_t snapshots) {

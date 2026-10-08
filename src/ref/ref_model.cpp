@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <numeric>
+#include <string>
 
 #include "core/common.hpp"
 
@@ -118,6 +121,29 @@ void Model::expert_linear(const TensorView &packed, const TensorView &scale, con
     });
 }
 
+// QW_REF_F16=in,out,kv,q,act (experiment): the named tensors are rounded to fp16 as the engine's are, one kind at a
+// time or together, to see which of the engine's fp16 roundings move the outputs: in = a block's input (the mixer's
+// output), out = a block's output, kv = the stored K and V, q = the attention queries, act = the attention and GDN
+// outputs that enter the output projection.
+static bool ref_f16(const char *site) {
+    static const std::string on = std::string(",") + (std::getenv("QW_REF_F16") ? std::getenv("QW_REF_F16") : "") + ",";
+    return on.find(std::string(",") + site + ",") != std::string::npos;
+}
+// QW_REF_F16_ROWS=a:b limits the rounding to the tokens at positions [a, b) of the call (a prompt run in one call):
+// what a rounded history costs the tokens after it, against what rounding a token's own computation costs.
+static bool ref_f16_row(int64_t t) {
+    static const char *e = std::getenv("QW_REF_F16_ROWS");
+    static const int64_t a = e ? std::atoll(e) : 0, b = e && std::strchr(e, ':') ? std::atoll(std::strchr(e, ':') + 1) : INT64_MAX;
+    return t >= a && t < b;
+}
+static void round16(float *p, size_t n) {
+    for (size_t i = 0; i < n; ++i) p[i] = f16_to_f32(f32_to_f16(p[i]));
+}
+static void round16_rows(float *p, int T, size_t width) {
+    for (int t = 0; t < T; ++t)
+        if (ref_f16_row(t)) round16(p + size_t(t) * width, width);
+}
+
 void Model::hc_mix(const std::string &prefix, bool with_inject, const float *X, int T, float *block_in, float *inj) {
     std::vector<float> w = bf16_vec(st_.get(prefix + "hc_norm.weight", DType::BF16, {HCH}));
     std::vector<float> xn(size_t(T) * HCH);
@@ -142,15 +168,36 @@ void Model::hc_mix(const std::string &prefix, bool with_inject, const float *X, 
             }
             block_in[size_t(t) * H + j] = acc / HC;
         }
+    static const bool in16 = ref_f16("in");
+    if (in16) round16_rows(block_in, T, H);
+}
+
+// QW_REF_NOISE=eps (experiment): every block output is scaled by 1 + eps * u, u uniform in [-1, 1] per value (a hash
+// of QW_REF_NOISE_SEED, the call and the index), before it joins the residual streams: a stand-in for arithmetic that
+// rounds each block's output at relative precision eps (fp32 ~6e-8, fp16 ~2.4e-4). Measures how far the next-token
+// distribution moves for a given precision (docs/DESIGN.md "How much precision the outputs can use").
+static float ref_noise(uint64_t call, size_t i) {
+    static const double eps = std::getenv("QW_REF_NOISE") ? std::atof(std::getenv("QW_REF_NOISE")) : 0.0;
+    static const uint64_t seed = std::getenv("QW_REF_NOISE_SEED") ? std::strtoull(std::getenv("QW_REF_NOISE_SEED"), nullptr, 10) : 1;
+    if (eps == 0.0) return 1.f;
+    uint64_t z = (seed * 0x9e3779b97f4a7c15ull) ^ (call * 0xbf58476d1ce4e5b9ull) ^ (uint64_t(i) + 0x94d049bb133111ebull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    z ^= z >> 31;
+    return float(1.0 + eps * (double(z >> 11) * (2.0 / 9007199254740992.0) - 1.0));
 }
 
 void Model::combine(float *X, const float *block_out, const float *inj, int T) {
+    static uint64_t calls = 0;
+    const uint64_t call = calls++;
+    static const bool out16 = ref_f16("out");
     for (int t = 0; t < T; ++t)
         for (int s = 0; s < HC; ++s) {
             float w = 2.f * sigmoidf(inj[t * HC + s] / HC);
             float *x = X + size_t(t) * HCH + s * H;
             const float *b = block_out + size_t(t) * H;
-            for (int j = 0; j < H; ++j) x[j] += b[j] * w;
+            for (int j = 0; j < H; ++j)
+                x[j] += (out16 && ref_f16_row(t) ? f16_to_f32(f32_to_f16(b[j])) : b[j]) * ref_noise(call, size_t(t) * H + size_t(j)) * w;
         }
 }
 
@@ -282,6 +329,8 @@ void Model::gdn(State &st, int layer, const float *x, int T, float *out) {
             }
         });
     }
+    static const bool gact16 = ref_f16("act");
+    if (gact16) round16_rows(o.data(), T, o.size() / size_t(T));
     linear(st_.get(p + "out_proj.weight", DType::BF16, {H, GDN_VAL}), o.data(), T, GDN_VAL, out, H);
 }
 
@@ -301,6 +350,7 @@ void Model::qsa(State &st, int layer, const float *x, int T, float *out) {
     auto iqn = bf16_vec(st_.get(p + "indexer.q_layernorm.weight", DType::BF16, {IDX_DIM}));
     auto ikn = bf16_vec(st_.get(p + "indexer.k_layernorm.weight", DType::BF16, {IDX_DIM}));
 
+    static const bool kv16 = ref_f16("kv"), q16 = ref_f16("q"), act16 = ref_f16("act");
     const int64_t base = st.n_tokens;
     std::vector<float> q(size_t(T) * Q_HEADS * HEAD_DIM), gate(size_t(T) * Q_HEADS * HEAD_DIM),
         iqh(size_t(T) * IDX_HEADS * IDX_DIM);
@@ -311,6 +361,7 @@ void Model::qsa(State &st, int layer, const float *x, int T, float *out) {
             float *qh = q.data() + (size_t(t) * Q_HEADS + h) * HEAD_DIM;
             rmsnorm(src, qh, HEAD_DIM, qn.data(), true);
             rope(qh, pos);
+            if (q16 && ref_f16_row(t)) round16(qh, HEAD_DIM);
             std::copy(src + HEAD_DIM, src + 2 * HEAD_DIM, gate.data() + (size_t(t) * Q_HEADS + h) * HEAD_DIM);
         }
         for (int j = 0; j < KV_HEADS; ++j) {
@@ -318,7 +369,9 @@ void Model::qsa(State &st, int layer, const float *x, int T, float *out) {
             float tmp[HEAD_DIM];
             rmsnorm(kh, tmp, HEAD_DIM, kn.data(), true);
             rope(tmp, pos);
+            if (kv16 && ref_f16_row(t)) round16(tmp, HEAD_DIM);
             std::copy(tmp, tmp + HEAD_DIM, kh);
+            if (kv16 && ref_f16_row(t)) round16(v.data() + size_t(t) * KV + j * HEAD_DIM, HEAD_DIM);
         }
         for (int h = 0; h < IDX_HEADS; ++h) {
             float *dst = iqh.data() + (size_t(t) * IDX_HEADS + h) * IDX_DIM;
@@ -400,6 +453,7 @@ void Model::qsa(State &st, int layer, const float *x, int T, float *out) {
             }
         }
     });
+    if (act16) round16_rows(o.data(), T, o.size() / size_t(T));
     linear(st_.get(p + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), o.data(), T, Q_HEADS * HEAD_DIM, out, H);
 }
 

@@ -141,6 +141,10 @@ struct Rank {
     hipEvent_t stage_ready = nullptr, stage_free = nullptr;
     std::array<hipEvent_t, 2> stage_done{};
     gpu::SlotPtrs *dtab = nullptr;
+    // export_kv packs a block of up to KV_PACK_TOKENS positions here in the block store's layout, then copies it once
+    static constexpr int KV_PACK_TOKENS = 256;
+    uint8_t *pack = nullptr;
+    size_t pack_bytes = 0;
     int32_t **pen_tab = nullptr;  // device [slots]: each slot's pen
     // recurrent-state snapshots (pool, any slot)
     struct Snap {
