@@ -753,11 +753,14 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          hashing the prompt from its start, and eviction takes one pass over the nodes per save instead of one per
          victim per tier. Bit-exact (the store tests). On the dev box the foreground time of a 200k-token prompt's
          saves goes 1.12 -> 0.52 s; production's 60-120 ms per chunk is expected to be mostly the eviction scans
-         (both tiers full there): the new log line "prefix cache: N saves took ..." says where it goes. Open:
-         removing a disk victim waits for its pending write (seconds when the disk budget is smaller than a prefill)
+         (both tiers full there): the new log line "prefix cache: N saves took ..." says where it goes. Removing
+         a disk victim no longer waits for its pending write or unlinks in the prefill's thread (a 100k-token prompt
+         with a 6 GB tier: 44.7 s against 44.0 without a store; 186 against 88 s at 200k / 12 GB before). In
+         production since 2026-10-08 16:18 UTC (`qw-engine:b4e6fd4`); the production figure is still to read
    - [x] fp8 against bf16 n-gram table, tasks and prefill (2026-10-08, "PLE n-gram table precision"): no task
          difference (92.3% against 92.4% of 3,916, McNemar p = 0.73); next-token distributions: fp8 +0.006 (decode)
-         and +0.010 (prefill) mean |dlogprob| over bf16, int8 +0.003 and -0.0005 for 6 GB more than fp8
+         and +0.010 (prefill) mean |dlogprob| over bf16, int8 +0.003 and -0.0005 for 6 GB more than fp8.
+         Production runs the int8 table since 2026-10-08 16:18 UTC (the owner's choice)
    - [x] how much precision the outputs can use (2026-10-08, section of that name): the fp32 reference with the
          engine's fp16 roundings is as far from fp32 as the engine is (0.042 against 0.044), any one rounding alone
          costs half to three quarters of all of them, and a token computed in fp32 on a history built with fp16 is as
@@ -1454,6 +1457,11 @@ no measurable task effect. The distribution result and the task result measure
 different things: int8 brings the next-token probabilities measurably closer
 to the original model's, but greedy final answers on these tasks almost never
 depend on that difference.
+
+**Decision (2026-10-08): production runs the int8 table** (`ples_int8`, 57.6 GB pinned in 200 s at a cold start;
+65 GiB of host memory available with the engine up), after the measurements above: equal to bf16 through prefill,
+half of fp8's gap in decode, 6 GB more than fp8. `--ple-dir` in llama-swap's qw entry (backup
+`config.yaml.bak-before-ple-int8-1008`). Before that:
 
 **Decision (2026-09-28): production runs the official fp8 table** (`ples_fp8`,
 51.2 GB) with a 160 GB host prefix cache. The bf16 table plus a 128 GB cache
@@ -2208,11 +2216,16 @@ exporting, waiting for the copies, queueing disk writes, thinning, evicting from
 Tests (bit-exact): `test_kv_replicas`, `test_block_store` (also with both switches off), `test_host_tier`,
 `test_disk_tier`, `test_disk_load`, `test_spill` pass with all three changes.
 
-**Found on the way, open.** `DiskTier::remove` waits for the victim's pending write before it unlinks. With a disk
-budget smaller than what one prefill writes (`cold_prefill_bench --disk DIR`, 12 GB, RAM 2 GB) the victims are the
-prompt's own newest files, still queued: 0.3-2.5 s per eviction, 186 s for the 200k prompt against 88 without a store.
-Production's tier holds many conversations and evicts old files, so it should not meet this, but the unlink itself
-also runs in the prefill's thread; removals belong in the writer's queue.
+**Removing a disk victim waited for the disk (fixed 2026-10-08).** `DiskTier::remove` waited for the victim's
+pending write before it unlinked, in the prefill's thread. With a disk budget smaller than what one prefill writes
+(`cold_prefill_bench --disk DIR`, 12 GB, RAM 2 GB) the victims are the prompt's own newest files, still queued: 0.3-2.5
+s per eviction, 186 s for the 200k prompt against 88 without a store. Now `remove` drops a write of the file that is
+still in the queue (its buffers are released, nothing is written) and queues the unlink behind the writes, so a later
+write of the same file still comes after it; `flush` also waits for the job in progress. The same kind of run after
+(100k tokens, 6 GB tier, 2 GB RAM): 44.7 s against 44.0 without a store, all saves together under a second.
+`test_disk_tier` (no GPU): removals behind queued writes return at once, the removed files are gone after a flush,
+the others and a file written again after its removal are there with the new bytes; `test_block_store`,
+`test_disk_load` and `test_host_tier` pass.
 
 ## How much precision the outputs can use (measured 2026-10-08)
 

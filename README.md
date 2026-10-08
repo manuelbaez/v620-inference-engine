@@ -37,7 +37,7 @@ reusable across turns without re-prefilling.
 The n-gram (PLE) table never goes to the GPUs. It stays pinned in host RAM and
 the host gathers 16 rows per token. It comes in three precisions (int4 30 GB,
 int8 54 GB, the original bf16 102 GB, and the official fp8 51 GB;
-`--ple-dir`); production runs the official fp8 table (docs/DESIGN.md, "PLE
+`--ple-dir`); production runs the int8 table since 2026-10-08 (docs/DESIGN.md, "PLE
 n-gram table precision").
 
 ## Serving
@@ -104,7 +104,7 @@ Measured through HTTP (2026-09-24/25):
 - `/mnt/llms/qwen3.8-flash-next-ple/ples_int4`, `ples_int8`, `ples_fp8`, `ples_bf16`: the
   n-gram table sidecar in four precisions (int4 is the `--ple-dir` default; bf16 is Qwen's
   original, `tools/ple_download.py` + `tools/ple_convert.py`; fp8 is from Qwen's FP8
-  checkpoint, `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8`; production runs fp8)
+  checkpoint, `tools/ple_download.py OUT Qwen/Qwen3.8-Flash-Next-FP8`; production runs int8)
 
 ## Layout
 
