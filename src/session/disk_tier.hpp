@@ -52,8 +52,11 @@ public:
     // several ranks share (a store that keeps one KV copy per replica group) is read once; into separate buffers,
     // the replicas of a v2 block get a copy of their group's bytes.
     bool read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size_t rank_bytes, std::vector<float> *logits);
+    // Removes a file without waiting for the disk: a write of it still in the queue is dropped, and the unlink is
+    // queued behind the writes (a save evicting from a full tier used to wait here for the victim's pending write,
+    // seconds on a slow disk, and to unlink in the prefill's thread). A later write of the same file comes after it.
     void remove(uint64_t hash, bool snap);
-    // Blocks until queued writes are on disk.
+    // Blocks until queued writes and removals are done.
     void flush();
     // Bytes of files queued or being written; their pinned buffers stay held until then.
     size_t pending_bytes() const;
@@ -66,6 +69,7 @@ private:
         size_t rank_bytes;
         std::shared_ptr<const void> keep;
         size_t bytes = 0;  // the file's size
+        bool remove = false;  // unlink the file (m.hash, m.snap) instead of writing one
     };
     std::string path(uint64_t hash, bool snap) const;
     void writer_loop();
@@ -79,6 +83,7 @@ private:
     std::deque<Job> queue_;
     std::set<std::pair<uint64_t, bool>> pending_;  // queued or being written
     size_t pending_bytes_ = 0;
+    bool working_ = false;  // the writer is on a job it took from the queue
     bool stop_ = false;
     std::thread writer_;
 };

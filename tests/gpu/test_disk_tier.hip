@@ -180,6 +180,47 @@ int main() {
             check(same, "every rank gets its group's bytes, replicas included");
             check(d.read(7001, false, into_four, RB, nullptr) && out[0] == 1 && out[3 * RB + RB - 1] == 1, "a v1 block still reads");
         }
+        {  // remove() never waits for the disk: queued writes are dropped, files go once the writer gets to them
+            const auto exists = [&](uint64_t h) {
+                struct stat st{};
+                char name[64];
+                std::snprintf(name, sizeof name, "/%016llx.qwb", (unsigned long long)h);
+                return stat((dir + name).c_str(), &st) == 0;
+            };
+            const auto put = [&](uint64_t h, int fill) {
+                auto buf = std::make_shared<std::vector<uint8_t>>(size_t(RANKS) * RANK_BYTES, uint8_t(fill));
+                Engine::RankBufs bufs;
+                for (int r = 0; r < RANKS; ++r) bufs[size_t(r)] = buf->data() + size_t(r) * RANK_BYTES;
+                DiskTier::Meta m;
+                m.hash = h;
+                m.parent = 7;
+                m.tokens.assign(256, 1);
+                d.write(m, {}, bufs, RANK_BYTES, buf);
+            };
+            d.flush();
+            check(exists(1000) && exists(1001), "the first files are on disk");
+            for (int i = 0; i < 40; ++i) put(9000 + uint64_t(i), i);  // ~480 MB queued
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 20; i < 40; ++i) d.remove(9000 + uint64_t(i), false);  // most of them still queued
+            d.remove(1000, false);                                                // long on disk
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            std::printf("21 removals behind %zu MB of queued writes took %.2f ms\n", d.pending_bytes() >> 20, ms);
+            check(ms < 100, "removals do not wait for the queued writes");
+            put(9030, 77);  // written again after its removal
+            d.flush();
+            check(d.pending_bytes() == 0, "pending bytes are zero after the removals");
+            bool gone = !exists(1000);
+            for (int i = 20; i < 40; ++i) gone = gone && (i == 30 || !exists(9000 + uint64_t(i)));
+            check(gone, "removed files are not on disk after flush");
+            bool kept = exists(1001) && exists(9030);
+            for (int i = 0; i < 20; ++i) kept = kept && exists(9000 + uint64_t(i));
+            check(kept, "the other files, and the one written again, are");
+            std::vector<uint8_t> back(size_t(RANKS) * RANK_BYTES);
+            Engine::RankBufs rb;
+            for (int r = 0; r < RANKS; ++r) rb[size_t(r)] = back.data() + size_t(r) * RANK_BYTES;
+            check(d.read(9030, false, rb, RANK_BYTES, nullptr) && back[0] == 77 && back.back() == 77,
+                  "the file written again holds the new bytes");
+        }
         d.flush();
         check(d.pending_bytes() == 0, "pending bytes are zero at the end");
         std::system(("rm -rf " + dir).c_str());

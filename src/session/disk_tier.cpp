@@ -142,13 +142,20 @@ void DiskTier::writer_loop() {
             if (queue_.empty()) return;  // stopping, nothing left
             job = std::move(queue_.front());
             queue_.pop_front();
+            working_ = true;
         }
-        write_file(job);
+        if (job.remove)
+            std::remove(path(job.m.hash, job.m.snap).c_str());
+        else
+            write_file(job);
         job.keep.reset();  // release the buffers outside the lock
         {
             std::lock_guard<std::mutex> lk(mu_);
-            pending_.erase({job.m.hash, job.m.snap});
-            pending_bytes_ -= job.bytes;
+            if (!job.remove) {
+                pending_.erase({job.m.hash, job.m.snap});
+                pending_bytes_ -= job.bytes;
+            }
+            working_ = false;
         }
         done_cv_.notify_all();
     }
@@ -230,8 +237,28 @@ bool DiskTier::read(uint64_t hash, bool snap, const Engine::RankBufs &bufs, size
 }
 
 void DiskTier::remove(uint64_t hash, bool snap) {
-    wait_written(hash, snap);
-    std::remove(path(hash, snap).c_str());
+    std::shared_ptr<const void> dropped;  // a cancelled write's buffers, released outside the lock
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // a write of it still waiting in the queue is dropped (the one being written, if any, finishes first: the
+        // unlink below is queued behind it)
+        if (pending_.count({hash, snap}))
+            for (auto it = queue_.begin(); it != queue_.end(); ++it)
+                if (!it->remove && it->m.hash == hash && it->m.snap == snap) {
+                    pending_.erase({hash, snap});
+                    pending_bytes_ -= it->bytes;
+                    dropped = std::move(it->keep);
+                    queue_.erase(it);
+                    break;
+                }
+        Job j;
+        j.m.hash = hash;
+        j.m.snap = snap;
+        j.remove = true;
+        queue_.push_back(std::move(j));
+    }
+    cv_.notify_all();
+    done_cv_.notify_all();
 }
 
 size_t DiskTier::pending_bytes() const {
@@ -241,7 +268,7 @@ size_t DiskTier::pending_bytes() const {
 
 void DiskTier::flush() {
     std::unique_lock<std::mutex> lk(mu_);
-    done_cv_.wait(lk, [&] { return queue_.empty() && pending_.empty(); });
+    done_cv_.wait(lk, [&] { return queue_.empty() && pending_.empty() && !working_; });
 }
 
 }  // namespace qw
