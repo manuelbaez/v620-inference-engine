@@ -6,10 +6,11 @@ export const count = n => n == null ? "-"
   : n >= 1e4 ? (n / 1e3).toFixed(1) + " k"
   : String(Math.round(n));
 
+// Binary units (1 GiB = 2^30 bytes), as memory hardware is specified: a 32 GiB card reads 32.0 GiB.
 export const bytes = b => b == null ? "-"
-  : b >= 1e12 ? (b / 1e12).toFixed(1) + " TB"
-  : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB"
-  : (b / 1e6).toFixed(1) + " MB";
+  : b >= 2 ** 40 ? (b / 2 ** 40).toFixed(1) + " TiB"
+  : b >= 2 ** 30 ? (b / 2 ** 30).toFixed(1) + " GiB"
+  : (b / 2 ** 20).toFixed(1) + " MiB";
 
 export const seconds = s => s == null ? "-"
   : s < 120 ? s.toFixed(1) + " s"
