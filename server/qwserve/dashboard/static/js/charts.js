@@ -10,14 +10,15 @@
 const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const L = 48, R = 8, T = 8, B = 20;
 
-export function lineChart(canvas, history, series, windowS, minMax) {
-  canvas._chart = {history, series, windowS, minMax};
+// `whole`: the values are counts, so the axis shows whole numbers.
+export function lineChart(canvas, history, series, windowS, minMax, whole = false) {
+  canvas._chart = {history, series, windowS, minMax, whole};
   if (!canvas._tip) attachTooltip(canvas);
   draw(canvas);
 }
 
 function draw(canvas) {
-  const {history, series, windowS, minMax} = canvas._chart;
+  const {history, series, windowS, minMax, whole} = canvas._chart;
   const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
   canvas.width = w * dpr;
   canvas.height = h * dpr;
@@ -29,7 +30,8 @@ function draw(canvas) {
   const points = history.filter(p => p.t >= t0);
   let ymax = minMax || 1;
   for (const p of points) for (const s of series) ymax = Math.max(ymax, p[s.key] ?? 0);
-  ymax *= 1.1;
+  // counts get whole numbers on the axis: the top is the next multiple of the 4 grid steps above the largest value
+  ymax = whole ? 4 * Math.ceil((ymax + 1) / 4) : ymax * 1.1;
 
   const pw = w - L - R, ph = h - T - B;
   g.strokeStyle = cssVar("--line");
@@ -39,7 +41,7 @@ function draw(canvas) {
   for (let i = 0; i <= 4; i++) {
     const y = T + ph * i / 4;
     g.beginPath(); g.moveTo(L, y); g.lineTo(w - R, y); g.stroke();
-    g.fillText((ymax * (1 - i / 4)).toFixed(1), 4, y + 4);
+    g.fillText((ymax * (1 - i / 4)).toFixed(whole ? 0 : 1), 4, y + 4);
   }
   g.fillText(`-${Math.round(windowS / 60)} min`, L, h - 4);
   g.fillText("now", w - R - 22, h - 4);

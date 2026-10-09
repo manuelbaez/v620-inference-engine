@@ -56,7 +56,7 @@ function renderCharts(d) {
     {key: "gen_demand_tps", color: "--accent2", label: "tokens generated", fmt: tps}], win, 10);
   lineChart($("chart-queue"), h, [
     {key: "running", color: "--accent", label: "running", fmt: n},
-    {key: "waiting", color: "--accent2", label: "waiting / prefilling / loading", fmt: n}], win, 4);
+    {key: "waiting", color: "--accent2", label: "waiting / prefilling / loading", fmt: n}], win, 4, true);
   lineChart($("chart-kv"), h, [
     {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
 }
