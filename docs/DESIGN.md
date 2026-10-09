@@ -698,10 +698,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          (layout `f8e4m3_tensorscale`, decoded through a 256-entry table). Accuracy against
          the fp32 reference: 0.050 mean |dlogprob| (int8 0.048, bf16 0.044; see "PLE n-gram
          table precision")
-   - [~] the model card's benchmarks through production (2026-10-08/09, section "Benchmarks against the model
-         card"): GPQA Diamond 90.9% (180 of 198; published 91.7), LiveCodeBench v6 79.4% of 175 with 21 answers
-         cut off at 65,536 tokens of thinking (90.3% of the 154 that finished; published 91.9). Open: the 21 again
-         with a larger limit
+   - [x] the model card's benchmarks through production (2026-10-08/09, section "Benchmarks against the model
+         card"): GPQA Diamond 90.9% (180 of 198; published 91.7), LiveCodeBench v6 86.9% (152 of 175; published
+         91.9), both with the card's 262,144-token output limit for the answers that needed it. GPQA is at the
+         published figure; LiveCodeBench is 5 points below it, about two standard errors of one run
    - [~] the int4 experts against the original (2026-10-08, section of that name): four layers' original bf16
          experts downloaded and swapped into the fp32 reference. The int4 experts are 11-17% off the original
          weights and one layer of them moves the outputs more (0.055 mean |dlogprob|) than all of the engine's
@@ -2381,11 +2381,20 @@ line and no repeated 8-word sequence. Answers took 12,000 tokens on average in t
 | hard | 80 | 20 | 58.8% | 78.3% |
 | all | 175 | 21 | **79.4%** | 90.3% of 154 |
 
-Median answer 19,000 tokens. The 21 cut-off answers have no code and count as failures; as with GPQA they are the
-ones to ask again with a larger limit before the 79.4 is compared with 91.9 (in GPQA 21 of 30 such answers were
-right). 15 answers finished and failed the tests.
+Median answer 19,000 tokens. The 21 cut-off answers have no code. The model card recommends an output limit of
+262,144 tokens for the reasoning, so they were asked again with that limit (as was GPQA's last cut-off answer: 106k
+tokens, wrong, score unchanged): none was cut off (41k-113k tokens each), 13 of the 21 passed.
 
-Reading: GPQA is at the published figure within its error (0.8 points below, standard error 2.0), so no loss shows
-there. LiveCodeBench is not decided: between 79.4% (cut-offs as failures) and 90.3% (finished ones only), with the
-published 91.9 at the upper end. With 175-198 items only gaps of about 5 points can show.
+| with the 262,144-token limit | n | pass@1 |
+|---|---|---|
+| easy | 43 | 100% |
+| medium | 52 | 94.2% |
+| hard | 80 | 75.0% |
+| all | 175 | **86.9%** (152; standard error 2.6) |
+
+Reading: GPQA is at the published figure within its error (0.8 points below, standard error 2.0). LiveCodeBench is
+5.0 points below the published 91.9, about two standard errors of this one sampled run: not proof of a loss, not
+agreement either. What is not known about the published run: whether "v6" is the same 175 problems, how many runs
+were averaged, and the prompt. A second run of ours would narrow our side of it (the 23 failures: 20 hard, 3
+medium).
 
