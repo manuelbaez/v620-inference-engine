@@ -43,7 +43,7 @@ def ask(prompt):
     for attempt in range(4):
         try:
             req = urllib.request.Request(URL, json.dumps(body).encode(), {"content-type": "application/json"})
-            with urllib.request.urlopen(req, timeout=3600) as r:
+            with urllib.request.urlopen(req, timeout=6 * 3600) as r:
                 return json.load(r)
         except Exception as ex:
             err = str(ex)

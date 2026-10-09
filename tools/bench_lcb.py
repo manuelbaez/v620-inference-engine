@@ -2,7 +2,7 @@
 (github.com/LiveCodeBench/LiveCodeBench on PYTHONPATH; datasets < 3). Thinking on at the given effort, the model's own
 sampling settings, one sample per problem. Writes the file lcb_runner.runner.custom_evaluator takes; resumes.
   PYTHONPATH=~/lcb python bench_lcb.py OUT.json [--url http://localhost:8000] [--release v6] [--effort xhigh]
-                                                [--workers 6] [--max-tokens 65536]
+                                                [--workers 6] [--max-tokens 65536] [--retry-cut]
 Then scores them with the benchmark's checker (the generated programs run on this machine against the hidden tests):
 pass@1 overall and by difficulty. (v6 = the 175 problems of 2025-01..04 that release_v6 added.)"""
 import argparse, json, os, threading, time, urllib.request
@@ -20,6 +20,7 @@ ap.add_argument("--effort", default="xhigh")
 ap.add_argument("--workers", type=int, default=6)
 ap.add_argument("--max-tokens", type=int, default=65536)
 ap.add_argument("--model", default="qw/qwen3.8-flash-next")
+ap.add_argument("--retry-cut", action="store_true", help="ask again the problems whose answer was cut off at max_tokens")
 a = ap.parse_args()
 URL = a.url.rstrip("/") + "/v1/chat/completions"
 problems = sorted(load_code_generation_dataset(release_version=a.release), key=lambda p: str(p.question_id))
@@ -28,7 +29,8 @@ raw = json.load(open(raw_path)) if os.path.exists(raw_path) else {}
 lock, t0 = threading.Lock(), time.time()
 
 def run(p):
-    if p.question_id in raw and "error" not in raw[p.question_id]:
+    if (p.question_id in raw and "error" not in raw[p.question_id]
+            and not (a.retry_cut and raw[p.question_id].get("finish") == "length")):
         return
     body = {"model": a.model, "max_tokens": a.max_tokens, "reasoning_effort": a.effort,
             "messages": format_prompt_generation(p, LMStyle.OpenAIChat)}
@@ -36,7 +38,7 @@ def run(p):
     for attempt in range(4):
         try:
             req = urllib.request.Request(URL, json.dumps(body).encode(), {"content-type": "application/json"})
-            with urllib.request.urlopen(req, timeout=7200) as r:
+            with urllib.request.urlopen(req, timeout=6 * 3600) as r:
                 d = json.load(r)
             c = d["choices"][0]
             out = {"text": c["message"].get("content") or "", "finish": c.get("finish_reason"),
