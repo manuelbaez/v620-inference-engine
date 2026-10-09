@@ -456,7 +456,23 @@ collective that times out makes every later wait give up at once and the
 engine fails with the waiting rank, missing peer and collective offset; a
 dispatch watchdog logs the stuck job and each rank's phase every 60 s.
 
-## Open issue: multi-request speculative batches (2026-09-25)
+## Open issue: multi-request speculative batches (2026-09-25; closed 2026-10-09)
+
+**Closed (2026-10-09).** At -50 mV, `test_speculative --session-only --gen 256 --k 5 --repeat 4` with 2 to 8 prompts
+of real text at once, with `QW_SPEC_MAX_ROWS` 8 and 16 and with the new policy: 15 runs, every speculative run gave
+the tokens of plain decoding and of its own repeats, steps of up to 16 rows included. The 8-row cap had also cut
+drafting off entirely from five requests on (8 / n - 1 = 0). Aggregate tok/s by drafts per request:
+
+| requests | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|
+| 8-row cap (drafts 3, 1, 1, 0, 0, 0, 0) | 126 | 173 | 217 | | 232 | | 291 |
+| 16 rows (drafts 5, 4, 3, 2, 1, 1, 1) | 126 | 167 | 197 | | 262 | | 311 |
+| new policy (drafts 3, 1, 1, 1, 1, 1, 1) | | | 216 | 239 | 259 | 293 | 311 |
+
+More than one draft does not pay from three requests on (the extra rows cost more than the accepted tokens bring),
+one draft pays up to eight. `Session::generate` now takes 8 / n - 1 drafts for one or two requests and one draft for
+three to eight; `QW_SPEC_MAX_ROWS=R` gives the old rule with R rows. The notes below are the history.
+
 
 **Likely cause found (2026-09-26): the GPUs' -75 mV undervolt.** A detector
 (`test_speculative --gen 256 --k 5 --repeat 6`: 18 greedy runs per prompt set,

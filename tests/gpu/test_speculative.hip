@@ -3,7 +3,9 @@
 // bit-identical to single steps); reports the draft acceptance and speed.
 //   1. each prompt alone: plain greedy vs speculative (K drafts)
 //   2. all prompts at once in separate slots, speculative
-// Usage: qw_spec_test --p 1,2,3 [--p 4,5,6 ...] [--gen 128] [--k 3]
+//      (plain and speculative timed; the speculative run repeated --repeat times: every run must give the same
+//      tokens. QW_SPEC_MAX_ROWS sets the rows a verification step may have, so its draft count per request)
+// Usage: qw_spec_test --p 1,2,3 [--p 4,5,6 ...] [--gen 128] [--k 3] [--repeat 1] [--session-only]   (up to 8 prompts)
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -143,7 +145,8 @@ int main(int argc, char **argv) {
             opt.warmup = false;
     }
     try {
-        QW_CHECK(!prompts.empty() && prompts.size() <= 4, "1..4 prompts");
+        QW_CHECK(!prompts.empty() && prompts.size() <= 8, "1..8 prompts");
+        opt.slot_tokens.assign(std::max<size_t>(4, prompts.size()), 32768);
         Engine e(opt);
         QW_CHECK(e.has_mtp(), "no MTP head loaded");
         int fails = 0;
@@ -249,9 +252,22 @@ int main(int argc, char **argv) {
                 return outs;
             };
             for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+            double t0 = now();
             const auto plain = gen_all(0);
+            const double plain_s = now() - t0;
             for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+            t0 = now();
             const auto spec = gen_all(K);
+            const double spec_s = now() - t0;
+            const double toks = double(prompts.size() * size_t(gen - 1));
+            std::printf("session generate, %zu prompts at once: plain %.1f tok/s aggregate, speculative %.1f tok/s\n",
+                        prompts.size(), toks / plain_s, toks / spec_s);
+            for (int rep = 1; rep < repeat; ++rep) {  // the same again: any difference is wrong arithmetic
+                for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
+                const bool again = gen_all(K) == spec;
+                fails += !again;
+                if (!again) std::printf("  session speculative run %d differs from the first\n", rep + 1);
+            }
             bool same = true;
             for (size_t p = 0; p < prompts.size(); ++p) {
                 const bool sp = plain[p] == spec[p] && (ref.empty() || plain[p] == ref[p]);

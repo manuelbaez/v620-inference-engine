@@ -122,11 +122,15 @@ const std::vector<Session::StepOut> &Session::generate(const std::vector<StepReq
     if (reqs.empty()) return out_;
     const int n = int(reqs.size());
     QW_CHECK(n <= Engine::MAX_BATCH_ROWS, "generate: too many requests for one batch");
-    // Verification batches are capped at 8 rows: batches of 11-16 rows (3-4 requests x 1 + 3 drafts)
-    // intermittently produce wrong tokens or GPU faults on this box, cause not yet found
-    // (docs/DESIGN.md, "Open issue"). QW_SPEC_MAX_ROWS=16 lifts the cap.
-    static const int max_rows = std::getenv("QW_SPEC_MAX_ROWS") ? std::atoi(std::getenv("QW_SPEC_MAX_ROWS")) : 8;
-    const int k_max = e_.has_mtp() ? std::max(0, std::min({k, Engine::MAX_BATCH_ROWS / n - 1, max_rows / n - 1})) : 0;
+    // Drafts per request by the number of requests in the step (rows = requests x (1 + drafts), at most 16): one or
+    // two requests fill 8 rows (5 and 3 drafts), three to eight draft one token each. Measured 2026-10-09 (real
+    // text, 256 tokens each): 4 requests 217 tok/s with 1 draft against 197 with 3; 6 requests 262 with 1 against
+    // 232 with none; 8 requests 311 against 291. (Until then five requests or more drafted nothing: verification
+    // steps were capped at 8 rows after wrong tokens in 11-16 row steps, which the -75 mV undervolt explained:
+    // docs/DESIGN.md, "Open issue".) QW_SPEC_MAX_ROWS=R: instead, as many drafts as R rows allow.
+    static const int max_rows = std::getenv("QW_SPEC_MAX_ROWS") ? std::atoi(std::getenv("QW_SPEC_MAX_ROWS")) : 0;
+    const int by_count = max_rows > 0 ? max_rows / n - 1 : n <= 2 ? 8 / n - 1 : 1;
+    const int k_max = e_.has_mtp() ? std::max(0, std::min({k, Engine::MAX_BATCH_ROWS / n - 1, by_count})) : 0;
     // free positions of a slot; drafting k tokens needs k + 2
     auto room = [&](int slot) { return e_.slot_capacity(slot) - e_.slot_len(slot); };
 
