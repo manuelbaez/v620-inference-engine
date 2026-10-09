@@ -698,6 +698,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          (layout `f8e4m3_tensorscale`, decoded through a 256-entry table). Accuracy against
          the fp32 reference: 0.050 mean |dlogprob| (int8 0.048, bf16 0.044; see "PLE n-gram
          table precision")
+   - [~] the model card's benchmarks through production (2026-10-08/09, section "Benchmarks against the model
+         card"): GPQA Diamond 90.9% (180 of 198; published 91.7), LiveCodeBench v6 79.4% of 175 with 21 answers
+         cut off at 65,536 tokens of thinking (90.3% of the 154 that finished; published 91.9). Open: the 21 again
+         with a larger limit
    - [~] the int4 experts against the original (2026-10-08, section of that name): four layers' original bf16
          experts downloaded and swapped into the fp32 reference. The int4 experts are 11-17% off the original
          weights and one layer of them moves the outputs more (0.055 mean |dlogprob|) than all of the engine's
@@ -2345,4 +2349,43 @@ would spill to host memory (untested as a configuration; the compressed keys and
 plus a 6-bit expert path in the decode pair kernel and the prefill expert GEMM. Before that: whether the original
 model scores higher on the tasks at all (GSM8K / MMLU / ARC through a hosted endpoint of the original, against our
 92.3%); if it does not, the difference above is one that does not matter.
+
+## Benchmarks against the model card (2026-10-08/09)
+
+Does what production serves (int4 experts, int8 n-gram table, fp16 arithmetic) score like the released model? Two of
+the model card's benchmarks that can be run as published, through production's API (`qw-engine:b4e6fd4`, then
+`9e86688`), thinking at the template's highest effort (`reasoning_effort` xhigh) and the model's own sampling
+settings (temperature 1.0, top_p 0.95, top_k 20), one sample per item. The card says no more about its settings
+than "thinking mode" and those sampling values, so the prompts and token limits are the benchmarks' usual ones.
+
+**GPQA Diamond** (`tools/bench_gpqa.py`, the simple-evals prompt, 198 questions; published 91.7):
+
+| | correct |
+|---|---|
+| first pass, at most 32,768 tokens per answer | 159 of 198 = 80.3%; 30 answers cut off while still thinking |
+| ... of the 168 that finished | 159 = 94.6% |
+| the 30 again with at most 100,000 tokens | 21 correct, 1 cut off again |
+| together | **180 of 198 = 90.9%** (standard error 2.0) |
+
+The long answers are not loops: a cut-off question asked again with its thinking kept (9,000 tokens) has no repeated
+line and no repeated 8-word sequence. Answers took 12,000 tokens on average in the first pass, the 30 long ones
+17-90k.
+
+**LiveCodeBench v6** (`tools/bench_lcb.py`: the benchmark's prompt, code extraction and checker; the 175 problems of
+2025-01..04 that release_v6 added; published 91.9), at most 65,536 tokens per answer:
+
+| | n | cut off | pass@1 | of those that finished |
+|---|---|---|---|---|
+| easy | 43 | 0 | 100% | 100% |
+| medium | 52 | 1 | 94.2% | 96.1% |
+| hard | 80 | 20 | 58.8% | 78.3% |
+| all | 175 | 21 | **79.4%** | 90.3% of 154 |
+
+Median answer 19,000 tokens. The 21 cut-off answers have no code and count as failures; as with GPQA they are the
+ones to ask again with a larger limit before the 79.4 is compared with 91.9 (in GPQA 21 of 30 such answers were
+right). 15 answers finished and failed the tests.
+
+Reading: GPQA is at the published figure within its error (0.8 points below, standard error 2.0), so no loss shows
+there. LiveCodeBench is not decided: between 79.4% (cut-offs as failures) and 90.3% (finished ones only), with the
+published 91.9 at the upper end. With 175-198 items only gaps of about 5 points can show.
 
