@@ -76,7 +76,7 @@ public addresses only (`QW_MEDIA_ALLOW_PRIVATE=1` allows the LAN,
 `QW_MEDIA_FETCH=0` allows `data:` URLs only); videos decode as a stream.
 
 The server logs a stats line every 10 s while busy and one line per request,
-and serves a dashboard at `/` (prompt and generation speed while busy, demand, queue, KV and memory use, request
+and serves a dashboard at `/` (prompt and generation speed while busy, demand, queue, a bar per slot (tokens in VRAM and spilled to host RAM), memory use in GiB, request
 times; JSON at `/metrics.json`). Through llama-swap:
 `http://llm-backend-amd.local.net:8080/upstream/qw/qwen3.8-flash-next/`.
 

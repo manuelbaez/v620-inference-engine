@@ -104,6 +104,14 @@ int64_t qw_slot_capacity(qw_handle *h, int slot) {
     return guarded(h, [&] { return h->engine->slot_capacity(slot); }, int64_t(-1));
 }
 
+int64_t qw_slot_vram_tokens(qw_handle *h, int slot) {
+    return guarded(h, [&] { return h->engine->slot_vram_tokens(slot); }, int64_t(-1));
+}
+
+int64_t qw_slot_len(qw_handle *h, int slot) {
+    return guarded(h, [&] { return h->engine->slot_len(slot); }, int64_t(-1));
+}
+
 int qw_acquire(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new) {
     return guarded(h, [&] { return h->session->acquire(std::vector<int32_t>(tokens, tokens + n), max_new); }, -1);
 }
@@ -242,6 +250,18 @@ int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out) {
             if (slot < 0 || slot >= h->session->num_slots()) return -1;
             const qw::Session::Timing t = h->session->slot_timing(slot);
             *out = {t.restore_s, t.prefill_s, t.save_s, t.pin_wait_s};
+            return 0;
+        },
+        -1);
+}
+
+int qw_get_moe_use(qw_handle *h, unsigned long long *out) {
+    return guarded(
+        h,
+        [&] {
+            unsigned long long u[qw::cfg::RANKS][2];
+            h->engine->moe_use(u);
+            for (int r = 0; r < qw::cfg::RANKS; ++r) out[2 * r] = u[r][0], out[2 * r + 1] = u[r][1];
             return 0;
         },
         -1);

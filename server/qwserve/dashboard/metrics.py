@@ -66,11 +66,14 @@ class Metrics:
             else None,
         })
 
-    def sample(self, running, prefilling, waiting, kv_used, kv_capacity, force=False):
-        """Records a history point every SAMPLE_SECONDS (called often by the scheduler loop)."""
+    def sample(self, running, prefilling, waiting, kv_used, kv_capacity, force=False, slots=None):
+        """Records a history point every SAMPLE_SECONDS (called often by the scheduler loop). slots: per slot,
+        the tokens it holds and whether a request uses it (None: as last reported, none in use)."""
         now = time.time()
+        if slots is None:
+            slots = [{"tokens": s["tokens"], "busy": False} for s in self.live.get("slots", [])]
         self.live = {"running": running, "prefilling": prefilling, "waiting": waiting, "kv_used_tokens": kv_used,
-                     "kv_capacity_tokens": kv_capacity}
+                     "kv_capacity_tokens": kv_capacity, "slots": slots}
         dt = now - self._win["t"]
         if dt < SAMPLE_SECONDS and not force:
             return

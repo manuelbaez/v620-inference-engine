@@ -137,6 +137,9 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, const SpillPool *spill, boo
     rk.pack_bytes = size_t(gpu::QSA_LAYERS_MAX) * (size_t(Rank::KV_PACK_TOKENS) * 2 * HEAD_DIM * 2 +
                                                    size_t(Rank::KV_PACK_TOKENS / IDX_RATIO) * IDX_DIM * 2);
     rk.pack = zeros<uint8_t>(rk.pack_bytes);
+    rk.moe_use = zeros<unsigned long long>(2);
+    rk.moe_use_host = pinned<unsigned long long>(2);
+    rk.moe_use_host[0] = rk.moe_use_host[1] = 0;
     std::vector<int32_t *> pens;
     for (const auto &sl : rk.slots) pens.push_back(sl.pen);
     rk.pen_tab = upload(pens);

@@ -141,6 +141,10 @@ struct Rank {
     hipEvent_t stage_ready = nullptr, stage_free = nullptr;
     std::array<hipEvent_t, 2> stage_done{};
     gpu::SlotPtrs *dtab = nullptr;
+    // Routed-expert work of this rank: (token, expert) pairs it computed, [0] in prefill, [1] in decode, counted by
+    // the routing kernels on the device and copied to the pinned host copy now and then (Engine::moe_use).
+    unsigned long long *moe_use = nullptr, *moe_use_host = nullptr;
+    unsigned moe_use_tick = 0;
     // export_kv packs a block of up to KV_PACK_TOKENS positions here in the block store's layout, then copies it once
     static constexpr int KV_PACK_TOKENS = 256;
     uint8_t *pack = nullptr;

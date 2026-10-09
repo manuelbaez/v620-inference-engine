@@ -13,6 +13,19 @@ export function bar(label, used, total, extra) {
          `<div class="bar"><div style="width:${pct.toFixed(1)}%"></div></div></div>`;
 }
 
+// One slot: the tokens it holds, the part in VRAM and the part spilled to host RAM, on a bar `scale` tokens wide;
+// the tick is where the slot's VRAM part ends.
+export function slotBar(i, tokens, vram, capacity, busy, scale) {
+  const hot = Math.min(tokens, vram), cold = Math.max(0, tokens - vram), pct = v => (100 * Math.min(1, v / scale)).toFixed(2);
+  const state = tokens ? (busy ? "in use" : "idle, kept") : "empty";
+  const split = cold ? ` (${fmt.count(hot)} + ${fmt.count(cold)})` : "";
+  return `<div class="mem-item"><div class="row"><span>slot ${i} <span class="m">${state}</span></span>` +
+         `<span class="m">${fmt.count(tokens)}${split} of ${fmt.count(capacity)} tokens</span></div>` +
+         `<div class="bar split"><div class="hot" style="width:${pct(hot)}%"></div>` +
+         `<div class="cold" style="width:${pct(cold)}%"></div>` +
+         (vram < scale ? `<i style="left:${pct(vram)}%"></i>` : "") + `</div></div>`;
+}
+
 export function line(label, value) {
   return `<div class="mem-item"><div class="row"><span>${label}</span><span class="m">${value}</span></div></div>`;
 }

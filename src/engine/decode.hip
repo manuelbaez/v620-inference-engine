@@ -100,7 +100,8 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, M, b.sh_h, s);
         gemv(w.sh_down, w.sh_down8, H, SFFN_L, b.sh_h, b.sh_out);
         gemv(w.router, Q8{}, N_EXPERTS, H, b.bin, b.router);
-        gpu::moe_route_B(b.router, M, r * EXP_L, b.ecounts, b.offsets, b.tok_w, b.tok_slot, b.pair_tok, s);
+        gpu::moe_route_B(b.router, M, r * EXP_L, b.ecounts, b.offsets, b.tok_w, b.tok_slot, b.pair_tok, s,
+                         rk.moe_use + 1);
         if (M <= moe_pair_max)
             gpu::moe_experts_P(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.offsets, b.pair_tok, b.bin, M, b.moe_h, b.yp,
                                s);
@@ -242,6 +243,8 @@ void Engine::run_decode_rank(Rank &rk) {
     if (djob_.copy_logits)
         CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
     CK(hipMemcpyAsync(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
+    if ((rk.moe_use_tick++ & 63) == 0)  // the routed-expert count, for the stats
+        CK(hipMemcpyAsync(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, s));
     phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(dlse_parts_.data() + size_t(r) * gpu::MAX_ROWS * 2, b.h_lse, size_t(M) * 2 * 4);

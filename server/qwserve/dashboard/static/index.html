@@ -46,9 +46,14 @@
       <div class="legend"><span style="--c:var(--accent)">running</span><span style="--c:var(--accent2)">waiting / prefilling / loading</span></div>
     </div>
     <div class="card">
-      <h2>KV cache in use (% of GPU slots)</h2>
+      <h2>Tokens held by running requests (% of all slots' capacity)</h2>
       <canvas id="chart-kv"></canvas>
-      <div class="legend"><span style="--c:var(--accent)">KV used</span></div>
+      <div class="legend"><span style="--c:var(--accent)">prompt + generated tokens of the requests in progress</span></div>
+    </div>
+    <div class="card">
+      <h2>Slots</h2>
+      <div id="slots"></div>
+      <div class="legend"><span style="--c:var(--accent)">in VRAM</span><span style="--c:var(--accent2)">in host RAM (spilled)</span><em id="slots-scale"></em></div>
     </div>
   </section>
 

@@ -11,7 +11,10 @@ namespace qw::gpu {
 // ---- routing (moe_route.hip)
 // Per token: top-10 of softmax(logits), renormalized, local ones kept.
 // tok_e/tok_w [T][10] (local expert or -1), counts[128] (atomic, pre-zeroed).
-void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s);
+// use: if not null, the (token, expert) pairs that fell to this rank are added to *use (a running count of the
+// rank's routed-expert work: Engine::moe_use).
+void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s,
+                 unsigned long long *use = nullptr);
 // offsets = exclusive scan(counts); slot of each (token, j) pair; pair_tok[slot] = t.
 void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *offsets, int32_t *fill,
                    int32_t *tok_slot, int32_t *pair_tok, hipStream_t s);
@@ -19,7 +22,8 @@ void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *
 // Decode rows (M <= 32): routing, counts, offsets [129] and pair slots in one
 // kernel (the per-pair outputs of moe_route_T + moe_scatter_T, no pre-zeroing).
 void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t *offsets, float *tok_w,
-                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s);
+                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s,
+                 unsigned long long *use = nullptr);
 
 // ---- routed experts (moe_experts.hip, moe_w4a8.hip)
 // For every (token, expert) pair: h[slot] = silu(gate x) * up x,

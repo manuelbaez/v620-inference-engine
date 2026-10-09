@@ -326,6 +326,13 @@ private:
         std::vector<double> layer_max, layer_mean;                            // tiles per layer, summed over chunks
     } moe_bal_;
     bool moe_stats_ = false;
+
+public:
+    // Routed-expert work per rank since the start: (token, expert) pairs each card computed, out[r][0] in prefill and
+    // out[r][1] in decode (the main layers; a few steps behind). Uneven counts are cards waiting for the busiest one.
+    void moe_use(unsigned long long out[RANKS][2]) const;
+
+private:
     void collect_moe_balance();
     void log_moe_balance();
 

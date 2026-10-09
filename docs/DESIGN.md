@@ -700,8 +700,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          table precision")
    - [x] the model card's benchmarks through production (2026-10-08/09, section "Benchmarks against the model
          card"): GPQA Diamond 90.9% (180 of 198; published 91.7), LiveCodeBench v6 86.9% (152 of 175; published
-         91.9), both with the card's 262,144-token output limit for the answers that needed it. GPQA is at the
-         published figure; LiveCodeBench is 5 points below it, about two standard errors of one run
+         91.9; a second run 87.4%), with the card's 262,144-token output limit. GPQA is at the published figure;
+         LiveCodeBench is 4.8 points below it in both runs (13 problems flip between them, the totals differ by
+         one), so not noise of ours: a real difference or a different measurement
    - [~] the int4 experts against the original (2026-10-08, section of that name): four layers' original bf16
          experts downloaded and swapped into the fp32 reference. The int4 experts are 11-17% off the original
          weights and one layer of them moves the outputs more (0.055 mean |dlogprob|) than all of the engine's
@@ -2392,9 +2393,28 @@ tokens, wrong, score unchanged): none was cut off (41k-113k tokens each), 13 of 
 | hard | 80 | 75.0% |
 | all | 175 | **86.9%** (152; standard error 2.6) |
 
-Reading: GPQA is at the published figure within its error (0.8 points below, standard error 2.0). LiveCodeBench is
-5.0 points below the published 91.9, about two standard errors of this one sampled run: not proof of a loss, not
-agreement either. What is not known about the published run: whether "v6" is the same 175 problems, how many runs
-were averaged, and the prompt. A second run of ours would narrow our side of it (the 23 failures: 20 hard, 3
-medium).
+**A second LiveCodeBench run** (2026-10-09, all 175 with the 262,144-token limit from the start, 8 streams): 153 of
+175 = 87.4% (easy 43 / 43, medium 48 / 52, hard 62 / 80; median answer 18,800 tokens, the longest 169,500, none cut
+off). The two runs: 86.9% and 87.4%, mean 87.1%; 146 problems passed in both, 6 only in the first, 7 only in the
+second, 16 in neither (159 passed at least once).
 
+Reading: GPQA is at the published figure within its error (0.8 points below, standard error 2.0). LiveCodeBench is
+4.8 points below the published 91.9 in both runs: the runs differ by one problem in total (13 flip, about evenly), so
+the gap is not run-to-run noise of ours. What is not known about the published run: whether "v6" is the same 175
+problems, how many samples per problem it took (159 of 175 = 90.9% pass in at least one of our two), and the prompt.
+So production's model is either a few points weaker than the released one on hard coding problems or measured
+differently; this is the first result that points at a real difference, and the int4 experts are the largest known
+one ("The int4 experts against the original").
+
+## Expert work per card, in the stats line (2026-10-09)
+
+To see whether the cards are evenly loaded by the routed experts in real traffic (the question behind moving experts
+between cards): the routing kernels add the (token, expert) pairs that fall to their card to a counter on the device
+(prefill and decode separately, the 48 main layers), copied to the host at the end of a prefill chunk and every 64th
+decode step, and the stats line ends with the busiest card's share over the mean since the last line, e.g.
+"experts, busiest card: prefill x1.07, decode x1.05" (shown from 4,000 pairs in the interval). Pairs, not tiles: in
+prefill the kernels' time follows tiles, whose imbalance was a little lower on the same text (1.137 against 1.189).
+No extra kernel; the logits are bit-identical to the build before (`logits_dump`), `test_moe` and `test_speculative`
+pass. `Engine::moe_use`, `qw_get_moe_use`. The dashboard got a bar per slot the same day (tokens held, the part in
+VRAM and the part spilled to host RAM; `qw_slot_vram_tokens`, `qw_slot_len`), sizes in GiB and whole numbers on the
+Requests axis.

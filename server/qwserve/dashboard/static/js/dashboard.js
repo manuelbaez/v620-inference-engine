@@ -61,8 +61,18 @@ function renderCharts(d) {
     {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
 }
 
+function renderSlots(m) {
+  const st = m.slot_state || [], vram = m.slot_vram || [];
+  if (!st.length) { $("slots").innerHTML = ""; return; }
+  // every bar on one scale: at least twice the largest VRAM part, so both parts show
+  const scale = Math.max(2 * Math.max(...vram, 1), ...st.map(s => s.tokens));
+  $("slots").innerHTML = st.map((s, i) => ui.slotBar(i, s.tokens, vram[i] ?? 0, m.slots[i], s.busy, scale)).join("");
+  $("slots-scale").textContent = `bar width ${fmt.count(scale)} tokens; tick: end of the VRAM part`;
+}
+
 function renderMemory(m) {
-  let gpu = ui.bar("KV cache in slots (used / allocated)", m.kv_gpu_used, m.kv_gpu_allocated,
+  renderSlots(m);
+  let gpu = ui.bar("KV of the slots, VRAM + host RAM (in use / capacity)", m.kv_gpu_used, m.kv_gpu_allocated,
                    "slots " + m.slots.map(fmt.count).join(" / "));
   for (const c of m.gpus || [])
     gpu += ui.bar(`${c.card} VRAM`, c.vram_used, c.vram_total, c.power_w != null ? c.power_w.toFixed(1) + " W" : "");

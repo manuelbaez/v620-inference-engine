@@ -256,6 +256,26 @@ class Scheduler:
                       f"interleaved {inter:.2f} s"]
         return " | " + ", ".join(parts)
 
+    def _slot_state(self):
+        """For the dashboard: the tokens each slot holds and whether a request is using it."""
+        busy = {r.slot for r in self.active + self.prefilling + self.loading}
+        return [{"tokens": max(0, self.e.slot_len(i)), "busy": i in busy} for i in range(len(self.e.capacity))]
+
+    def _expert_balance(self):
+        """For the stats line: the busiest card's routed-expert work over the cards' mean since the last line, in
+        prefill and in decode (1.00 = even; the cards wait for the busiest one). Empty when the engine has no count."""
+        try:
+            use = self.e.moe_use()
+        except Exception:
+            return ""
+        last, self._moe_use = getattr(self, "_moe_use", use), use
+        parts = []
+        for i, name in ((0, "prefill"), (1, "decode")):
+            d = [u[i] - l[i] for u, l in zip(use, last)]
+            if sum(d) >= 4000:  # enough pairs for the ratio to mean something
+                parts.append(f"{name} x{max(d) * len(d) / sum(d):.2f}")
+        return " | experts, busiest card: " + ", ".join(parts) if parts else ""
+
     def _stats(self, force=False):
         """The periodic stats line (like vLLM's): throughput since the last line and the queue."""
         w, now = self.win, time.time()
@@ -271,7 +291,8 @@ class Scheduler:
             print(f"stats: prompt {w['prefill'] / dt:.0f} tok/s, generation {w['gen'] / dt:.1f} tok/s{step} | "
                   f"running {len(self.active)}, prefilling {len(self.prefilling)}, loading {len(self.loading)}, waiting "
                   f"{len(self.waiting) + len(self.queue)} | slots {len(self.active) + len(self.prefilling) + len(self.loading)}/"
-                  f"{len(self.e.capacity)}, KV {100 * used / cap:.1f}% | prompt tokens from cache {reuse}", flush=True)
+                  f"{len(self.e.capacity)}, KV {100 * used / cap:.1f}% | prompt tokens from cache {reuse}"
+                  f"{self._expert_balance()}", flush=True)
         self.win = {"t": now, "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0, "rows": 0}
 
     def _finish(self, r, reason):
@@ -565,7 +586,7 @@ class Scheduler:
                 self.metrics.sample(len(self.active), len(self.prefilling),
                                     len(self.waiting) + len(self.queue) + len(self.loading),
                                     sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),
-                                    sum(self.e.capacity))
+                                    sum(self.e.capacity), slots=self._slot_state())
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
                 print(f"scheduler error ({len(self.prefilling) + len(self.active)} requests failed): {ex}\n"
                       f"{traceback.format_exc()}", file=sys.stderr, flush=True)

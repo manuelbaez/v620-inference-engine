@@ -56,9 +56,15 @@ typedef struct qw_slot_timing {
     double restore_s, prefill_s, save_s, pin_wait_s;
 } qw_slot_timing;
 int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out);
+// Routed-expert work per card since the start: out[2 * r] the (token, expert) pairs card r computed in prefill,
+// out[2 * r + 1] in decode (4 cards: 8 values). Uneven counts mean the cards wait for the busiest one.
+int qw_get_moe_use(qw_handle *h, unsigned long long *out);
 
 int qw_num_slots(qw_handle *h);
 int64_t qw_slot_capacity(qw_handle *h, int slot);
+// Tokens of the slot's capacity that are in VRAM (the rest is KV spill in host RAM), and tokens the slot holds now.
+int64_t qw_slot_vram_tokens(qw_handle *h, int slot);
+int64_t qw_slot_len(qw_handle *h, int slot);
 
 /* Picks and reserves a free slot that can hold n + max_new tokens, preferring
  * the one that can reuse the most of `tokens`. Returns the slot, or -1 when

@@ -83,6 +83,8 @@ class Collector:
             "kv_gpu_allocated": sum(capacity) * KV_BYTES_PER_TOKEN,
             "kv_gpu_used": snap["live"].get("kv_used_tokens", 0) * KV_BYTES_PER_TOKEN,
             "slots": capacity,
+            "slot_vram": list(getattr(srv.engine, "vram_tokens", capacity)),
+            "slot_state": snap["live"].get("slots", []),
             "host_cache_used": cs.get("ram_bytes"), "host_cache_budget": int(args.host_cache_gb * 1e9),
             "disk_cache_used": cs.get("disk_bytes"), "disk_cache_budget": int(args.disk_cache_gb * 1e9),
             "cache_blocks": cs.get("blocks"), "cache_snapshots": cs.get("snapshots"),

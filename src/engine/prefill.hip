@@ -335,7 +335,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         // (measured: mean |dlogprob| vs the fp32 reference 0.074 -> 0.088).
         gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.logits, N_EXPERTS, false);
         CK(hipMemsetAsync(b.counts, 0, EXP_L * 4, s));
-        gpu::moe_route_T(b.logits, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s);
+        gpu::moe_route_T(b.logits, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s, l < N_LAYERS ? rk.moe_use : nullptr);
         if (moe_stats_)  // this micro-batch's tokens per local expert (read after the job, see collect_moe_balance)
             CK(hipMemcpyAsync(moe_counts_[size_t(r)] + (size_t(&m != &mbs[0]) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
                               b.counts, EXP_L * 4, hipMemcpyDeviceToHost, s));
@@ -496,6 +496,7 @@ void Engine::run_prefill_rank(Rank &rk) {
             captured = true;
         }
     if (captured) CK(hipStreamSynchronize(rk.s));
+    CK(hipMemcpyAsync(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, rk.s));  // (a count for the stats)
     for (const Out &o : outs)
         for (int i = 0; i < o.rows; ++i)
             CK(hipMemcpy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,

@@ -5,7 +5,7 @@
 namespace qw::gpu {
 
 __global__ __launch_bounds__(512) void moe_route_T_kernel(const float *logits, int first, int32_t *tok_e, float *tok_w,
-                                                          int32_t *counts) {
+                                                          int32_t *counts, unsigned long long *use) {
     __shared__ int top[TOP_K];
     __shared__ float topp[TOP_K];
     const int t = blockIdx.x;
@@ -18,11 +18,13 @@ __global__ __launch_bounds__(512) void moe_route_T_kernel(const float *logits, i
         tok_e[t * TOP_K + k] = local ? e - first : -1;
         tok_w[t * TOP_K + k] = topp[k] / sum;
         if (local) atomicAdd(&counts[e - first], 1);
+        if (local && use) atomicAdd(use, 1ull);
     }
 }
 
-void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s) {
-    moe_route_T_kernel<<<T, N_EXPERTS, 0, s>>>(logits, first, tok_e, tok_w, counts);
+void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s,
+                 unsigned long long *use) {
+    moe_route_T_kernel<<<T, N_EXPERTS, 0, s>>>(logits, first, tok_e, tok_w, counts, use);
 }
 
 __global__ void moe_offsets_kernel(const int32_t *counts, int32_t *offsets, int32_t *fill) {
@@ -64,7 +66,7 @@ void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *
 // each pair a deterministic slot (row-major order within an expert).
 __global__ __launch_bounds__(1024) void moe_route_B_kernel(const float *logits, int M, int first, int32_t *counts,
                                                            int32_t *offsets, float *tok_w, int32_t *tok_slot,
-                                                           int32_t *pair_tok) {
+                                                           int32_t *pair_tok, unsigned long long *use) {
     constexpr int PER = N_EXPERTS / WAVE;  // 16 logits per lane
     __shared__ int s_e[32 * TOP_K];
     __shared__ int s_cnt[EXP_L], s_off[EXP_L + 1];
@@ -143,6 +145,7 @@ __global__ __launch_bounds__(1024) void moe_route_B_kernel(const float *logits, 
         if (lane == WAVE - 1) {
             s_off[EXP_L] = acc;
             offsets[EXP_L] = acc;
+            if (use) atomicAdd(use, static_cast<unsigned long long>(acc));
         }
     }
     __syncthreads();
@@ -161,8 +164,8 @@ __global__ __launch_bounds__(1024) void moe_route_B_kernel(const float *logits, 
 }
 
 void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t *offsets, float *tok_w,
-                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s) {
-    moe_route_B_kernel<<<1, 1024, 0, s>>>(logits, M, first, counts, offsets, tok_w, tok_slot, pair_tok);
+                 int32_t *tok_slot, int32_t *pair_tok, hipStream_t s, unsigned long long *use) {
+    moe_route_B_kernel<<<1, 1024, 0, s>>>(logits, M, first, counts, offsets, tok_w, tok_slot, pair_tok, use);
 }
 
 __global__ void moe_combine_T_kernel(const __half *yp, const int32_t *tok_slot, const float *tok_w,

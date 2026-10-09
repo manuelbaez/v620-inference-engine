@@ -465,4 +465,11 @@ const std::vector<float> &Engine::step(int32_t token) {
     return logits_;
 }
 
+void Engine::moe_use(unsigned long long out[RANKS][2]) const {
+    for (size_t r = 0; r < ranks_.size(); ++r) {
+        out[r][0] = ranks_[r]->moe_use_host[0];
+        out[r][1] = ranks_[r]->moe_use_host[1];
+    }
+}
+
 }  // namespace qw

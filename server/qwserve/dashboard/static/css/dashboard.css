@@ -27,6 +27,9 @@ h2 { font-size: 14px; margin: 4px 0 8px; color: var(--muted); font-weight: 600; 
 .panels { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
 .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
 .bar > div { height: 100%; background: var(--accent); }
+.bar.split { display: flex; position: relative; }
+.bar.split > .cold { background: var(--accent2); }
+.bar.split > i { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--muted); }
 .row { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
 .row .m { color: var(--muted); }
 .mem-item { margin-bottom: 10px; }

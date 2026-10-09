@@ -50,6 +50,7 @@ class FakeEngine:
     def __init__(self, capacity=(8192, 8192), step_s=0.0):
         self.capacity = list(capacity)
         self.max_tokens = max(self.capacity)
+        self.vram_tokens = list(capacity)
         self.busy = [False] * len(self.capacity)
         self.step_s = step_s
         self.left = {}
@@ -64,6 +65,12 @@ class FakeEngine:
 
     def slot_timing(self, slot):
         return {"restore_s": 0.001, "prefill_s": 0.002, "save_s": 0.0005, "pin_wait_s": 0.0}
+
+    def slot_len(self, slot):
+        return 0
+
+    def moe_use(self):
+        return [(0, 0)] * 4
 
     def failure(self):
         return self.failed_with

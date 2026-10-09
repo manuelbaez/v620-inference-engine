@@ -90,6 +90,8 @@ class Engine:
             "qw_engine_failure": (ctypes.c_int, [P, ctypes.c_char_p, ctypes.c_int]),
             "qw_num_slots": (ctypes.c_int, [P]),
             "qw_slot_capacity": (ctypes.c_int64, [P, ctypes.c_int]),
+            "qw_slot_vram_tokens": (ctypes.c_int64, [P, ctypes.c_int]),
+            "qw_slot_len": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_acquire": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64]),
             "qw_release": (ctypes.c_int, [P, ctypes.c_int]),
             "qw_set_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64]),
@@ -114,6 +116,7 @@ class Engine:
             "qw_set_boundary_token": (ctypes.c_int, [P, ctypes.c_int32]),
             "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
             "qw_get_slot_timing": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(SlotTiming)]),
+            "qw_get_moe_use": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_ulonglong)]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
                                            I32P, I32P]),
@@ -127,6 +130,7 @@ class Engine:
             raise RuntimeError("engine failed to start: " + err.value.decode(errors="replace"))
         self.lib = lib
         self.capacity = [lib.qw_slot_capacity(self.h, i) for i in range(lib.qw_num_slots(self.h))]
+        self.vram_tokens = [min(c, lib.qw_slot_vram_tokens(self.h, i)) for i, c in enumerate(self.capacity)]
         self.max_tokens = max(self.capacity)
         self.prefill_chunk = int(options.get("prefill_chunk", 8192))  # most tokens of one prefill_batch
         self.has_mtp = bool(lib.qw_has_mtp(self.h))
@@ -266,6 +270,16 @@ class Engine:
         t = SlotTiming()
         self._check(self.lib.qw_get_slot_timing(self.h, slot, ctypes.byref(t)))
         return {name: getattr(t, name) for name, _ in SlotTiming._fields_}
+
+    def slot_len(self, slot):
+        """Tokens the slot holds now (a conversation stays in its slot after its request ended)."""
+        return self.lib.qw_slot_len(self.h, slot)
+
+    def moe_use(self):
+        """Routed-expert work per card since the start: [(prefill pairs, decode pairs)] for the 4 cards."""
+        u = (ctypes.c_ulonglong * 8)()
+        self._check(self.lib.qw_get_moe_use(self.h, u))
+        return [(u[2 * r], u[2 * r + 1]) for r in range(4)]
 
     def persist(self):
         """Saves the slots' conversations to the disk prefix cache."""
