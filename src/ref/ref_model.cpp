@@ -109,22 +109,30 @@ void Model::linear(const TensorView &w, const float *x, int T, int ldx, float *y
     });
 }
 
-// Same for a compressed-tensors int4 g128 expert matrix.
-void Model::expert_linear(const TensorView &packed, const TensorView &scale, const float *x, int T, int ldx, float *y,
-                          int ldy) {
-    const int out = int(packed.dim(0)), in = int(packed.dim(1)) * 8;
-    QW_CHECK(scale.dim(0) == out && scale.dim(1) == in / QGROUP, packed.name + ": scale shape");
-    const int32_t *P = packed.i32();
+// Same for a compressed-tensors int4 expert matrix `proj`weight_packed: (nibble - 8 - zero point) * scale, a bf16
+// scale per group of inputs (128, or 32 in the checkpoints with zero points, whose nibbles are packed along the rows).
+void Model::expert_linear(const std::string &proj, int out, int in, const float *x, int T, int ldx, float *y, int ldy) {
+    const TensorView &scale = st_.get(proj + "weight_scale");
+    QW_CHECK(scale.dtype == DType::BF16 && scale.dim(0) == out && in % scale.dim(1) == 0, scale.name + ": scale shape");
+    const int groups = int(scale.dim(1)), group = in / groups;
+    QW_CHECK(group % 8 == 0, scale.name + ": group size");
+    const int32_t *P = st_.get(proj + "weight_packed", DType::I32, {out, in / 8}).i32();
     const uint16_t *S = scale.u16();
+    const uint32_t *Z = st_.has(proj + "weight_zero_point")
+                            ? reinterpret_cast<const uint32_t *>(
+                                  st_.get(proj + "weight_zero_point", DType::I32, {out / 8, groups}).i32())
+                            : nullptr;
     pool_.parallel_for(out, 16, [&](int64_t b, int64_t e) {
         std::vector<float> row(static_cast<size_t>(in));
         for (int64_t o = b; o < e; ++o) {
             const uint32_t *p = reinterpret_cast<const uint32_t *>(P + o * (in / 8));
-            const uint16_t *s = S + o * (in / QGROUP);
+            const uint16_t *s = S + o * groups;
             for (int c = 0; c < in / 8; ++c) {
-                float sc = bf16_to_f32(s[c * 8 / QGROUP]);
+                const int g = c * 8 / group;
+                float sc = bf16_to_f32(s[g]);
+                const int zero = Z ? int((Z[(o / 8) * groups + g] >> (4 * (o % 8))) & 0xf) : 8;
                 uint32_t word = p[c];
-                for (int i = 0; i < 8; ++i) row[size_t(c * 8 + i)] = float(int((word >> (4 * i)) & 0xf) - 8) * sc;
+                for (int i = 0; i < 8; ++i) row[size_t(c * 8 + i)] = float(int((word >> (4 * i)) & 0xf) - zero) * sc;
             }
             for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
         }
@@ -586,20 +594,14 @@ void Model::moe(int layer, const float *x, int T, float *out) {
             raw_linear(gu, FFN, H, xs.data(), n, H, g.data(), FFN);
             raw_linear(gu + size_t(FFN) * H, FFN, H, xs.data(), n, H, u.data(), FFN);
         } else {
-            expert_linear(st_.get(ep + "gate_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                          st_.get(ep + "gate_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, g.data(),
-                          FFN);
-            expert_linear(st_.get(ep + "up_proj.weight_packed", DType::I32, {FFN, H / 8}),
-                          st_.get(ep + "up_proj.weight_scale", DType::BF16, {FFN, H / QGROUP}), xs.data(), n, H, u.data(),
-                          FFN);
+            expert_linear(ep + "gate_proj.", FFN, H, xs.data(), n, H, g.data(), FFN);
+            expert_linear(ep + "up_proj.", FFN, H, xs.data(), n, H, u.data(), FFN);
         }
         for (size_t i = 0; i < g.size(); ++i) g[i] = siluf(g[i]) * u[i];
         if (orig) {
             raw_linear(orig->down + size_t(e) * H * FFN, H, FFN, g.data(), n, FFN, y.data(), H);
         } else {
-            expert_linear(st_.get(ep + "down_proj.weight_packed", DType::I32, {H, FFN / 8}),
-                          st_.get(ep + "down_proj.weight_scale", DType::BF16, {H, FFN / QGROUP}), g.data(), n, FFN,
-                          y.data(), H);
+            expert_linear(ep + "down_proj.", H, FFN, g.data(), n, FFN, y.data(), H);
         }
         for (int i = 0; i < n; ++i) {
             float w = toks[size_t(i)].second;

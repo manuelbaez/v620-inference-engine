@@ -6,6 +6,8 @@
 
 #include <cstdint>
 
+#include "core/config.hpp"
+
 namespace qw::gpu {
 
 // ---- routing (moe_route.hip)
@@ -30,15 +32,17 @@ void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t
 // yp[slot] = down h (fp16). tiles: scratch of 2*(T*10/32 + 128) + 1 ints.
 // With q8 (int8 scratch >= T*10*640 bytes) and q8s (>= T*10*5 floats), runs
 // W4A8 on v_dot4_i32_i8 with per-128-group activation scales (lossy; see DESIGN).
+// group: QGROUP (an fp16 scale per 128 inputs) or QGROUP_Z (a scale and zero point word per 32 inputs,
+// core/config.hpp; not with q8).
 void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *counts, const int32_t *offsets, const int32_t *pair_tok,
                    const uint16_t *bin, int T, int32_t *tiles, uint16_t *h, uint16_t *yp, hipStream_t s,
-                   int8_t *q8 = nullptr, float *q8s = nullptr);
+                   int8_t *q8 = nullptr, float *q8s = nullptr, int group = cfg::QGROUP);
 // Same outputs as moe_experts_T (fp16 only) with GEMV-shaped kernels, one
 // wave per (pair, row): faster for small T (decode batches).
 void moe_experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok, const uint16_t *bin, int T,
-                   uint16_t *h, uint16_t *yp, hipStream_t s);
+                   uint16_t *h, uint16_t *yp, hipStream_t s, int group = cfg::QGROUP);
 
 // ---- shared expert and combine (moe_route.hip)
 // h[t][i] = fp16(silu(v[t][i]) * v[t][n+i] * sigmoid(v[t][2n])), v rows of ldv

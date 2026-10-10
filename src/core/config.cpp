@@ -59,8 +59,9 @@ void check_config(const std::string &model_dir) {
         QW_CHECK(full == is_qsa(i), "config.json: layer_types pattern differs");
     }
     const Json &q = root["quantization_config"]["config_groups"]["group_0"]["weights"];
-    QW_CHECK(q["num_bits"].as_int() == 4 && q["group_size"].as_int() == QGROUP && q["symmetric"].as_bool(),
-             "config.json: experts are not symmetric int4 g128");
+    const int64_t group = q["group_size"].as_int();
+    QW_CHECK(q["num_bits"].as_int() == 4 && ((group == QGROUP && q["symmetric"].as_bool()) || group == QGROUP_Z),
+             "config.json: experts are neither symmetric int4 g128 nor int4 g32");
 }
 
 }  // namespace qw::cfg

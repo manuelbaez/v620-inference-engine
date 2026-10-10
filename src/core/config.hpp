@@ -68,6 +68,16 @@ constexpr int N_EXPERTS = 512;
 constexpr int TOP_K = 10;
 constexpr int FFN = 640;     // routed and shared intermediate
 constexpr int QGROUP = 128;  // int4 group size along K
+// The routed experts of a checkpoint may instead have a scale and a zero point per QGROUP_Z inputs (an experiment,
+// docs/DESIGN.md "Experts with a scale per 32 and zero points"). The engine keeps both in one 16-bit word per group:
+// the fp16 scale, whose sign and low three mantissa bits are free (the checkpoint's scales are bf16, 7 mantissa
+// bits), with the zero point's nibble (zero point + 8) in bit 15 and bits 2-0.
+constexpr int QGROUP_Z = 32;
+constexpr uint16_t QZ_SCALE_MASK = 0x7FF8;
+inline uint16_t qz_word(uint16_t f16_scale, int zp_nibble) {
+    return uint16_t(f16_scale | ((zp_nibble & 8) << 12) | (zp_nibble & 7));
+}
+inline int qz_nibble(uint16_t word) { return ((word >> 12) & 8) | (word & 7); }
 
 // PLE
 constexpr int PLE_LAYER = 1;  // 0-based

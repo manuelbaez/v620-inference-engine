@@ -85,7 +85,8 @@ struct LayerW {
     // MoE
     uint16_t *router;           // [512][H]
     uint32_t *eg, *eu, *ed;     // packed int4, local experts
-    uint16_t *egs, *eus, *eds;  // fp16 scales
+    uint16_t *egs, *eus, *eds;  // fp16 scales per QGROUP inputs, or scale and zero point words per QGROUP_Z (egroup)
+    int egroup = cfg::QGROUP;
     uint16_t *sh_gu;            // [321][H]: gate 160 | up 160 | shared_expert_gate
     uint16_t *sh_down;          // [H][160]
     Q8 qsa_proj8, qsa_o8, gdn_proj8, gdn_out8, sh_gu8, sh_down8;

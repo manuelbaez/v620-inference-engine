@@ -46,25 +46,32 @@ int main() {
             for (auto &x : v) x = rng();
             return v;
         };
+        int fails = 0;
+        // both expert formats: a scale per 128 inputs, and a scale with a zero point per 32 (core/config.hpp)
+        for (const int G : {QGROUP, QGROUP_Z}) {
         auto scales = [&](size_t n) {
             std::vector<uint16_t> v(n);
-            for (auto &x : v) x = f32_to_f16(std::uniform_real_distribution<float>(0.001f, 0.01f)(rng));
+            for (auto &x : v) {
+                x = f32_to_f16(std::uniform_real_distribution<float>(0.001f, 0.01f)(rng));
+                if (G == QGROUP_Z) x = qz_word(x & QZ_SCALE_MASK, int(rng() % 16));
+            }
             return v;
         };
         const size_t gu_words = size_t(EXP_L) * FFN * H / 8, d_words = size_t(EXP_L) * H * FFN / 8;
         const auto hgw = words(gu_words), huw = words(gu_words), hdw = words(d_words);
-        const auto hgs = scales(size_t(EXP_L) * FFN * H / QGROUP), hus = scales(size_t(EXP_L) * FFN * H / QGROUP),
-                   hds = scales(size_t(EXP_L) * H * FFN / QGROUP);
+        const auto hgs = scales(size_t(EXP_L) * FFN * H / G), hus = scales(size_t(EXP_L) * FFN * H / G),
+                   hds = scales(size_t(EXP_L) * H * FFN / G);
         uint32_t *gw = dev(hgw), *uw = dev(huw), *dw = dev(hdw);
         uint16_t *gs = dev(hgs), *us = dev(hus), *ds = dev(hds);
         // element k of row n of expert e in the kernels' packed layout (even elements in the low half-word)
-        auto weight = [](const std::vector<uint32_t> &w, const std::vector<uint16_t> &sc, int e, int rows, int K, int n,
+        auto weight = [G](const std::vector<uint32_t> &w, const std::vector<uint16_t> &sc, int e, int rows, int K, int n,
                          int k) {
             const size_t row = size_t(e) * rows + size_t(n);
             const uint32_t word = w[row * size_t(K / 8) + size_t(k / 8)];
             const int i = k % 8, bit = (i & 1) ? 16 + 4 * (i >> 1) : 4 * (i >> 1);
-            const int q = int((word >> bit) & 0xf) - 8;
-            return float(q) * f16_to_f32(sc[row * size_t(K / QGROUP) + size_t(k / QGROUP)]);
+            const uint16_t sw = sc[row * size_t(K / G) + size_t(k / G)];
+            const int q = int((word >> bit) & 0xf) - (G == QGROUP ? 8 : qz_nibble(sw));
+            return float(q) * f16_to_f32(G == QGROUP ? sw : uint16_t(sw & QZ_SCALE_MASK));
         };
         constexpr int MR = 16;
         int32_t *counts, *offsets, *tok_slot, *pair_tok, *tiles;
@@ -80,7 +87,7 @@ int main() {
         CK(hipMalloc(&hT, size_t(MR) * TOP_K * FFN * 2));
         CK(hipMalloc(&yP, size_t(MR) * TOP_K * H * 2));
         CK(hipMalloc(&yT, size_t(MR) * TOP_K * H * 2));
-        int fails = 0;
+        std::printf("experts with a scale per %d inputs\n", G);
         for (int trial = 0; trial < 64; ++trial) {
             const int M = 1 + trial % MR;
             std::vector<float> logits(size_t(M) * N_EXPERTS);
@@ -96,8 +103,9 @@ int main() {
             gpu::moe_route_B(d_logits, M, 0, counts, offsets, tok_w, tok_slot, pair_tok, nullptr);
             CK(hipMemset(yP, 0, size_t(MR) * TOP_K * H * 2));
             CK(hipMemset(yT, 0, size_t(MR) * TOP_K * H * 2));
-            gpu::moe_experts_P(gw, gs, uw, us, dw, ds, offsets, pair_tok, d_bin, M, hP, yP, nullptr);
-            gpu::moe_experts_T(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, d_bin, M, tiles, hT, yT, nullptr);
+            gpu::moe_experts_P(gw, gs, uw, us, dw, ds, offsets, pair_tok, d_bin, M, hP, yP, nullptr, G);
+            gpu::moe_experts_T(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, d_bin, M, tiles, hT, yT, nullptr,
+                               nullptr, nullptr, G);
             CK(hipDeviceSynchronize());
             const auto off = host(offsets, EXP_L + 1);
             const auto ts = host(tok_slot, size_t(M) * TOP_K);
@@ -147,7 +155,7 @@ int main() {
                     ref_err_T = std::max(ref_err_T, std::fabs(f16_to_f32(b[size_t(n)]) - y[size_t(n)]) / scale);
                 }
             }
-            const bool ok = bad_route == 0 && worst < 0.01;
+            const bool ok = bad_route == 0 && worst < 0.01 && ref_err_P < 0.02 && ref_err_T < 0.02;
             if (trial < 6)
                 std::printf("   pair 0 vs fp32 reference: P %.4f, T %.4f (max abs err / max |y|)\n", ref_err_P,
                             ref_err_T);
@@ -157,6 +165,11 @@ int main() {
                             bad_route, worst, ok ? "" : "<-- FAIL");
             CK(hipFree(d_logits));
             CK(hipFree(d_bin));
+        }
+        for (void *d : {(void *)gw, (void *)uw, (void *)dw, (void *)gs, (void *)us, (void *)ds, (void *)counts,
+                        (void *)offsets, (void *)tok_slot, (void *)pair_tok, (void *)tiles, (void *)tok_w, (void *)hP,
+                        (void *)hT, (void *)yP, (void *)yT})
+            CK(hipFree(d));
         }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;

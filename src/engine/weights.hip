@@ -348,9 +348,18 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
         add_rows(router, st.get(mp + "gate.weight", DType::BF16, {N_EXPERTS, H}), 0, N_EXPERTS);
         return router;
     });
-    // A projection of the rank's experts: the packed int4 words, then their fp16 scales (built together).
+    // The checkpoint's expert format: a scale per QGROUP inputs, or a scale per QGROUP_Z with or without zero points
+    // (then one word per group holds both, core/config.hpp).
+    if (!bf16_experts) {
+        const std::string e0 = mp + "experts." + std::to_string(r * EXP_L) + ".gate_proj.weight_";
+        w.egroup = int(H / st.get(e0 + "scale").dim(1));
+        QW_CHECK(w.egroup == QGROUP || w.egroup == QGROUP_Z, e0 + "scale: unsupported group size");
+        QW_CHECK(w.egroup == QGROUP_Z || !st.has(e0 + "zero_point"), e0 + "zero_point: zero points need groups of 32");
+    }
+    const int G = w.egroup;
+    // A projection of the rank's experts: the packed int4 words, then their scale words (built together).
     auto pack_experts = [&](const char *proj, int rows, int K, uint32_t **wd, uint16_t **sd) {
-        const size_t words = size_t(rows) * K / 8, groups = size_t(rows) * K / QGROUP;
+        const size_t words = size_t(rows) * K / 8, groups = size_t(rows) * K / G;
         std::vector<uint16_t> scales;
         *wd = wc.item<uint32_t>([&] {
             std::vector<uint32_t> packed(size_t(EXP_L) * words);
@@ -359,9 +368,24 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
                 for (int64_t i = b; i < e; ++i) {
                     const std::string ep = mp + "experts." + std::to_string(r * EXP_L + i) + "." + proj;
                     const TensorView &pw = st.get(ep + ".weight_packed", DType::I32, {rows, K / 8});
-                    const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / QGROUP});
+                    const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / G});
                     pack_int4_words(pw.i32(), packed.data() + size_t(i) * words, words);
-                    for (size_t g = 0; g < groups; ++g) scales[size_t(i) * groups + g] = bf16_to_f16(sw.u16()[g]);
+                    uint16_t *sc = scales.data() + size_t(i) * groups;
+                    for (size_t g = 0; g < groups; ++g) sc[g] = bf16_to_f16(sw.u16()[g]);
+                    if (G == QGROUP) continue;
+                    // zero points: nibbles packed along the rows, [rows / 8][K / G] words
+                    const uint32_t *zp = st.has(ep + ".weight_zero_point")
+                                             ? reinterpret_cast<const uint32_t *>(
+                                                   st.get(ep + ".weight_zero_point", DType::I32, {rows / 8, K / G}).i32())
+                                             : nullptr;
+                    const size_t gpr = size_t(K / G);
+                    for (size_t g = 0; g < groups; ++g) {
+                        // the word has room for the nibble only if the scale is a bf16 value that fp16 holds exactly
+                        QW_CHECK((sc[g] & ~QZ_SCALE_MASK) == 0 && f16_to_f32(sc[g]) == bf16_to_f32(sw.u16()[g]),
+                                 ep + ".weight_scale: a scale does not fit the engine's scale word");
+                        const size_t row = g / gpr, col = g % gpr;
+                        sc[g] = qz_word(sc[g], zp ? int((zp[(row / 8) * gpr + col] >> (4 * (row % 8))) & 0xf) : 8);
+                    }
                 }
             });
             return packed;

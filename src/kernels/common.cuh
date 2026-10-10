@@ -53,12 +53,13 @@ __device__ __forceinline__ float dot8(const uint4 &a, const uint4 &b, float acc)
 
 // Two int4 weights in the low nibbles of each 16-bit half (bits 0-3 and
 // 16-19) -> two fp16 values (n - 8), exactly. 0x6400 is 1024.0 in fp16, so
-// 0x6400 | n reads as 1024 + n.
-__device__ __forceinline__ uint32_t nib2_to_h2(uint32_t w) {
+// 0x6400 | n reads as 1024 + n. `off` is 1024 + the nibble that stands for
+// zero: 1032 for symmetric int4, 1024 + the zero point's nibble otherwise.
+__device__ __forceinline__ uint32_t nib2_to_h2(uint32_t w, _Float16 off = (_Float16)1032.0f) {
     uint32_t v = (w & 0x000F000Fu) | 0x64006400u;
     typedef _Float16 h2 __attribute__((ext_vector_type(2)));
     h2 h = __builtin_bit_cast(h2, v);
-    h -= h2{(_Float16)1032.0f, (_Float16)1032.0f};
+    h -= h2{off, off};
     return __builtin_bit_cast(uint32_t, h);
 }
 
@@ -78,15 +79,16 @@ __device__ __forceinline__ float block_sum(float v, float *red) {
 }
 
 // 32 k values (one uint4 of int4 weights) against 32 fp16 activations.
-__device__ __forceinline__ float dot_int4x32(const uint4 &w, const uint4 *x, float acc) {
+__device__ __forceinline__ float dot_int4x32(const uint4 &w, const uint4 *x, float acc,
+                                             _Float16 off = (_Float16)1032.0f) {
     const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         uint4 xv = x[i];
-        acc = dot2(nib2_to_h2(ws[i]), xv.x, acc);
-        acc = dot2(nib2_to_h2(ws[i] >> 4), xv.y, acc);
-        acc = dot2(nib2_to_h2(ws[i] >> 8), xv.z, acc);
-        acc = dot2(nib2_to_h2(ws[i] >> 12), xv.w, acc);
+        acc = dot2(nib2_to_h2(ws[i], off), xv.x, acc);
+        acc = dot2(nib2_to_h2(ws[i] >> 4, off), xv.y, acc);
+        acc = dot2(nib2_to_h2(ws[i] >> 8, off), xv.z, acc);
+        acc = dot2(nib2_to_h2(ws[i] >> 12, off), xv.w, acc);
     }
     return acc;
 }

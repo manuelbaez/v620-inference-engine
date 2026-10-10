@@ -342,7 +342,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         gpu::moe_scatter_T(b.tok_e, b.counts, T, b.offsets, b.fill, b.tok_slot, b.pair_tok, s);
         static const bool int8_experts = std::getenv("QW_INT8_EXPERTS") != nullptr;
         gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.counts, b.offsets, b.pair_tok, b.bin, T, b.tiles,
-                           b.moe_h, b.yp, s, int8_experts ? b.q8 : nullptr, b.q8s);
+                           b.moe_h, b.yp, s, int8_experts ? b.q8 : nullptr, b.q8s, w.egroup);
         gemm(m, w.sh_gu, 2 * SFFN_L + 1, H, b.bin, H, T, b.part16, 2 * SFFN_L + 1, true);  // fp16 out: neutral
         gpu::f16_to_f32_T(b.part16, b.shp, size_t(T) * (2 * SFFN_L + 1), s);
         gpu::swiglu_T(b.shp, 2 * SFFN_L + 1, SFFN_L, T, b.sh_h, s);

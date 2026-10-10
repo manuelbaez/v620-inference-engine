@@ -104,10 +104,10 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
                          rk.moe_use + 1);
         if (M <= moe_pair_max)
             gpu::moe_experts_P(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.offsets, b.pair_tok, b.bin, M, b.moe_h, b.yp,
-                               s);
+                               s, w.egroup);
         else
             gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.ecounts, b.offsets, b.pair_tok, b.bin, M,
-                               b.tiles, b.moe_h, b.yp, s);
+                               b.tiles, b.moe_h, b.yp, s, nullptr, nullptr, w.egroup);
         gpu::moe_combine_B(b.yp, b.tok_slot, b.tok_w, b.sh_out, M, b.partial, s);
         reduce_scatter(b.partial, b.out_moe);
         return b.out_moe;

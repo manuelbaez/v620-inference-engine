@@ -64,8 +64,7 @@ private:
 
     void linear(const TensorView &w, const float *x, int T, int ldx, float *y, int ldy);
     void raw_linear(const uint16_t *W, int out, int in, const float *x, int T, int ldx, float *y, int ldy);
-    void expert_linear(const TensorView &packed, const TensorView &scale, const float *x, int T, int ldx, float *y,
-                       int ldy);
+    void expert_linear(const std::string &proj, int out, int in, const float *x, int T, int ldx, float *y, int ldy);
 
     void hc_mix(const std::string &prefix, bool with_inject, const float *X, int T, float *block_in, float *inj);
     void combine(float *X, const float *block_out, const float *inj, int T);
