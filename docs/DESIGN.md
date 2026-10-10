@@ -702,7 +702,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          card"): GPQA Diamond 90.9% (180 of 198; published 91.7), LiveCodeBench v6 86.9% (152 of 175; published
          91.9; a second run 87.4%), with the card's 262,144-token output limit. GPQA is at the published figure;
          LiveCodeBench is 4.8 points below it in both runs (13 problems flip between them, the totals differ by
-         one), so not noise of ours: a real difference or a different measurement
+         one). The same harness against the maker's hosted model (OpenRouter) gives 80.0%, below ours, so the
+         published figure is measured differently and no loss from quantization shows: 6-bit experts are not
+         justified by this
    - [~] the int4 experts against the original (2026-10-08, section of that name): four layers' original bf16
          experts downloaded and swapped into the fp32 reference. The int4 experts are 11-17% off the original
          weights and one layer of them moves the outputs more (0.055 mean |dlogprob|) than all of the engine's
@@ -2405,6 +2407,27 @@ problems, how many samples per problem it took (159 of 175 = 90.9% pass in at le
 So production's model is either a few points weaker than the released one on hard coding problems or measured
 differently; this is the first result that points at a real difference, and the int4 experts are the largest known
 one ("The int4 experts against the original").
+
+**The same harness against the maker's hosted model** (2026-10-10; OpenRouter `qwen/qwen3.8-flash`, which its
+listing ties to `Qwen/Qwen3.8-Flash-Next`, served by Alibaba, serving precision not stated; `tools/bench_lcb.py
+--api-key-file --stream --extra`; thinking effort xhigh, temperature 1.0, top_p 0.95, top_k 20; the API allows 131,072
+output tokens, half of ours; 5.7 M output tokens, $2.99):
+
+| LiveCodeBench v6, pass@1 | hosted | ours, run 1 / run 2 |
+|---|---|---|
+| easy (43) | 43 | 43 / 43 |
+| medium (52) | 43 | 49 / 48 |
+| hard (80) | 54 | 60 / 62 |
+| all (175) | **140 = 80.0%** | 152 = 86.9% / 153 = 87.4% |
+
+Four hosted answers were cut off at the limit (ours passed two of those problems in at least one run); without them
+140 of 171 = 81.9%. With answers over 131,072 tokens counted as failures ours are 150 and 151. Paired: 16 and 19
+problems only ours passed against 4 and 6 only the hosted model passed (McNemar p = 0.012 and 0.015); 15 fail in all
+three runs. So with this harness the released model, as its maker serves it, does not reach the published 91.9
+either, and production's int4 / int8-table / fp16 engine scores higher, not lower: the 4.8 points to the published
+figure are a difference of measurement (problem set, attempts or prompt), not a loss from quantization. Why the hosted
+run is lower than ours is not known (one run; its serving precision, and how OpenRouter maps the thinking and
+sampling fields, are not visible). Nothing here justifies 6-bit experts.
 
 ## Expert work per card, in the stats line (2026-10-09)
 
