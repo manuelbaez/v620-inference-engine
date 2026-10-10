@@ -718,6 +718,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          the original where the checkpoint in use gives 0.071 (-0.008, CI -0.013 to -0.003; 6 bits 0.051, floor
          0.045); text log-likelihood equal. Not adopted: +1.76 GiB per card (1.64 free) and new expert kernels for a
          tenth of a difference no task shows
+   - [~] experts with a scale per 32 and zero points, as an experiment at the owner's request (2026-10-10, section
+         of that name): that checkpoint runs in the engine (zero point folded into the nibble offset, scale and
+         zero point in one 16-bit word: 4.5 bits per weight, +1.40 GiB per card); engine against its fp32 reference
+         0.040 / 0.038 (g128: 0.044 / 0.048), prefill -5%, decode equal, exactness and determinism pass, g128 path
+         bit-identical. Serving production with 8 x 28,672 slots since 09:37 UTC for GPQA Diamond and LiveCodeBench
+         v6 (running). Open: the benchmark results and the owner's decision to keep it or roll back; the prefill
+         5%; the prefix cache's identity (R4) before two checkpoints share a cache directory
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -2418,6 +2425,78 @@ difference that no task result has shown to matter (the hosted original scored l
 "Benchmarks against the model card"). Four layers only; all 48 would need the whole checkpoint (188 GB) and a
 reference that reads zero points. What it does say: at 4 bits the scale granularity is where the error is, so if the
 experts are ever requantized, a finer scale (per 32 or 16) is the first thing to try and costs 0.4-0.9 bits per weight.
+
+## Experts with a scale per 32 and zero points (experiment, built and measured 2026-10-10)
+
+The owner asked for the candidate of the section above to be supported, measured and benchmarked. The engine now
+loads two expert formats; which one a layer has is read from the checkpoint (`LayerW::egroup`):
+
+| | g128 (the checkpoint in use) | g32 (`cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4`) |
+|---|---|---|
+| value | nibble - 8 | nibble - zero point's nibble |
+| scale | fp16 per 128 inputs | per 32 inputs, in a 16-bit word with the zero point |
+| bits per weight in VRAM | 4.125 | 4.5 (the file: 4.625) |
+
+- **The zero point is free in the kernels.** They turn a nibble n into fp16 as (1024 + n) - 1032; the 1032 becomes
+  1024 + the group's zero-point nibble (`nib2_to_h2`, `dot_int4x32`, `dequant32` take the offset). A group of 32 is
+  one packed `uint4` word, so the decode kernels read one scale word per weight word.
+- **Scale and zero point share a word.** The checkpoint's scales are bf16 (7 mantissa bits), fp16 has 10 and a sign:
+  the zero point's nibble sits in bit 15 and bits 2-0 (`core/config.hpp`, `qz_word`). The loader checks every scale
+  (sign clear, low bits clear, fp16 value equal to the bf16 one) and fails otherwise; all 1.9 billion fit.
+- **One code path per format**: the four expert kernels are templates on the group size (`moe_experts.hip`); the
+  g128 instantiation is the old code, and its logits are bit-identical to the previous build (`logits_dump`). The MTP
+  head's experts (bf16 in both checkpoints, quantized at load) stay g128. `QW_INT8_EXPERTS` is refused with g32.
+- The fp32 reference reads zero points and any group size (`Model::expert_linear`), unchanged on g128 (byte-identical
+  logprobs). `check_config` accepts g32 and configs without `seed` / `norm_topk_prob` (class defaults that the
+  released `config.json` does not write). `QW_MODEL_DIR` sets the default checkpoint for tests and benchmarks.
+- The checkpoint directory holds the candidate's `config.json` and weights without its n-gram table (18 files, 87 GB;
+  the index rewritten without the table's tensors) and our tokenizer, template and sampling files (the candidate's
+  tokenizer encodes a 60k-token sample identically).
+
+**Is it right.** `test_moe` runs both formats against an fp32 sum (0.0003-0.0005 of max |y|, as g128). The fp32
+reference on the whole g32 checkpoint predicts the 4,000-token text as well as on g128 (below), which a misread zero
+point in 48 layers would not. Greedy paths: plain == speculative == engine greedy at 1 and 8 streams, batched rows ==
+single rows (0), six repeats identical (`test_speculative --gen 256 --k 5 --repeat 6`).
+
+**Accuracy** (4,000-token set, int8 table in the engine, each against the fp32 reference of its own checkpoint):
+
+| | g128 | g32 | g32 minus g128 (95% CI) |
+|---|---|---|---|
+| engine, prefill path: mean \|dlogprob\| / top-1 | 0.0436 / 97.7% | 0.0403 / 97.9% | -0.003 (-0.007, +0.000) |
+| engine, decode path | 0.0476 / 97.4% | 0.0381 / 97.9% | -0.010 (-0.013, -0.006) |
+| fp32 reference, log-likelihood of the text | -0.8731 | -0.8616 | +0.012 +- 0.007 |
+
+So the engine is at its fp16 floor on the new format too. The two full models differ from each other by 0.133 mean
+|dlogprob| (top-1 agreement 93.5%): either is that far from the other, and which is nearer the original can only be
+measured where the original experts are on disk (four layers: 0.063 against 0.071, section above).
+
+**Speed** (dev box, same build, alternating runs, production's chunk 4096 and int8 table; text tokens):
+
+| | g128 | g32 | |
+|---|---|---|---|
+| prefill 2,000 / 8,192 / 16,384 tokens, tok/s | 2,221 / 2,424 / 2,391 | 2,097 / 2,317 / 2,264 | **-5.6 / -4.4 / -5.3%** |
+| prefill energy at 16k, mJ per token | 264-265 | 281-283 | +7% |
+| decode, plain, one stream alone (tok/s, 24 runs each) | 60.3, 57.9 | 59.4, 59.7 | equal |
+| decode step, 1 / 4 / 8 rows (ms) | 14.66 / 20.98 / 26.35 | 14.76 / 21.12 / 26.79 | +0.7 / +0.7 / +1.7% |
+| speculative, 1 stream / 8 streams (tok/s) | 85.0, 81.7 / 312.1, 312.4 | 81.0, 83.2 / 315.2, 316.8 | equal |
+| VRAM free per card after the load (default slots) | 5.48 GiB | 4.08 GiB | **-1.40 GiB** |
+
+- Three runs of g128 and four of g32 for prefill; the spread within a format is 1-2%. Building the scale and the
+  offset from the word's bits instead of through float conversions gave +0.6% (kept, outputs bit-identical); the rest
+  of the 5% is not explained yet (four times the scale words to read per row is the candidate; not profiled).
+- **Production's slot layout does not fit**: 8 x 45,056 leaves 0.24 GiB after the load (1.64 needed), 8 x 36,864
+  1.04, 8 x 32,768 1.45; 8 x 28,672 fits with 1.85 GiB (the startup estimate now counts the scale words). Every slot
+  keeps its 524k capacity; 16k tokens more of each spill to host RAM (105.6 GB pinned instead of 102).
+
+**In production as an experiment since 2026-10-10 09:37 UTC** (`qw-engine:01715f3`), for the benchmarks: llama-swap's
+command points to `/mnt/llms/qwen3.8-flash-next-awq-g32`, `--slots 28672 x 8`, and its own prefix-cache directory
+`--disk-cache-dir /cache/prefix-g32 --disk-cache-gb 60`, because **the prefix cache does not tell checkpoints apart**
+(CODE_REVIEW R4, open): KV saved with one checkpoint would be restored under the other without any error. Ready in
+474 s. Rollback: `config.yaml.bak-before-g32-1010`, `docker tag qw-engine:a7d0637 qw-engine:latest`, idle-unload;
+then `/cache/prefix-g32` can be deleted. Production was down 07:43-09:37 UTC for the dev-box runs.
+
+**Benchmarks on the new format**: GPQA Diamond and LiveCodeBench v6 with the harness and limits of "Benchmarks
+against the model card" are running since 09:38 UTC (`~/quality-1010-g32` on the dev box); results go here.
 
 ## Benchmarks against the model card (2026-10-08/09)
 

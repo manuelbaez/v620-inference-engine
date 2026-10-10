@@ -89,7 +89,9 @@ undervolt (section 11).
   hidden state; used for speculative decoding.
 - **Vision tower:** a Qwen3-VL ViT (27 layers, 0.41 B parameters).
 - Checkpoint: routed experts int4 (AWQ, group 128), everything else bf16
-  (run as fp16). The PLE table is a separate sidecar (section 9).
+  (run as fp16). The PLE table is a separate sidecar (section 9). A second
+  checkpoint format, int4 with a zero point and a scale per 32 inputs, is
+  supported as an experiment (section 4, "Expert format").
 
 ---
 
@@ -206,6 +208,7 @@ Speed figures are single-stream decode unless stated.
 | Vision | ViT copy on every card, lazy encoding, LRU cache | 1080p image ~1.2 s | as HF | on | on | `QW_NO_VISION`, `QW_VISION_CACHE_GB` (2), `QW_VISION_MAX_PIXELS` (1920x1088) |
 | int8 dense weights | W8A16 copies of dense matrices | +13% at 1 row, 0% at 8 | **worse**: +0.012..0.033 | off | off | `QW_INT8_DENSE=1` (+ `QW_INT8_DIR` GPTQ) |
 | W4A8 experts | int8 activations for the expert GEMM in prefill | prefill +2% | **worse** (0.075 -> 0.104) | off | off | `QW_INT8_EXPERTS=1` |
+| Expert format | read from the checkpoint: int4 with an fp16 scale per 128 inputs (g128), or with a scale and a zero point per 32 in one 16-bit word (g32, 4.5 bits per weight; experiment 2026-10-10) | g32: prefill -5%, decode equal, +1.40 GiB VRAM per card | g32 is 0.063 against 0.071 from the original in four layers; engine at the fp16 floor on both (0.040 / 0.044) | g128 checkpoint (`--model-dir` default) | **g32 as an experiment since 2026-10-10 09:37 UTC** for the benchmarks: `--model-dir /mnt/llms/qwen3.8-flash-next-awq-g32`, `--slots 28672 x 8`, `--disk-cache-dir /cache/prefix-g32 --disk-cache-gb 60` in llama-swap's command (image `qw-engine:01715f3`; before and rollback: g128, 8 x 45,056, `qw-engine:a7d0637`) | `--model-dir`, `QW_MODEL_DIR` (default for tests) |
 
 | Logs | stats line every N s while busy (ending with the busiest card's share of the routed-expert work over the mean, prefill and decode; in production since 2026-10-09 22:31 UTC, image `qw-engine:a7d0637`), one line per request (with queue, disk load, restore, prefill, saves, pin wait and interleaved seconds after the old fields), errors with tracebacks | none | none | 10 s | 10 s | `QW_LOG_INTERVAL` (0 off) |
 | Dashboard | page at `/` (llama-swap's model link), JSON at `/metrics.json`, collected on its own thread | none measurable | none | on | on | |
@@ -578,8 +581,10 @@ NVFP4 experts (possibly closer to the original than AWQ int4; costs ~1.5 GB
 per card and software FP4 decode on RDNA2; see DESIGN.md roadmap). Another
 4-bit quantization of the experts with a finer scale (zero points, a scale per
 32 inputs, 4.625 bits per weight) was measured in four layers of the reference:
-0.063 against 0.071 mean |dlogprob| from the original, for +1.76 GiB per card;
-not adopted (DESIGN.md "Another 4-bit quantization of the experts").
+0.063 against 0.071 mean |dlogprob| from the original. The engine runs that
+checkpoint since 2026-10-10 (4.5 bits per weight, +1.40 GiB per card, prefill
+-5%, decode equal; DESIGN.md "Experts with a scale per 32 and zero points");
+whether production keeps it waits for the benchmarks.
 
 ---
 
