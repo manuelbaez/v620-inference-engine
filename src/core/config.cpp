@@ -6,7 +6,7 @@
 
 namespace qw::cfg {
 
-void check_config(const std::string &model_dir) {
+int check_config(const std::string &model_dir) {
     Json root = Json::parse(read_file(model_dir + "/config.json"));
     const Json &t = root["text_config"];
     auto want = [&](const char *key, int64_t v) {
@@ -43,11 +43,13 @@ void check_config(const std::string &model_dir) {
     want("ple_embed_dim", H);
     want("ple_conv_kernel_size", PLE_CONV);
     want("ngram_vocab_size_base", NGRAM_VOCAB_BASE);
-    want("seed", int64_t(PLE_SEED));
+    // (seed and norm_topk_prob are the model class's defaults: the released config.json and checkpoints saved by an
+    // older transformers do not write them)
+    if (t.has("seed")) want("seed", int64_t(PLE_SEED));
     QW_CHECK(t["ple_layer_ids"].size() == 1 && t["ple_layer_ids"][0].as_int() == PLE_LAYER + 1,
              "config.json: unexpected ple_layer_ids");
     QW_CHECK(t["output_gate_type"].as_str() == "sigmoid", "config.json: GDN gate is not sigmoid");
-    QW_CHECK(t["norm_topk_prob"].as_bool(), "config.json: norm_topk_prob is false");
+    QW_CHECK(!t.has("norm_topk_prob") || t["norm_topk_prob"].as_bool(), "config.json: norm_topk_prob is false");
     QW_CHECK(t["full_attention_interval"].as_int() == 4, "config.json: attention interval");
     double theta = t["rope_parameters"]["rope_theta"].as_double();
     QW_CHECK(theta == ROPE_THETA, "config.json: rope_theta");
@@ -62,6 +64,7 @@ void check_config(const std::string &model_dir) {
     const int64_t group = q["group_size"].as_int();
     QW_CHECK(q["num_bits"].as_int() == 4 && ((group == QGROUP && q["symmetric"].as_bool()) || group == QGROUP_Z),
              "config.json: experts are neither symmetric int4 g128 nor int4 g32");
+    return int(group);
 }
 
 }  // namespace qw::cfg

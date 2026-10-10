@@ -9,6 +9,7 @@
 // has its own captured HIP graph.
 #pragma once
 
+#include <cstdlib>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -36,7 +37,8 @@ class ArenaBank;  // pinned arenas for the prefix cache's pools (pinned_pool.hpp
 #define QW_HAVE_SPILL_CACHE 1  // Engine::spill_cache_stats exists
 
 struct EngineOptions {
-    std::string model_dir = "/mnt/llms/qwen3.8-flash-next-awq";
+    // QW_MODEL_DIR changes the default (the tests and benchmarks have no option for it); an explicit setting wins.
+    std::string model_dir = std::getenv("QW_MODEL_DIR") ? std::getenv("QW_MODEL_DIR") : "/mnt/llms/qwen3.8-flash-next-awq";
     std::string ple_dir = "/mnt/llms/qwen3.8-flash-next-ple/ples_int4";
     std::array<int, RANKS> devices{0, 1, 2, 3};
     // KV tokens of each sequence slot held in VRAM; multiples of 256.
@@ -326,6 +328,7 @@ private:
         std::vector<double> layer_max, layer_mean;                            // tiles per layer, summed over chunks
     } moe_bal_;
     bool moe_stats_ = false;
+    int expert_group_ = cfg::QGROUP;  // the checkpoint's expert format (check_config): QGROUP or QGROUP_Z
 
 public:
     // Routed-expert work per rank since the start: (token, expert) pairs each card computed, out[r][0] in prefill and

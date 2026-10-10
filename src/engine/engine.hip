@@ -31,7 +31,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     // "SDMA code-object wedge"). Must be set before the HIP runtime starts;
     // an explicit HSA_ENABLE_SDMA in the environment wins.
     setenv("HSA_ENABLE_SDMA", "0", 0);
-    check_config(opt_.model_dir);
+    expert_group_ = check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
     // The n-gram table is reserved in RAM up front (mlock); QW_PLE_PIN=0 leaves it in page cache.
@@ -134,7 +134,10 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
                 // measured at a 4096-token chunk: weights, vision tower, collectives and buffers take 19.7 GiB (recalibrated 2026-10-04); the prefill
                 // scoring buffers (two micro-batches) 6144 B per compressed-key group of the longest slot
                 const double gib = double(1ull << 30);
-                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003;
+                // experts with a scale word per 32 inputs: 2 bytes per 32 weights of a card's 128 experts, not per 128
+                const double expert_scales = expert_group_ == QGROUP ? 0.0 :
+                    double(N_LAYERS) * EXP_L * 3.0 * FFN * H * 2.0 * (1.0 / expert_group_ - 1.0 / QGROUP) / gib;
+                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales;
                 const double scoring = 6144.0 * double(max_slot_tokens() / IDX_RATIO) / gib;
                 const double est = double(total_b) / gib - base - double(slot_vram_bytes(opt_, mtp_)) / gib - scoring;
                 const double need = opt_.warmup ? 1.6 : 0.6;  // warmup (graphs, rocBLAS kernels) takes ~1.1 GiB; keep 0.5 free

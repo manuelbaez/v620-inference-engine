@@ -91,6 +91,7 @@ constexpr int64_t NGRAM_VOCAB_BASE = 20000000;
 constexpr uint64_t PLE_SEED = 1234;
 
 // Throws if config.json does not describe the model these constants encode.
-void check_config(const std::string &model_dir);
+// Returns the group size of the routed experts' scales (QGROUP or QGROUP_Z).
+int check_config(const std::string &model_dir);
 
 }  // namespace qw::cfg

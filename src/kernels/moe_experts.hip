@@ -30,28 +30,30 @@ __global__ void moe_tiles_kernel(const int32_t *counts, int32_t *tile_e, int32_t
 // A group's scale and the fp16 value its nibbles are offset by (nib2_to_h2). G = QGROUP: the word is the fp16 scale,
 // the nibbles are value + 8. G = QGROUP_Z: scale and zero point share the word (core/config.hpp).
 struct GroupScale {
-    float scale;
-    _Float16 off;
+    _Float16 scale, off;
 };
 template <int G>
 __device__ __forceinline__ GroupScale group_scale(const __half *word) {
-    if (G == QGROUP) return {__half2float(*word), (_Float16)1032.0f};
     const uint16_t b = *reinterpret_cast<const uint16_t *>(word);
-    return {float(__builtin_bit_cast(_Float16, uint16_t(b & QZ_SCALE_MASK))), (_Float16)float(1024 + (((b >> 12) & 8) | (b & 7)))};
+    if (G == QGROUP) return {__builtin_bit_cast(_Float16, b), (_Float16)1032.0f};
+    // 0x6400 | n is 1024 + n in fp16
+    return {__builtin_bit_cast(_Float16, uint16_t(b & QZ_SCALE_MASK)),
+            __builtin_bit_cast(_Float16, uint16_t(0x6400 | ((b >> 12) & 8) | (b & 7)))};
 }
 
 // Dequantize one uint4 of packed int4 (32 consecutive k) * scale into LDS
 // halves dst[0..32) (4-byte stores: the row stride is not 16-byte aligned).
 __device__ __forceinline__ void dequant32(const uint4 &w, const GroupScale gs, __half *dst) {
-    const __half2 sc = __float2half2_rn(gs.scale);
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const h2 sc = {gs.scale, gs.scale};
     const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
-    __half2 *d2 = reinterpret_cast<__half2 *>(dst);
+    uint32_t *d2 = reinterpret_cast<uint32_t *>(dst);
 #pragma unroll
     for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int sh = 0; sh < 4; ++sh) {
             const uint32_t v = nib2_to_h2(ws[i] >> (4 * sh), gs.off);
-            d2[i * 4 + sh] = __hmul2(*reinterpret_cast<const __half2 *>(&v), sc);
+            d2[i * 4 + sh] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(h2, v) * sc);
         }
 }
 
@@ -239,8 +241,8 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
         const uint4 *xc = x + c * 4;
         const int grp = c / (G / 32);
         const GroupScale sg = group_scale<G>(gsc + grp), su = group_scale<G>(usc + grp);
-        ag += sg.scale * dot_int4x32(g0, xc, 0.f, sg.off);
-        au += su.scale * dot_int4x32(u0, xc, 0.f, su.off);
+        ag += float(sg.scale) * dot_int4x32(g0, xc, 0.f, sg.off);
+        au += float(su.scale) * dot_int4x32(u0, xc, 0.f, su.off);
     }
     ag = wave_sum(ag);
     au = wave_sum(au);
@@ -261,7 +263,7 @@ __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict
     float acc = 0.f;
     if (lane < CH) {
         const GroupScale sd = group_scale<G>(ds + rbase * (FFN / G) + lane / (G / 32));
-        acc = sd.scale * dot_int4x32(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4, 0.f, sd.off);
+        acc = float(sd.scale) * dot_int4x32(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4, 0.f, sd.off);
     }
     acc = wave_sum(acc);
     if (lane == 0) yp[size_t(p) * H + row] = __float2half(acc);
