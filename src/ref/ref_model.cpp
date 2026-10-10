@@ -95,15 +95,38 @@ std::string Model::lp(int layer) const {
     return "model.language_model.layers." + std::to_string(layer) + ".";
 }
 
+// QW_REF_DENSE_Q8=1 (experiment): the dense matrices that llama.cpp's Q8_0 quantizations of this model hold in 8 bits
+// (the unsloth GGUFs: everything dense but the router, the shared expert's gate, the HC inject weights, GDN's a / b
+// projections and the indexer's) are rounded the way Q8_0 does: blocks of 32 along the inputs, scale = max |w| / 127
+// kept as fp16, values rounded half away from zero. tools/gguf_q8_check.py compares this with a GGUF's tensors.
+static bool dense_q8(const std::string &name) {
+    static const bool on = std::getenv("QW_REF_DENSE_Q8") && std::atoi(std::getenv("QW_REF_DENSE_Q8")) != 0;
+    if (!on) return false;
+    for (const char *keep : {"mlp.gate.weight", "shared_expert_gate", "block_inject_weight", "in_proj_a", "in_proj_b",
+                             "index_qk_proj"})
+        if (name.find(keep) != std::string::npos) return false;
+    return true;
+}
+static void q8_0_row(float *w, int n) {
+    for (int b = 0; b + 32 <= n; b += 32) {
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(w[b + i]));
+        const float d = amax / 127.f, id = d ? 1.f / d : 0.f, dq = f16_to_f32(f32_to_f16(d));
+        for (int i = 0; i < 32; ++i) w[b + i] = std::round(w[b + i] * id) * dq;
+    }
+}
+
 // y[t][o] = sum_i w[o][i] * x[t][i]
 void Model::linear(const TensorView &w, const float *x, int T, int ldx, float *y, int ldy) {
     QW_CHECK(w.dtype == DType::BF16 && w.shape.size() == 2, w.name + ": expected bf16 matrix");
     const int out = int(w.dim(0)), in = int(w.dim(1));
+    const bool q8 = dense_q8(w.name);
     const uint16_t *W = w.u16();
     pool_.parallel_for(out, 16, [&](int64_t b, int64_t e) {
         std::vector<float> row(static_cast<size_t>(in));
         for (int64_t o = b; o < e; ++o) {
             bf16_row(W + o * in, row.data(), in);
+            if (q8) q8_0_row(row.data(), in);
             for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
         }
     });
@@ -638,6 +661,7 @@ void Model::forward(State &st, const std::vector<int32_t> &tokens, std::vector<f
         QW_CHECK(tokens[size_t(t)] >= 0 && tokens[size_t(t)] < VOCAB, "token id out of range");
         float *row = X.data() + size_t(t) * HCH;
         bf16_row(emb.u16() + size_t(tokens[size_t(t)]) * H, row, H);
+        if (dense_q8(emb.name)) q8_0_row(row, H);
         for (int s = 1; s < HC; ++s) std::copy(row, row + H, row + s * H);
     }
 
