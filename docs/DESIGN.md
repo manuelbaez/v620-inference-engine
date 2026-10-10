@@ -722,9 +722,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          of that name): that checkpoint runs in the engine (zero point folded into the nibble offset, scale and
          zero point in one 16-bit word: 4.5 bits per weight, +1.40 GiB per card); engine against its fp32 reference
          0.040 / 0.038 (g128: 0.044 / 0.048), prefill -5%, decode equal, exactness and determinism pass, g128 path
-         bit-identical. Serving production with 8 x 28,672 slots since 09:37 UTC for GPQA Diamond and LiveCodeBench
-         v6 (running). Open: the benchmark results and the owner's decision to keep it or roll back; the prefill
-         5%; the prefix cache's identity (R4) before two checkpoints share a cache directory
+         bit-identical. Served production with 8 x 28,672 slots from 09:37 UTC for the benchmarks: GPQA Diamond
+         179/198 (g128: 180), LiveCodeBench v6 153/175 (g128: 152, 153), no difference. Open: the owner's decision
+         to keep it or roll back (recommended: roll back); the prefill 5%; the prefix cache's identity (R4) before
+         two checkpoints share a cache directory
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -2495,8 +2496,27 @@ command points to `/mnt/llms/qwen3.8-flash-next-awq-g32`, `--slots 28672 x 8`, a
 474 s. Rollback: `config.yaml.bak-before-g32-1010`, `docker tag qw-engine:a7d0637 qw-engine:latest`, idle-unload;
 then `/cache/prefix-g32` can be deleted. Production was down 07:43-09:37 UTC for the dev-box runs.
 
-**Benchmarks on the new format**: GPQA Diamond and LiveCodeBench v6 with the harness and limits of "Benchmarks
-against the model card" are running since 09:38 UTC (`~/quality-1010-g32` on the dev box); results go here.
+**Benchmarks on the new format** (2026-10-10 09:38-19:02 UTC, served by production; the harness and the
+262,144-token limit of "Benchmarks against the model card", one run each; results in `~/quality-1010-g32` on the
+dev box):
+
+| | g128 (2026-10-09) | g32 | per item |
+|---|---|---|---|
+| GPQA Diamond (198) | 180 = 90.9% | 179 = 90.4% | 5 only g128, 4 only g32 (McNemar p = 1.0) |
+| LiveCodeBench v6 (175), pass@1 | 152 = 86.9%, 153 = 87.4% | 153 = 87.4% | against run 1: 7 / 8; against run 2: 6 / 6 (p = 1.0) |
+| ... easy / medium / hard | run 2: 43 / 48 / 62 | 43 / 46 / 64 | |
+| mean completion tokens, GPQA / LiveCodeBench | 14,655 / 28,693 | 16,425 / 30,103 | |
+
+No answer cut off, none without code, no errors. **No difference**: the two formats disagree on as many items as two
+runs of the same format do (run 1 against run 2: 13 flips), and in both directions equally. Against the hosted
+original the g32 run is ahead like the g128 runs were (18 only g32, 5 only hosted, p = 0.01). The benchmark ran on 7
+streams, from 14:03 on 8 (a helper process answering from the end of the list; 4 of the 175 answers are its).
+
+**Conclusion.** The format works and is exact, and it is measurably nearer the original in the four layers where
+that can be measured, but nothing a user would see changes: task scores equal, text log-likelihood equal within
+noise, for -5% prefill, 1.40 GiB of VRAM per card (8 x 28,672 resident tokens instead of 8 x 45,056) and a cold
+prefix cache. Recommendation to the owner: roll production back to g128; keep the code (the g128 path is
+bit-identical, the g32 path is tested) in case the VRAM picture changes.
 
 ## Benchmarks against the model card (2026-10-08/09)
 

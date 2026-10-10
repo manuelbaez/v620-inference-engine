@@ -584,7 +584,9 @@ per card and software FP4 decode on RDNA2; see DESIGN.md roadmap). Another
 0.063 against 0.071 mean |dlogprob| from the original. The engine runs that
 checkpoint since 2026-10-10 (4.5 bits per weight, +1.40 GiB per card, prefill
 -5%, decode equal; DESIGN.md "Experts with a scale per 32 and zero points");
-whether production keeps it waits for the benchmarks.
+GPQA Diamond and LiveCodeBench v6 score the same on it (179 against 180 of 198,
+153 against 152-153 of 175), so it buys nothing visible; rolling production
+back is recommended and waits for the owner.
 
 ---
 
