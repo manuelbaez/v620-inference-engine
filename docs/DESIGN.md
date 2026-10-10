@@ -2442,7 +2442,7 @@ loads two expert formats; which one a layer has is read from the checkpoint (`La
   one packed `uint4` word, so the decode kernels read one scale word per weight word.
 - **Scale and zero point share a word.** The checkpoint's scales are bf16 (7 mantissa bits), fp16 has 10 and a sign:
   the zero point's nibble sits in bit 15 and bits 2-0 (`core/config.hpp`, `qz_word`). The loader checks every scale
-  (sign clear, low bits clear, fp16 value equal to the bf16 one) and fails otherwise; all 1.9 billion fit.
+  (sign clear, low bits clear, fp16 value equal to the bf16 one) and fails otherwise; all 3.8 billion fit.
 - **One code path per format**: the four expert kernels are templates on the group size (`moe_experts.hip`); the
   g128 instantiation is the old code, and its logits are bit-identical to the previous build (`logits_dump`). The MTP
   head's experts (bf16 in both checkpoints, quantized at load) stay g128. `QW_INT8_EXPERTS` is refused with g32.
