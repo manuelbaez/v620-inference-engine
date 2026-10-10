@@ -726,6 +726,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          179/198 (g128: 180), LiveCodeBench v6 153/175 (g128: 152, 153), no difference. Open: the owner's decision
          to keep it or roll back (recommended: roll back); the prefill 5%; the prefix cache's identity (R4) before
          two checkpoints share a cache directory
+   - [x] a GGUF quantization measured in the reference (2026-10-10, section "A GGUF quantization"): unsloth
+         UD-Q4_K_XL's experts in four layers 0.053 against the original (ours 0.071, g32 0.063, 6 bits 0.051) for
+         +3.4 GiB per card; its Q8_0 dense weights alone move the outputs 0.064 (`QW_REF_DENSE_Q8`), more than fp16
+         arithmetic, and cancel the experts' gain. Neither adopted
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -2517,6 +2521,54 @@ that can be measured, but nothing a user would see changes: task scores equal, t
 noise, for -5% prefill, 1.40 GiB of VRAM per card (8 x 28,672 resident tokens instead of 8 x 45,056) and a cold
 prefix cache. Recommendation to the owner: roll production back to g128; keep the code (the g128 path is
 bit-identical, the g32 path is tested) in case the VRAM picture changes.
+
+## A GGUF quantization: its experts and its 8-bit dense weights (measured 2026-10-10)
+
+The owner asked whether `unsloth/Qwen3.8-Flash-Next-GGUF`, `UD-Q4_K_XL` (111 GB) would help, and what 8-bit dense
+weights cost. From the files' headers: the routed experts' `gate` and `up` are Q4_K (4.5 bits per weight) in 47
+layers and Q5_K in one, `down` is Q5_1 (6 bits) in 43 layers and Q8_0 (8.5) in five; the experts are 77.0 GB (ours
+62.3, the g32 checkpoint 69.9 as stored). Every other dense matrix is Q8_0 except the router, the shared expert's
+gate, the HC inject weights, GDN's a / b projections and the indexer's (F32 / BF16). GGUF keeps the original
+parametrization: no rescaled side tensors, the experts are a drop-in.
+
+**Experts** (`tools/expert_gguf_download.py`: HTTP ranges, dequantized with gguf-py; layers 2, 15, 30, 44, of which
+layer 2 is the Q5_K one and 2 and 30 have Q8_0 `down`, so the sample flatters the file). Relative error of the
+weights against the original: Q4_K 0.073, Q5_K 0.037, Q5_1 0.034-0.035, Q8_0 0.005 (ours 0.112-0.125, g32
+0.082-0.086). The fp32 reference with them in those four layers, against the original experts there:
+
+| in those four layers | mean \|dlogprob\| | top-1 | minus the checkpoint in use (95% CI) | log-likelihood |
+|---|---|---|---|---|
+| the checkpoint in use (g128) | 0.0709 | 96.4% | | -0.873 |
+| the g32 checkpoint | 0.0633 | 96.8% | -0.008 (-0.013, -0.003) | -0.875 |
+| **UD-Q4_K_XL experts** | **0.0526** | 97.2% | -0.018 (-0.023, -0.013) | -0.879 |
+| rounded to 6 bits / 8 bits | 0.0510 / 0.0448 | 97.5 / 97.9% | -0.020 / -0.026 | |
+
+As near the original as plain 6-bit rounding (+0.002, CI -0.002 to +0.006), at 5.1 bits per weight on average:
+~19.3 GB of experts per card against 15.6, **+3.4 GiB per card**, and three more kernel formats (Q4_K with 6-bit
+scales and minimums per 32, 5-bit values, int8).
+
+**8-bit dense weights** (`QW_REF_DENSE_Q8=1` in the reference: the matrices that file holds as Q8_0, rounded as Q8_0
+does, blocks of 32 along the inputs, scale max / 127 as fp16; `tools/gguf_q8_check.py` compares the rounding with six
+tensors of the file: bit-identical, the two GDN ones after undoing the file's head order):
+
+| the reference with | against | mean \|dlogprob\| | top-1 |
+|---|---|---|---|
+| Q8_0 dense, our experts | the plain reference | **0.0640** | 96.2% |
+| (the engine's fp16 arithmetic, for scale) | the plain reference | 0.044 | 97.7% |
+| UD-Q4_K_XL experts in four layers | the original experts there | 0.0526 | 97.2% |
+| UD-Q4_K_XL experts and Q8_0 dense | the original experts there | 0.0664 | 96.6% |
+
+- **Q8_0 dense weights move the outputs more than fp16 arithmetic does, and nearly as much as four layers of int4
+  experts** (0.064; 0.5-0.7% weight error). With the engine's own arithmetic on top the two would combine (the
+  2026-09-26 engine measurement of round-to-nearest int8 dense was +0.033 over fp16).
+- **They cancel what the better experts buy**: 0.053 -> 0.066 (+0.014, CI +0.009 to +0.018); against the checkpoint in
+  use the file's experts with its dense weights are -0.005 (CI -0.010 to +0.001), not significant.
+- Text log-likelihood unchanged (-0.878 and -0.876 against -0.873), as with every format so far.
+
+**Reading.** That file as it is run by llama.cpp (4-6 bit experts, 8-bit dense) is about as far from the original as
+what production serves (4-bit experts, fp16 dense); its experts alone on our fp16 dense weights would be the nearest
+measured so far, for 3.4 GiB per card. Not adopted, and 8-bit dense stays off: it saves ~1.2 GB per card (estimate) and
+no time at 8 rows, for an error larger than the engine's whole arithmetic. No task benchmark was run for either.
 
 ## Benchmarks against the model card (2026-10-08/09)
 
