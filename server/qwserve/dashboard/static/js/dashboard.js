@@ -64,10 +64,10 @@ function renderCharts(d) {
 function renderSlots(m) {
   const st = m.slot_state || [], vram = m.slot_vram || [];
   if (!st.length) { $("slots").innerHTML = ""; return; }
-  // every bar on one scale: at least twice the largest VRAM part, so both parts show
-  const scale = Math.max(2 * Math.max(...vram, 1), ...st.map(s => s.tokens));
+  // every bar is the slot's whole capacity wide, so its fill is the share the label states ("x of y tokens")
+  const scale = Math.max(...m.slots, 1);
   $("slots").innerHTML = st.map((s, i) => ui.slotBar(i, s.tokens, vram[i] ?? 0, m.slots[i], s.busy, scale)).join("");
-  $("slots-scale").textContent = `bar width ${fmt.count(scale)} tokens; tick: end of the VRAM part`;
+  $("slots-scale").textContent = `bar width ${fmt.count(scale)} tokens (a slot's capacity); tick: end of the VRAM part`;
 }
 
 function renderMemory(m) {
