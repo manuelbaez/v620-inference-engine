@@ -575,7 +575,11 @@ Where the remaining time goes (decode step, one card): ~4.9 ms dense GEMVs at
 launch gaps. Remaining ideas are small: reduced-vocabulary drafts (~5%), a
 chunked GDN prefill kernel, fp8 KV (capacity, not speed; changes output), and
 NVFP4 experts (possibly closer to the original than AWQ int4; costs ~1.5 GB
-per card and software FP4 decode on RDNA2; see DESIGN.md roadmap).
+per card and software FP4 decode on RDNA2; see DESIGN.md roadmap). Another
+4-bit quantization of the experts with a finer scale (zero points, a scale per
+32 inputs, 4.625 bits per weight) was measured in four layers of the reference:
+0.063 against 0.071 mean |dlogprob| from the original, for +1.76 GiB per card;
+not adopted (DESIGN.md "Another 4-bit quantization of the experts").
 
 ---
 

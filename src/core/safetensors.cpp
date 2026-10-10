@@ -108,7 +108,7 @@ void MappedFile::prefetch() const {
     ::madvise(data_, size_, MADV_WILLNEED);
 }
 
-void SafeTensors::add_file(const std::string &path) {
+void SafeTensors::add_file(const std::string &path, bool replace) {
     files_.push_back(std::make_unique<MappedFile>(path));
     const MappedFile &f = *files_.back();
     QW_CHECK(f.size() >= 8, "safetensors too small: " + path);
@@ -130,8 +130,8 @@ void SafeTensors::add_file(const std::string &path) {
         t.data = base + b;
         t.nbytes = size_t(e - b);
         QW_CHECK(t.nbytes == size_t(t.numel()) * dtype_size(t.dtype), "size mismatch for " + t.name);
-        QW_CHECK(tensors_.count(t.name) == 0, "duplicate tensor " + t.name);
-        tensors_.emplace(t.name, std::move(t));
+        QW_CHECK(replace || tensors_.count(t.name) == 0, "duplicate tensor " + t.name);
+        tensors_[t.name] = std::move(t);
     }
 }
 

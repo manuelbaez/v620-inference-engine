@@ -54,8 +54,9 @@ private:
 
 class SafeTensors {
 public:
-    // Opens one file and indexes its tensors.
-    void add_file(const std::string &path);
+    // Opens one file and indexes its tensors. With `replace`, its tensors take the place of those already indexed
+    // under the same name (an overlay for experiments); otherwise a repeated name is an error.
+    void add_file(const std::string &path, bool replace = false);
     // Opens every *.safetensors file named in <dir>/model.safetensors.index.json,
     // plus any extra files given.
     void add_index(const std::string &dir, const std::vector<std::string> &extra = {});

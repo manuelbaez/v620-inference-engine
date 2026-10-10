@@ -82,6 +82,12 @@ void State::reset() {
 Model::Model(const std::string &model_dir, const std::string &ple_dir, int threads) : pool_(threads) {
     check_config(model_dir);
     st_.add_index(model_dir);
+    // QW_REF_OVERLAY=FILE (experiment): the tensors of that safetensors file replace the checkpoint's of the same name
+    // (another quantization's side tensors for the layers whose experts come from QW_REF_EXPERTS_DIR).
+    if (const char *overlay = std::getenv("QW_REF_OVERLAY")) {
+        st_.add_file(overlay, true);
+        log("reference: overlay %s", overlay);
+    }
     ple_ = std::make_unique<PleTable>(ple_dir);
 }
 

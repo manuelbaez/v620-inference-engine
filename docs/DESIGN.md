@@ -712,6 +712,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          (the floor of the measure). The text's own log-likelihood is the same with every format (no sign that
          int4 predicts worse, only differently). Open: the task scores of the original model (a hosted endpoint)
          against ours, before any 6-bit expert path is built (+7 GiB per card)
+   - [x] another 4-bit quantization of the experts (2026-10-10, section of that name):
+         `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` (zero points, a scale per 32, 4.625 bits per weight) swapped into four
+         layers of the fp32 reference with its rescaled side tensors (`QW_REF_OVERLAY`): 0.063 mean |dlogprob| against
+         the original where the checkpoint in use gives 0.071 (-0.008, CI -0.013 to -0.003; 6 bits 0.051, floor
+         0.045); text log-likelihood equal. Not adopted: +1.76 GiB per card (1.64 free) and new expert kernels for a
+         tenth of a difference no task shows
    - [ ] NVFP4 experts (idea, not started): take only the routed experts from an NVFP4
          checkpoint (`nvidia/Qwen3.8-Flash-Next-NVFP4`; first check what it quantizes, dense
          layers must stay fp16). FP4 (E2M1) with an FP8 scale per 16 weights may round the
@@ -2352,6 +2358,66 @@ would spill to host memory (untested as a configuration; the compressed keys and
 plus a 6-bit expert path in the decode pair kernel and the prefill expert GEMM. Before that: whether the original
 model scores higher on the tasks at all (GSM8K / MMLU / ARC through a hosted endpoint of the original, against our
 92.3%); if it does not, the difference above is one that does not matter.
+
+## Another 4-bit quantization of the experts (measured 2026-10-10)
+
+Would the routed experts of a different 4-bit quantization be closer to the original model than the checkpoint in use?
+Tried with `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` (Hugging Face, 188 GB with the n-gram table). Like ours it
+quantizes only the routed experts and keeps the rest bf16, but differently:
+
+| | the checkpoint in use | the candidate |
+|---|---|---|
+| values | 4 bits, symmetric | 4 bits with a 4-bit zero point per group |
+| scale | bf16 per 128 inputs (min-max) | bf16 per 32 inputs (MSE) |
+| bits per weight | 4.125 | 4.625 (experts 62.3 -> 69.9 GB, +1.76 GiB per card) |
+| calibration (AWQ) | a scale between `up_proj` rows and `down_proj` columns (256 ultrachat samples) | that, and a scale per input channel of `gate_proj` / `up_proj` shared by a layer's experts |
+
+**It is not a drop-in set of expert weights.** The scale per input channel (median 1.17 and 1.24 in layers 2 and 15,
+5-95% 1.0-1.4) is divided out of the MLP's input and multiplied into everything else that reads it: in the four
+layers looked at
+`mlp_hyper_connection.{hc_norm, input_mix_weight_down, block_inject_weight}`, `mlp.gate`, `mlp.shared_expert.{gate,
+up}_proj` and `mlp.shared_expert_gate` differ from the original (an exact rescaling, stored again as bf16: 0.0016
+relative rounding). The other tensors of the layers are identical. Its experts alone on our side tensors would be
+about 20% wrong at the input, so the comparison takes both: `tools/expert_quant_download.py` (the experts of chosen
+layers by HTTP ranges, dequantized to bf16 in `expert_download.py`'s layout) and `tools/expert_quant_overlay.py`
+(the side tensors into one file for the reference's new switch `QW_REF_OVERLAY`).
+
+**Weights**, relative error against the original after removing the folded scales (five experts per layer, layers
+2, 15, 30, 44; unremoved the candidate reads 0.10-0.34 and means nothing):
+
+| | gate | up | down |
+|---|---|---|---|
+| the checkpoint in use | 0.112-0.129 | 0.112-0.125 | 0.111-0.121 |
+| the candidate | 0.082-0.086 | 0.082-0.086 | 0.082-0.086 |
+| (plain rounding of the original to 4 bits, scale per 128 / per 16, from the section above) | 0.106 / 0.080 | | |
+
+**Outputs.** The fp32 reference with the candidate's experts and side tensors in layers 2, 15, 30 and 44, the
+4,000-token set, against the reference with the original experts in those layers (the 2026-10-08 runs; the original
+run was repeated with today's binary and is byte-identical):
+
+| in those four layers | mean \|dlogprob\| | top-1 | minus the checkpoint in use (95% CI) | log-likelihood of the text |
+|---|---|---|---|---|
+| original | 0 | | | -0.880 |
+| the checkpoint in use | 0.0709 | 96.4% | | -0.873 |
+| the candidate | 0.0633 | 96.8% | -0.0076 (-0.0127, -0.0027) | -0.875 |
+| rounded to 6 bits | 0.0510 | 97.5% | -0.0200 (-0.0248, -0.0150) | -0.882 |
+| rounded to 8 bits (the floor of the measure) | 0.0448 | 97.9% | -0.0262 (-0.0312, -0.0215) | -0.879 |
+
+- **The candidate is closer to the original, by a little**: 0.063 against 0.071, significant, 29% of the distance
+  from our int4 to the floor; 6 bits is 0.012 better still (CI 0.008-0.017). Positions off by more than 0.1: 15.2%
+  against 16.2%.
+- **It pays for that with bits, not with better calibration, as far as this shows.** Its weight error (0.083) is what
+  plain rounding with a scale per 16 gives (0.080), and the output error follows the weight error across everything
+  measured (0.106 -> 0.070, 0.083 -> 0.063, 0.027 -> 0.051); the checkpoint in use, calibrated too, is no better
+  than plain rounding at its size.
+- **No better at predicting the text**: -0.875 against -0.873 (difference -0.002 +- 0.003), as for every format so far.
+
+**Not adopted.** It would need 1.76 GiB more per card where 1.64 GiB is free (KV slots would shrink or spill more), a
+zero point and a 32-wide scale in the decode pair kernel and in the prefill expert GEMM, and it buys a tenth of a
+difference that no task result has shown to matter (the hosted original scored lower than production on LiveCodeBench,
+"Benchmarks against the model card"). Four layers only; all 48 would need the whole checkpoint (188 GB) and a
+reference that reads zero points. What it does say: at 4 bits the scale granularity is where the error is, so if the
+experts are ever requantized, a finer scale (per 32 or 16) is the first thing to try and costs 0.4-0.9 bits per weight.
 
 ## Benchmarks against the model card (2026-10-08/09)
 
