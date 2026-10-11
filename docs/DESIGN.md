@@ -726,6 +726,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          179/198 (g128: 180), LiveCodeBench v6 153/175 (g128: 152, 153), no difference. Open: the owner's decision
          to keep it or roll back (recommended: roll back); the prefill 5%; the prefix cache's identity (R4) before
          two checkpoints share a cache directory
+   - [~] sixteen slots (2026-10-11, section of that name): supported (the spill cache's slot field was 3 bits:
+         fixed, `test_slots16`), but 16 streams give 243-251 tok/s against 294 for 8 streams with one draft each.
+         Open: profile a 16-stream step (~20 ms of it scale with the streams, not the rows)
    - [x] a GGUF quantization measured in the reference (2026-10-10, section "A GGUF quantization"): unsloth
          UD-Q4_K_XL's experts in four layers 0.053 against the original (ours 0.071, g32 0.063, 6 bits 0.051) for
          +3.4 GiB per card; its Q8_0 dense weights alone move the outputs 0.064 (`QW_REF_DENSE_Q8`), more than fp16
@@ -2569,6 +2572,39 @@ tensors of the file: bit-identical, the two GDN ones after undoing the file's he
 what production serves (4-bit experts, fp16 dense); its experts alone on our fp16 dense weights would be the nearest
 measured so far, for 3.4 GiB per card. Not adopted, and 8-bit dense stays off: it saves ~1.2 GB per card (estimate) and
 no time at 8 rows, for an error larger than the engine's whole arithmetic. No task benchmark was run for either.
+
+## Sixteen slots (built and measured 2026-10-11; supported, not used)
+
+The owner asked for 16 slots of 262,144 tokens to run a long benchmark faster. The engine was limited to 8
+(`Engine::MAX_SLOTS`), and one place would have gone wrong silently beyond that: the spill cache's tags and its miss
+list carried the slot number in 3 bits (`slot << 29` in the tag, `(y >> 25) & 7` in the fill kernel), so slot s + 8
+would have been served slot s's cached K and V rows. Now `cfg::MAX_SLOTS = 16`, the fields are 4 bits for the slot, 4
+for the QSA layer and 24 for the position (`cache_miss`, `cache_tag` in `kernels/types.hpp`), with a `static_assert`
+on each count and a check at start that every slot's capacity fits the position field. `MAX_SEGMENTS` (prompts of one
+prefill pass) stays 8.
+
+**Checks** (dev box, the g32 checkpoint): `tests/gpu/test_slots16` (two texts in slots 0-7 and 8-15, a resident slot
+and seven spilled ones each: prefill, 48 steps of 16 rows, runs of 4 rows with rollback, one slot changing its text:
+all bit-identical to the resident slot of the same text) passes; the same test built with the old 3-bit field fails
+at slot 9, as it should; `test_spill` passes; `test_speculative` with 8, 12 and 16 prompts: plain == speculative ==
+engine greedy.
+
+**Memory.** 16 x 12,288 tokens in VRAM with 262,144 capacity each loads with 1.97 GiB free per card (g32 checkpoint,
+`QW_SPILL_CACHE_MB=960`; 106.4 GB of spill pinned, the same as 8 x 524k).
+
+**Speed: lower, not higher** (`test_speculative --session-only --gen 192`, aggregate tok/s, same build and window):
+
+| streams | drafts per stream | tok/s |
+|---|---|---|
+| 8 | 1 | 294 |
+| 12 | 0 | 220-225 |
+| 16 | 0 | 243-251 |
+
+A step of 16 rows from 16 slots takes ~64 ms where 16 rows from 8 slots take ~44 ms (and 8 rows of plain decode 26 ms
+in `test_batch_decode`): ~20 ms of a step grow with the number of streams, not with the rows. Not profiled; candidates
+are the per-request host work of `Session::generate` (`accept()` syncs every rank once per request per step, review
+point P2) and per-slot state on the cards (rows of one slot share its tables). So the estimate that 16 streams would
+give ~380 tok/s was wrong, production keeps 8 slots, and more slots only pay once that per-stream cost is found.
 
 ## Benchmarks against the model card (2026-10-08/09)
 
