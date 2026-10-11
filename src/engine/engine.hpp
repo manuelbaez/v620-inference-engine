@@ -80,7 +80,7 @@ class Engine {
 public:
     static constexpr int MAX_SLOTS = cfg::MAX_SLOTS;  // 16; a decode step takes up to MAX_BATCH_ROWS rows
     static constexpr int SNAPSHOTS = 8;
-    static constexpr int MAX_BATCH_ROWS = 16;  // rows of one decode / draft step
+    static constexpr int MAX_BATCH_ROWS = 32;  // rows of one decode / draft step (gpu::MAX_ROWS)
 
     explicit Engine(const EngineOptions &opt);
     ~Engine();
@@ -448,8 +448,8 @@ private:
     std::vector<uint16_t> dple_;                                           // [M][H] fp16
     std::vector<float> dlogits_;                                           // [M][VOCAB]
     std::vector<float> dlse_;                                              // [M]
-    std::vector<float> dlse_parts_ = std::vector<float>(RANKS * 16 * 2);   // [rank][MAX_ROWS][max, sumexp]
-    std::vector<float> damax_parts_ = std::vector<float>(RANKS * 16 * 2);  // [rank][MAX_ROWS][max, index bits]
+    std::vector<float> dlse_parts_ = std::vector<float>(RANKS * MAX_BATCH_ROWS * 2);   // [rank][MAX_ROWS][max, sumexp]
+    std::vector<float> damax_parts_ = std::vector<float>(RANKS * MAX_BATCH_ROWS * 2);  // [rank][MAX_ROWS][max, index bits]
     std::vector<std::vector<int32_t>> drafts_;
     std::vector<float> logits_;
 

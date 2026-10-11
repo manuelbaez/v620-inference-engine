@@ -1,5 +1,5 @@
 // gemv_rows and gemv_rows_i8 (int8 weights, per-row scales) for every batch
-// row count (1..16) and the model's shapes against a CPU reference, including
+// row count (1..32) and the model's shapes against a CPU reference, including
 // the grouped (rows-per-group) form of the HC down projection and output rows
 // with a stride.
 #include <hip/hip_runtime.h>
@@ -12,6 +12,7 @@
 
 #include "core/common.hpp"
 #include "engine/weight_convert.hpp"
+#include "kernels/types.hpp"
 #include "kernels/gemv.hpp"
 
 using namespace qw;
@@ -34,18 +35,18 @@ int main() {
                                 {2560, 1536, 1536, 2560, 0}, {4120, 2560, 2560, 4120, 0}, {2560, 160, 160, 2560, 0}};
         int fails = 0;
         for (const Shape &sh : shapes) {
-            std::vector<uint16_t> W(size_t(sh.N) * sh.K), x(size_t(16) * sh.xs);
+            std::vector<uint16_t> W(size_t(sh.N) * sh.K), x(size_t(gpu::MAX_ROWS) * sh.xs);
             for (auto &v : W) v = f32_to_f16(std::uniform_real_distribution<float>(-1, 1)(rng));
             for (auto &v : x) v = f32_to_f16(std::uniform_real_distribution<float>(-1, 1)(rng));
             uint16_t *dW, *dx;
             float *dy;
-            const size_t ybytes = (size_t(16) * sh.ys + 4096) * 4;  // + guard
+            const size_t ybytes = (size_t(gpu::MAX_ROWS) * sh.ys + 4096) * 4;  // + guard
             CK(hipMalloc(&dW, W.size() * 2));
             CK(hipMalloc(&dx, x.size() * 2));
             CK(hipMalloc(&dy, ybytes));
             CK(hipMemcpy(dW, W.data(), W.size() * 2, hipMemcpyHostToDevice));
             CK(hipMemcpy(dx, x.data(), x.size() * 2, hipMemcpyHostToDevice));
-            for (int M = 1; M <= 16; ++M) {
+            for (int M = 1; M <= gpu::MAX_ROWS; ++M) {
                 std::vector<float> guard(ybytes / 4, 12345.f);
                 CK(hipMemcpy(dy, guard.data(), ybytes, hipMemcpyHostToDevice));
                 gpu::gemv_rows(dW, dx, sh.xs, dy, sh.ys, sh.N, sh.K, M, sh.rpg, false, nullptr);
@@ -74,7 +75,7 @@ int main() {
                     std::printf("N=%d K=%d M=%d: max err %.4g, stray writes %d  FAIL\n", sh.N, sh.K, M, worst,
                                 overwritten);
             }
-            std::printf("N=%4d K=%4d rpg=%3d: M=1..16 %s\n", sh.N, sh.K, sh.rpg, fails ? "(see above)" : "ok");
+            std::printf("N=%4d K=%4d rpg=%3d: M=1..32 %s\n", sh.N, sh.K, sh.rpg, fails ? "(see above)" : "ok");
             {  // int8 weights: against the same product with the dequantized weights
                 std::vector<int8_t> q;
                 std::vector<float> sc;
@@ -86,7 +87,7 @@ int main() {
                 CK(hipMemcpy(dq, q.data(), q.size(), hipMemcpyHostToDevice));
                 CK(hipMemcpy(ds, sc.data(), sc.size() * 4, hipMemcpyHostToDevice));
                 double worst = 0, qerr = 0;
-                for (int M = 1; M <= 16; ++M) {
+                for (int M = 1; M <= gpu::MAX_ROWS; ++M) {
                     gpu::gemv_rows_i8(dq, ds, dx, sh.xs, dy, sh.ys, sh.N, sh.K, M, sh.rpg, false, nullptr);
                     CK(hipDeviceSynchronize());
                     std::vector<float> y(ybytes / 4);

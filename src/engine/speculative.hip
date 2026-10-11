@@ -69,7 +69,7 @@ const std::vector<std::vector<int32_t>> &Engine::draft(const std::vector<DraftRe
     drafts_.assign(reqs.size(), {});
     if (!mtp_ || k <= 0 || reqs.empty()) return drafts_;
     constexpr int MR = gpu::MAX_ROWS;
-    QW_CHECK(k <= MR, "draft: at most 16 steps");
+    QW_CHECK(k <= MR, "draft: at most 32 steps");
     dsteps_.assign(size_t(k), {});
     // step 0: the slots' not yet MTP-processed tokens
     std::vector<Row> rows;

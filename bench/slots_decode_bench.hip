@@ -1,4 +1,4 @@
-// The engine's decode step by how its rows are spread over slots: S slots with k rows each (S * k <= 16), e.g. 8 x 2
+// The engine's decode step by how its rows are spread over slots: S slots with k rows each (S * k <= 32), e.g. 8 x 2
 // (eight streams with one draft row each) against 16 x 1 (sixteen streams). Engine::decode only: no sampling, no
 // session, so what differs between the shapes is on the cards and in the engine's own per-step host work.
 //   slots_decode_bench [--tokens-file F] [--ctx 400] [--steps 48]
@@ -45,7 +45,8 @@ int main(int argc, char **argv) {
                                                                            : 100 + ((i + s * 977) * 7919) % 30000;
             return p;
         };
-        const int shapes[][2] = {{1, 1}, {8, 1}, {8, 2}, {16, 1}, {4, 4}, {4, 2}, {2, 8}, {12, 1}, {1, 16}, {16, 1}, {8, 2}};
+        const int shapes[][2] = {{1, 1}, {8, 1}, {8, 2}, {16, 1}, {4, 4}, {12, 1}, {16, 2}, {12, 2}, {8, 4}, {8, 3},
+                                 {16, 1}, {8, 2}, {16, 2}};
         for (const auto &sh : shapes) {
             const int S = sh[0], k = sh[1];
             std::vector<int> cur(static_cast<size_t>(S));

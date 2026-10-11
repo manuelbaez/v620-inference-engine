@@ -1,4 +1,4 @@
-// Skinny fp16 GEMV for decode batches (M <= 16 rows): one wave per weight row,
+// Skinny fp16 GEMV for decode batches (M <= MAX_ROWS = 32 rows): one wave per weight row,
 // every row's activations dotted against it (weights read once).
 #pragma once
 

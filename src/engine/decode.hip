@@ -47,7 +47,7 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
     auto allgather = [&](const void *src, void *dst, size_t bytes) { comm_->allgather(r, src, dst, bytes, ++k, s, M); };
     const gpu::Rows rows{b.row_slot, b.row_pos, b.row_first, M};
     const gpu::SpillCache *cache = rk.cache.tags ? &rk.cache : nullptr;
-    static const int moe_pair_max = std::getenv("QW_MOE_PAIR_MAX") ? std::atoi(std::getenv("QW_MOE_PAIR_MAX")) : 16;
+    static const int moe_pair_max = std::getenv("QW_MOE_PAIR_MAX") ? std::atoi(std::getenv("QW_MOE_PAIR_MAX")) : 32;
 
     auto mix = [&](const HcW &w, const float *pend, const float *pend_inj, float *inj_out) {
         gpu::hc_pre_B(b.X, pend, pend_inj, w.w1, b.y, b.hc_send, M, s);
@@ -185,8 +185,9 @@ namespace {
 // QW_TRACE: host-side phases of decode steps, per row count
 struct DecodeTrace {
     bool on = std::getenv("QW_TRACE") != nullptr;
-    double prep[17] = {}, graph[17] = {}, copy[17] = {}, total[17] = {};
-    int n[17] = {};
+    double prep[gpu::MAX_ROWS + 1] = {}, graph[gpu::MAX_ROWS + 1] = {}, copy[gpu::MAX_ROWS + 1] = {},
+           total[gpu::MAX_ROWS + 1] = {};
+    int n[gpu::MAX_ROWS + 1] = {};
     static double ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
         return std::chrono::duration<double, std::milli>(b - a).count();
     }
@@ -340,7 +341,7 @@ void Engine::run_draft_rank(Rank &rk) {
 // a batch job; pos[i] is row i's position.
 void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos, bool embeddings) {
     const int M = int(rows.size());
-    QW_CHECK(M >= 1 && M <= gpu::MAX_ROWS, "batch: 1..16 rows");
+    QW_CHECK(M >= 1 && M <= gpu::MAX_ROWS, "batch: 1..32 rows");
     constexpr int MR = gpu::MAX_ROWS;
     djob_.M = M;
     djob_.i32.assign(5 * MR, 0);
