@@ -2725,6 +2725,26 @@ answer each, sampled; the second line with 4 short requests arriving from 5 s on
 | in parallel | 60, 80, 88, 99, 102, 103, 104, 106 | **113.7 s** | 92.7 s | |
 | ... with short requests | 64 ... 107 | 114.7 s | 93.6 s | 0.6-1.1 s |
 
+**Sixteen prompts a pass (2026-10-11 evening, `qw-engine:5f2e8b2`; the owner asked for it and to watch for cache
+misses).** `Engine::MAX_SEGMENTS` is 16 (was 8); the scheduler's passes follow (`QW_PREFILL_MAX_SEGMENTS`, 8 = as
+before). The VRAM snapshot pool stays at 8, so `Session::prefill_batch` now gives a pass's captures (a snapshot
+inside a piece, e.g. at a system prompt's end) one pool entry each while the pool lasts, saves them to the store
+first and only then snapshots the segments' ends: before, eight segments with a capture each would have reserved the
+whole pool and left none for the ends (not seen in production). A segment left without a capture loses only that
+intermediate snapshot. Dev box, g128: `logits_dump` bit-identical; `test_block_store`, `test_host_tier`,
+`test_snapshot_capture` pass; `test_batch_prefill` with 12 prompts passes and with 4, 8 and 16 reports one or two
+prompts over its tolerance (max |dlogit| 1.7-2.7), exactly as the build before does on the same four text prompts
+(2.1720 and 1.7374 on both: the tolerance, whose own noise-floor case shows up to 2.0, not the change); 16 prompts of
+400 tokens in one pass 2.46 s against 4.40 s one by one. Server on the dev box, 16 conversations at once, then their
+second turns, then new conversations on the same system prompts: second turns fully cached in 16 of 16 in four of
+five runs and in 13 of 16 in one (one conversation was restored from the store into another's slot, which pushed
+three conversations out that the store did not hold; why the first one did not continue in its own slot is not
+established); production's code: 16 of 16 in five of five. Deployed on that evidence, with
+`/home/server/qw-tools/cache-report.py` (requests, share of prompt tokens from the cache and "cold repeats" per
+period, from the request log) to watch production: before the change, 0-2 cold repeats per 12 hours of real traffic.
+In the same runs no new conversation reused an existing system prompt of ~3,000 tokens from the store on either
+build: not looked at yet.
+
 The batch finishes 10% sooner and the first answer comes 49 s later: the trade the owner asked for. It is less than
 the ~90 s a pure 2,300 tok/s would give: the stats line shows 1,880-1,910 prompt tok/s while all eight prefill
 (pieces of 512 tokens at 20k of context) and 1,300-1,700 once the first ones decode beside the rest (passes of 2,048
