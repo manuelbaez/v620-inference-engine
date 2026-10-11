@@ -728,8 +728,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          two checkpoints share a cache directory
    - [~] sixteen slots (2026-10-11, section of that name): supported (the spill cache's slot field was 3 bits:
          fixed, `test_slots16`). The raw step: 16 slots x 1 row 40.7 ms against 8 x 2 rows 38.4 ms, so ~+11%
-         aggregate tok/s for 16 streams at half the speed per stream; 16 x 262k fits (g128, 18,432 in VRAM each).
-         Open: the owner's decision on the layout; why `test_speculative` reports 16 streams 24 ms per step slower
+         aggregate tok/s for 16 streams at half the speed per stream; 16 x 262k fits (g128, 18,432 in VRAM each)
+         and serves production since 2026-10-11 14:49 UTC: 372-386 tok/s at 16 requests against 308-312 at 8.
+         Open: steps of 32 rows (a draft per stream at 16 streams; started 2026-10-11); why `test_speculative` reports 16 streams 24 ms per step slower
          than its own trace; the dev-box server's step times (51-88 ms) against production's
    - [x] a GGUF quantization measured in the reference (2026-10-10, section "A GGUF quantization"): unsloth
          UD-Q4_K_XL's experts in four layers 0.053 against the original (ours 0.071, g32 0.063, 6 bits 0.051) for
@@ -2626,8 +2627,21 @@ windows of pure decoding): 16 requests 296-307 tok/s at 51-53 ms per step, 12 re
 (one draft each) 229-238 at 58-59 ms; the 8 x 524k layout started after it: 8 requests 157-184 tok/s at 75-88 ms per
 step. Those server step times are far above the engine's (38-41 ms) and above production's own (42-50 ms at 8
 streams, 265-285 tok/s), and the two layouts ran in different server starts, so they rank the layouts (16 streams
-ahead) but are not production figures. Not deployed: the layout halves a conversation's capacity to 262k and is the
-owner's decision; production's stats line would give the real numbers.
+ahead) but are not production figures. 
+**In production since 2026-10-11 14:49 UTC, at the owner's request** (`qw-engine:cbf5c7a`, the g128 checkpoint again:
+the g32 experiment ended with it; llama-swap's command has `--slots 18432 x 16 --slot-max-tokens 262144`; ready in
+264 s, 1.76 GiB of VRAM free per card, the original prefix cache back with 199.7 GB on disk). Production's stats line
+under short sampled requests from the dev box (windows of pure decoding):
+
+| requests at once | aggregate tok/s | ms / step | per request |
+|---|---|---|---|
+| 8 (one draft each) | 308-312 | 42-43 | ~39 tok/s |
+| 12 | 321-326 | 36 | ~27 |
+| 16 | 372-386 | 41 | ~24 |
+
++22% in aggregate at 16 requests; up to 8 requests behave as before; a conversation's capacity is 262k instead of
+524k. Back to 8 slots: delete the two options from the command (the g32 experiment's settings are in
+`config.yaml.bak-g32-experiment-1011`). The dev-box server's slower steps above remain unexplained.
 
 ## Benchmarks against the model card (2026-10-08/09)
 

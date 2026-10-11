@@ -102,8 +102,9 @@ Measured through HTTP (2026-09-24/25):
 
 - `/mnt/llms/qwen3.8-flash-next-awq`: AWQ checkpoint (int4 experts, bf16 rest)
 - `/mnt/llms/qwen3.8-flash-next-awq-g32`: another quantization of the experts (zero points, a scale per 32 inputs;
-  `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` without its n-gram table), an experiment that serves production since
-  2026-10-10 while its benchmarks run (docs/DESIGN.md, "Experts with a scale per 32 and zero points")
+  `cyankiwi/Qwen3.8-Flash-Next-AWQ-INT4` without its n-gram table), an experiment that served production
+  2026-10-10/11 and scored the same on GPQA Diamond and LiveCodeBench v6 (docs/DESIGN.md, "Experts with a scale per
+  32 and zero points"); production is back on the checkpoint above, with 16 slots of 262k since 2026-10-11
 - `/mnt/llms/qwen3.8-flash-next-ple/ples_int4`, `ples_int8`, `ples_fp8`, `ples_bf16`: the
   n-gram table sidecar in four precisions (int4 is the `--ple-dir` default; bf16 is Qwen's
   original, `tools/ple_download.py` + `tools/ple_convert.py`; fp8 is from Qwen's FP8
