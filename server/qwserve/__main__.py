@@ -8,7 +8,7 @@ from aiohttp import web
 
 from . import __doc__ as DOC
 from . import dashboard
-from .api import Server
+from .api import RUN_OPTIONS, Server
 
 
 def main():
@@ -62,7 +62,7 @@ def main():
     app.router.add_post("/v1/chat/completions", srv.chat)
     app.router.add_post("/v1/completions", srv.completions)
     app.on_shutdown.append(srv.on_shutdown)
-    web.run_app(app, host=args.host, port=args.port, access_log=None)
+    web.run_app(app, host=args.host, port=args.port, access_log=None, **RUN_OPTIONS)
 
 
 if __name__ == "__main__":

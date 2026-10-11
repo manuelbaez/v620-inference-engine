@@ -47,7 +47,9 @@ class FakeEngine:
     has_mtp = False
     prefill_chunk = 4096
 
-    def __init__(self, capacity=(8192, 8192), step_s=0.0):
+    def __init__(self, capacity=(8192, 8192), step_s=0.0, prefill_s=0.0):
+        self.prefill_s = prefill_s  # seconds per prefill pass (a prompt takes len / prefill_chunk passes)
+        self.prefills = 0
         self.capacity = list(capacity)
         self.max_tokens = max(self.capacity)
         self.vram_tokens = list(capacity)
@@ -102,6 +104,9 @@ class FakeEngine:
         return self.prefill_batch([(slot, n)])[0]
 
     def prefill_batch(self, pairs):
+        self.prefills += 1
+        if self.prefill_s:
+            time.sleep(self.prefill_s)
         done = []
         for slot, n in pairs:
             self.left[slot] -= min(n, self.left[slot])

@@ -19,6 +19,13 @@ from .scheduler import Request, Scheduler, sampling_defaults
 from . import vision
 
 
+# How the HTTP server runs. handler_cancellation: aiohttp cancels a request's handler when its client disconnects,
+# which sets the request's `cancelled` (the `finally` of Server.run) so the scheduler drops it wherever it is:
+# waiting, loading, prefilling or decoding. Without it the server only notices on its next write to the socket, so a
+# cancelled request ran its whole prefill first, and one that does not stream ran to its last token.
+RUN_OPTIONS = {"handler_cancellation": True}
+
+
 class Server:
     sampling_defaults = {}  # the model's generation_config.json, for what a request does not set
 
