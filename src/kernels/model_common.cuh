@@ -262,7 +262,7 @@ __device__ inline void attend_body(const uint4 *q, const uint4 *K, const uint4 *
             } else if (lane == 0) {
                 const uint32_t i = atomicAdd(c.miss_n, 1u);
                 if (i < c.miss_cap)
-                    c.miss[i] = make_uint2(e, uint32_t(tok) | (uint32_t(slot) << 25) | (uint32_t(layer) << 28));
+                    c.miss[i] = make_uint2(e, cache_miss(slot, layer, tok));
                 if (c.stats) atomicAdd(c.stats + 1, 1ull);
             }
         }

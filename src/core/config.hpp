@@ -64,6 +64,7 @@ constexpr int GDN_CONV = 4;
 constexpr int GDN_RING = 8;
 
 // MoE
+constexpr int MAX_SLOTS = 16;  // sequence slots of an engine (kernels/types.hpp packs a slot into 4 bits)
 constexpr int N_EXPERTS = 512;
 constexpr int TOP_K = 10;
 constexpr int FFN = 640;     // routed and shared intermediate

@@ -78,7 +78,7 @@ struct EngineOptions {
 
 class Engine {
 public:
-    static constexpr int MAX_SLOTS = 8;
+    static constexpr int MAX_SLOTS = cfg::MAX_SLOTS;  // 16; a decode step takes up to MAX_BATCH_ROWS rows
     static constexpr int SNAPSHOTS = 8;
     static constexpr int MAX_BATCH_ROWS = 16;  // rows of one decode / draft step
 
@@ -130,7 +130,7 @@ public:
         std::vector<int32_t> tokens;
         std::vector<Capture> captures;
     };
-    static constexpr int MAX_SEGMENTS = MAX_SLOTS;
+    static constexpr int MAX_SEGMENTS = 8;  // prompts prefilled in one pass
     const std::vector<std::vector<float>> &prefill_batch(const std::vector<Segment> &segs);
 
     struct Row {

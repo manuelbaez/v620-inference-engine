@@ -271,7 +271,8 @@ __global__ __launch_bounds__(256) void spill_cache_fill_kernel(const SlotPtrs *t
     const int lane = threadIdx.x % WAVE;
     for (uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) / WAVE; i < n; i += gridDim.x * blockDim.x / WAVE) {
         const uint2 m = c.miss[i];
-        const int pos = int(m.y & 0x1ffffffu), slot = int((m.y >> 25) & 7u), layer = int(m.y >> 28);
+        const int pos = int(m.y & ((1u << CACHE_POS_BITS) - 1)), slot = int((m.y >> CACHE_POS_BITS) & 15u),
+                  layer = int(m.y >> (CACHE_POS_BITS + 4));
         const unsigned long long want = cache_tag(c.epoch[slot], slot, layer, pos);
         int claimed = 0;
         if (lane == 0) {

@@ -19,6 +19,10 @@ namespace qw::gpu {
 using namespace cfg;
 
 constexpr int MAX_ROWS = 16;
+// The spill cache's tags and miss list give a slot 4 bits, a QSA layer 4 bits and a position CACHE_POS_BITS
+// (cache_tag, cache_miss below): more slots (cfg::MAX_SLOTS), layers or a longer slot need wider fields there, and
+// the checks beside them fail the build or the start first.
+constexpr int CACHE_POS_BITS = 24;
 constexpr int QSA_LAYERS_MAX = N_QSA + 1;  // + the MTP layer
 constexpr int D_PAD = 328;                 // HC down outputs (320 + 4 inject) padded to 16 bytes
 constexpr int LIST_W = 2052;               // QSA attention token-list width (512 groups x 4 + tail)
@@ -62,15 +66,20 @@ struct SpillCache {
     uint16_t *K = nullptr, *V = nullptr;  // [entries][HEAD_DIM]
     uint32_t entries = 0;
     const uint32_t *epoch = nullptr;  // [slots]
-    uint2 *miss = nullptr;            // [miss_cap]: (entry, position | slot << 25 | layer << 28)
+    uint2 *miss = nullptr;            // [miss_cap]: (entry, cache_miss(slot, layer, position))
     uint32_t *miss_n = nullptr;
     uint32_t miss_cap = 0;
     unsigned long long *stats = nullptr;  // [2] hits, misses (QW_SPILL_CACHE_STATS), or null
 };
 constexpr unsigned long long CACHE_LOCK = ~0ull;
+static_assert(cfg::MAX_SLOTS <= 16, "the spill cache's tags hold a slot in 4 bits");
+// position | slot << 24 | layer << 28: the low word of a tag, and a miss-list entry
+__host__ __device__ inline uint32_t cache_miss(int slot, int layer, int64_t pos) {
+    return static_cast<uint32_t>(pos) | (static_cast<uint32_t>(slot) << CACHE_POS_BITS) |
+           (static_cast<uint32_t>(layer) << (CACHE_POS_BITS + 4));
+}
 __host__ __device__ inline unsigned long long cache_tag(uint32_t epoch, int slot, int layer, int64_t pos) {
-    return (static_cast<unsigned long long>(epoch) << 32) | (static_cast<unsigned long long>(slot) << 29) |
-           (static_cast<unsigned long long>(layer) << 25) | static_cast<unsigned long long>(pos);
+    return (static_cast<unsigned long long>(epoch) << 32) | cache_miss(slot, layer, pos);
 }
 __host__ __device__ inline uint32_t cache_entry(int slot, int layer, int64_t pos, uint32_t entries) {
     return (static_cast<uint32_t>(pos) + static_cast<uint32_t>(slot * 16 + layer) * 2654435761u) % entries;
