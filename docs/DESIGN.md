@@ -727,8 +727,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          to keep it or roll back (recommended: roll back); the prefill 5%; the prefix cache's identity (R4) before
          two checkpoints share a cache directory
    - [~] sixteen slots (2026-10-11, section of that name): supported (the spill cache's slot field was 3 bits:
-         fixed, `test_slots16`), but 16 streams give 243-251 tok/s against 294 for 8 streams with one draft each.
-         Open: profile a 16-stream step (~20 ms of it scale with the streams, not the rows)
+         fixed, `test_slots16`). The raw step: 16 slots x 1 row 40.7 ms against 8 x 2 rows 38.4 ms, so ~+11%
+         aggregate tok/s for 16 streams at half the speed per stream; 16 x 262k fits (g128, 18,432 in VRAM each).
+         Open: the owner's decision on the layout; why `test_speculative` reports 16 streams 24 ms per step slower
+         than its own trace; the dev-box server's step times (51-88 ms) against production's
    - [x] a GGUF quantization measured in the reference (2026-10-10, section "A GGUF quantization"): unsloth
          UD-Q4_K_XL's experts in four layers 0.053 against the original (ours 0.071, g32 0.063, 6 bits 0.051) for
          +3.4 GiB per card; its Q8_0 dense weights alone move the outputs 0.064 (`QW_REF_DENSE_Q8`), more than fp16
@@ -2573,7 +2575,7 @@ what production serves (4-bit experts, fp16 dense); its experts alone on our fp1
 measured so far, for 3.4 GiB per card. Not adopted, and 8-bit dense stays off: it saves ~1.2 GB per card (estimate) and
 no time at 8 rows, for an error larger than the engine's whole arithmetic. No task benchmark was run for either.
 
-## Sixteen slots (built and measured 2026-10-11; supported, not used)
+## Sixteen slots (built and measured 2026-10-11; supported, not in production)
 
 The owner asked for 16 slots of 262,144 tokens to run a long benchmark faster. The engine was limited to 8
 (`Engine::MAX_SLOTS`), and one place would have gone wrong silently beyond that: the spill cache's tags and its miss
@@ -2592,7 +2594,7 @@ engine greedy.
 **Memory.** 16 x 12,288 tokens in VRAM with 262,144 capacity each loads with 1.97 GiB free per card (g32 checkpoint,
 `QW_SPILL_CACHE_MB=960`; 106.4 GB of spill pinned, the same as 8 x 524k).
 
-**Speed: lower, not higher** (`test_speculative --session-only --gen 192`, aggregate tok/s, same build and window):
+**Speed, first measurement** (`test_speculative --session-only --gen 192`, aggregate tok/s, same build and window; see the correction below):
 
 | streams | drafts per stream | tok/s |
 |---|---|---|
@@ -2600,11 +2602,32 @@ engine greedy.
 | 12 | 0 | 220-225 |
 | 16 | 0 | 243-251 |
 
-A step of 16 rows from 16 slots takes ~64 ms where 16 rows from 8 slots take ~44 ms (and 8 rows of plain decode 26 ms
-in `test_batch_decode`): ~20 ms of a step grow with the number of streams, not with the rows. Not profiled; candidates
-are the per-request host work of `Session::generate` (`accept()` syncs every rank once per request per step, review
-point P2) and per-slot state on the cards (rows of one slot share its tables). So the estimate that 16 streams would
-give ~380 tok/s was wrong, production keeps 8 slots, and more slots only pay once that per-stream cost is found.
+**Correction (same night, the g128 checkpoint, `bench/slots_decode_bench`):** that table is not the engine. The raw
+decode step by how its rows are spread over the slots (text tokens, 400 of context per slot):
+
+| slots x rows per slot | ms / step |
+|---|---|
+| 1 x 1 | 14.5 |
+| 8 x 1 / 4 x 2 | 28.2 / 27.4 |
+| 12 x 1 | 35.0 |
+| 16 x 1 | 40.6-40.8 |
+| 8 x 2 / 4 x 4 / 2 x 8 / 1 x 16 | 38.4 / 37.5 / 37.1 / 37.4 |
+
+Sixteen rows from sixteen slots cost 6% more than sixteen rows from eight (40.7 against 38.4 ms): 16 tokens per
+step against the ~13.6 that eight streams with one draft each get, i.e. ~393 against ~354 tok/s, +11% in aggregate
+and 24.6 instead of ~44 tok/s per stream. `QW_TRACE` in the 16-stream `test_speculative` run agrees (decode 39-40 ms
+per step, sampling and accept 0.05 ms), yet that test's aggregate (227-250 tok/s on g128 too; 302 at 8 streams)
+corresponds to 64 ms per step: ~24 ms per step are spent outside the traced phases in that program, not found yet.
+
+**The layout the owner asked about, 16 x 262,144 with 18,432 tokens of each in VRAM (g128):** loads with 1.76 GiB free
+per card (106 GB of spill pinned, as 8 x 524k); one decode step over all 16 slots 37.9 ms (`slots_probe`). The server
+on the dev box (`--slots 18432 x 16 --slot-max-tokens 262144`, sampled requests of 700 tokens, the stats line's
+windows of pure decoding): 16 requests 296-307 tok/s at 51-53 ms per step, 12 requests 258 at 46 ms, 8 requests
+(one draft each) 229-238 at 58-59 ms; the 8 x 524k layout started after it: 8 requests 157-184 tok/s at 75-88 ms per
+step. Those server step times are far above the engine's (38-41 ms) and above production's own (42-50 ms at 8
+streams, 265-285 tok/s), and the two layouts ran in different server starts, so they rank the layouts (16 streams
+ahead) but are not production figures. Not deployed: the layout halves a conversation's capacity to 262k and is the
+owner's decision; production's stats line would give the real numbers.
 
 ## Benchmarks against the model card (2026-10-08/09)
 

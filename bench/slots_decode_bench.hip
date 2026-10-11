@@ -2,7 +2,7 @@
 // (eight streams with one draft row each) against 16 x 1 (sixteen streams). Engine::decode only: no sampling, no
 // session, so what differs between the shapes is on the cards and in the engine's own per-step host work.
 //   slots_decode_bench [--tokens-file F] [--ctx 400] [--steps 48]
-// Sixteen slots of 8,192 tokens; each slot is prefilled with its own --ctx tokens (of F, or an arithmetic sequence).
+// Sixteen slots of 16,384 tokens; each slot is prefilled with its own --ctx tokens (of F, or an arithmetic sequence).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
         }
         constexpr int S_MAX = Engine::MAX_SLOTS;
         EngineOptions opt;
-        opt.slot_tokens.assign(S_MAX, 8192);
+        opt.slot_tokens.assign(S_MAX, 16384);  // (the start-up warm-up needs more than 8,192 in a slot)
         if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;
         Engine e(opt);
         const auto prompt = [&](int s) {
