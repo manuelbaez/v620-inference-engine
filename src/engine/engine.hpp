@@ -130,7 +130,7 @@ public:
         std::vector<int32_t> tokens;
         std::vector<Capture> captures;
     };
-    static constexpr int MAX_SEGMENTS = 8;  // prompts prefilled in one pass
+    static constexpr int MAX_SEGMENTS = cfg::MAX_SLOTS;  // prompts prefilled in one pass (16; 8 until 2026-10-12)
     const std::vector<std::vector<float>> &prefill_batch(const std::vector<Segment> &segs);
 
     struct Row {

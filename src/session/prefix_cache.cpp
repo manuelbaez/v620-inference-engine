@@ -41,7 +41,7 @@ bool Session::prefetch(int slot, const std::vector<int32_t> &prompt, const std::
 std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
                                                     int max_caps, bool append) {
     std::vector<Engine::Capture> caps;
-    if (!store_ || boundary_ < 0) return caps;
+    if (!store_ || boundary_ < 0 || max_caps <= 0) return caps;
     const int64_t chunk = e_.prefill_chunk(), n = to;
     // chunk k of this prefill covers positions (from + k * chunk, from + (k + 1) * chunk]
     std::vector<std::vector<int64_t>> per_chunk(size_t((n - from + chunk - 1) / chunk));
@@ -144,7 +144,10 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
         for (const auto &[slot, max_tokens] : reqs) done.push_back(prefill_some(slot, max_tokens));
         return done;
     }
-    // snapshots to capture into: at most half the VRAM pool over all segments, the rest for their ends
+    // Snapshots to capture into: a capture holds one VRAM snapshot until its save after the pass, so the pass's
+    // captures together fit the pool (the segments' ends are snapshotted after those saves, below). Up to four
+    // segments share half the pool as before; beyond that each gets one while the pool lasts, and a segment left
+    // without one only loses a snapshot inside its piece (its end is saved as always).
     const int caps_each = std::max(1, Engine::SNAPSHOTS / 2 / int(pieces.size()));
     std::vector<Engine::Segment> segs;
     size_t blocks = 0, snaps = 0;
@@ -152,7 +155,8 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
     for (const Piece &pc : pieces) {
         const auto &prompt = slots_[size_t(pc.slot)].pending;
         drop_snapshots_after(pc.slot, pc.from);
-        auto caps = plan_captures(prompt, pc.from, pc.to, caps_each, true);
+        auto caps = plan_captures(prompt, pc.from, pc.to,
+                                  std::min(caps_each, Engine::SNAPSHOTS - int(reserved_.size())), true);
         blocks += size_t(pc.to - pc.from) / BlockStore::BLOCK + 2 * (caps.size() + 1);
         snaps += caps.size() + 1;
         segs.push_back({pc.slot, std::vector<int32_t>(prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to)),
@@ -161,14 +165,20 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
     if (store_) store_->reserve(blocks, snaps);  // pin the saves' memory while the GPUs prefill
     const auto pass_start = std::chrono::steady_clock::now();
     const auto &logits = e_.prefill_batch(segs);
-    for (size_t i = 0; i < pieces.size(); ++i) {  // what prefill_range does after a chunk, per segment
+    for (size_t i = 0; i < pieces.size(); ++i) {  // the captures first: their snapshots are free again after this
         const Piece &pc = pieces[i];
-        SlotInfo &si = slots_[size_t(pc.slot)];
-        const auto &prompt = si.pending;
+        const auto &prompt = slots_[size_t(pc.slot)].pending;
         const int64_t sys_end = system_end(prompt);
         for (const Engine::Capture &c : segs[i].captures)
             save_to_store(pc.slot, c.snap, std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(c.pos)),
                           nullptr, c.pos == sys_end);
+    }
+    reserved_.clear();
+    for (size_t i = 0; i < pieces.size(); ++i) {  // then what prefill_range does after a chunk, per segment
+        const Piece &pc = pieces[i];
+        SlotInfo &si = slots_[size_t(pc.slot)];
+        const auto &prompt = si.pending;
+        const int64_t sys_end = system_end(prompt);
         si.hist.insert(si.hist.end(), prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to));
         const int idx = save_snapshot(pc.slot, &logits[i]);
         const bool keep = pc.to == int64_t(prompt.size()) || pc.to % e_.prefill_chunk() == 0;

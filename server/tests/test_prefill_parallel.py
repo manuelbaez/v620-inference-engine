@@ -49,14 +49,20 @@ def main():
     s.shutdown(1)
 
     s, _ = sched([(f"L{i}", 30000) for i in range(10)])
-    check("10 long prompts: the first 8 share the pass", shape(s), [(f"L{i}", 512) for i in range(8)])
+    check("10 long prompts share the pass", shape(s), [(f"L{i}", 256) for i in range(10)])
     s.shutdown(1)
 
     s, _ = sched([(f"L{i}", 30000) for i in range(6)] + [(f"s{i}", 100) for i in range(5)])
     check("6 long, 5 short: first a pass for the short ones alone", shape(s), [(f"s{i}", 100) for i in range(5)])
-    check("... and if they are still there in the next pass: 4 of them whole, 4 long ones share the rest", shape(s),
-          [(f"s{i}", 100) for i in range(4)] + [(f"L{i}", 768) for i in range(4)])
+    check("... and if they are still there in the next pass: together, the long ones sharing the rest", shape(s),
+          [(f"s{i}", 100) for i in range(5)] + [(f"L{i}", 512) for i in range(6)])
     check("... then the short ones' own pass again", shape(s), [(f"s{i}", 100) for i in range(5)])
+    s.shutdown(1)
+
+    s, _ = sched([(f"L{i}", 30000) for i in range(14)] + [(f"s{i}", 50) for i in range(15)], slots=32)
+    shape(s)  # the short ones' own pass
+    check("14 long, 15 short: the long ones keep 4 of the 16 prompts of a pass", [n for n, _ in shape(s)],
+          [f"s{i}" for i in range(12)] + [f"L{i}" for i in range(4)])
     s.shutdown(1)
 
     s, _ = sched([(f"L{i}", 30000) for i in range(4)] + [(f"m{i}", 1500) for i in range(3)])

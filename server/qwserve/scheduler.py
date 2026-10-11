@@ -152,7 +152,7 @@ class Scheduler:
     # prompt waits, and at least this many of a pass's prompts (with half of its tokens) when short ones do.
     # QW_PREFILL_LONG_PARALLEL=0: one long prompt at a time (the rule until 2026-10-11).
     LONG_PARALLEL = int(os.environ.get("QW_PREFILL_LONG_PARALLEL", "4"))
-    MAX_SEGMENTS = 8   # prompts of one engine prefill pass (Engine::MAX_SEGMENTS)
+    MAX_SEGMENTS = int(os.environ.get("QW_PREFILL_MAX_SEGMENTS", "16"))  # prompts of one engine prefill pass (Engine::MAX_SEGMENTS; 8 until 2026-10-12)
     PIECE_ALIGN = 256  # a long prompt's share of a pass is a multiple of this
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
     # (QW_STUCK_SECONDS) is a wedged GPU. Unhealthy for EXIT_GRACE seconds (QW_EXIT_GRACE), the

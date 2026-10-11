@@ -90,10 +90,11 @@ int main(int argc, char **argv) {
             opt.warmup = false;
     }
     try {
-        QW_CHECK(P.size() >= 2 && P.size() <= 4, "give 2..4 prompts (--p ids)");
+        QW_CHECK(P.size() >= 2 && P.size() <= size_t(Engine::MAX_SEGMENTS), "give 2..16 prompts (--p ids)");
         size_t total = 0;
         for (auto &p : P) total += p.size();
         opt.prefill_chunk = std::max<int>(8192, int((total + 1023) / 1024 * 1024));
+        if (P.size() > 4) opt.slot_tokens.assign(P.size(), P.size() > 8 ? 16384 : 32768);  // a slot per prompt, what fits
         Engine e(opt);
         if (const char *dl = std::getenv("DEBUG_LAYERS")) e.set_debug_layers(std::atoi(dl));  // (needs QW_NOGRAPH)
         const int n = int(P.size());
