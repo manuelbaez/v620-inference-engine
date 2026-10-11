@@ -5,8 +5,8 @@
 //   1. prefill: identical logits;
 //   2. decode steps of 16 rows, one per slot (after the first steps the spilled slots read their rows from the VRAM
 //      cache, each under its own tag): identical logits within each group;
-//   3. runs of 4 rows in slots 0, 3, 8, 12 and 15 (the speculative verification shape, with a rollback): identical;
-//   4. slot 15 reset and given other text while the others continue: the others still agree.
+//   3. runs of 4 rows in slots 0, 3, 8 and 15 (the speculative verification shape, with a rollback): identical;
+//   4. slot 15 reset and given other text while the others continue: slots 0 and 3 still agree.
 // Usage: test_slots16 [--n 9000]
 #include <algorithm>
 #include <cmath>
@@ -86,7 +86,7 @@ int main(int argc, char **argv) {
         if (!ok) std::printf("  first differing slot: %d\n", bad_slot);
         check(ok, "decode, 48 steps of 16 rows, one per slot: identical logits within each text");
         // ---- 3. runs of 4 rows
-        const int run_slots[5] = {0, 3, 8, 12, 15};
+        const int run_slots[4] = {0, 3, 8, 15};  // 16 rows: a step's limit
         ok = true;
         for (int i = 0; i < 6 && ok; ++i) {
             std::vector<Engine::Row> rows;
@@ -94,23 +94,24 @@ int main(int argc, char **argv) {
                 for (int k = 0; k < 4; ++k) rows.push_back({sl, tok[sl / G] + k});
             const auto &d = e.decode(rows);
             const auto row = [&](int j, int r) { return d.data() + size_t(4 * j + r) * cfg::VOCAB; };
-            for (int r = 0; r < 4; ++r) ok = ok && same(row(0, r), row(1, r)) && same(row(2, r), row(3, r)) && same(row(2, r), row(4, r));
+            for (int r = 0; r < 4; ++r) ok = ok && same(row(0, r), row(1, r)) && same(row(2, r), row(3, r));
             tok[0] = argmax(row(0, 3));
             tok[1] = argmax(row(2, 3));
             for (int sl : run_slots) e.accept(sl, 2);  // roll two rows back: the next run rewrites those positions
         }
-        check(ok, "decode, runs of 4 rows in slots 0, 3 and 8, 12, 15: identical logits within each text");
-        // ---- 4. one slot changes its content; 8 and 12 stay in step with each other
+        check(ok, "decode, runs of 4 rows in slots 0, 3 and 8, 15: identical logits within each text");
+        // ---- 4. one slot changes its content; 0 and 3 (in step since the runs) must not notice, nor slot 8
         e.slot_reset(15);
         e.prefill(15, text(n, 7));
         ok = true;
         for (int i = 0; i < 16 && ok; ++i) {
-            const auto &d = e.decode({{7, tok[1]}, {8, tok[1]}, {12, tok[1]}, {15, tok[1]}});
-            ok = same(d.data() + cfg::VOCAB, d.data() + 2 * size_t(cfg::VOCAB));
-            ok = ok && !same(d.data() + cfg::VOCAB, d.data() + 3 * size_t(cfg::VOCAB));  // other text: other logits
-            tok[1] = argmax(d.data() + cfg::VOCAB);
+            const auto &d = e.decode({{0, tok[0]}, {3, tok[0]}, {8, tok[1]}, {15, tok[1]}});
+            ok = same(d.data(), d.data() + cfg::VOCAB);
+            ok = ok && !same(d.data() + 2 * size_t(cfg::VOCAB), d.data() + 3 * size_t(cfg::VOCAB));  // other text
+            tok[0] = argmax(d.data());
+            tok[1] = argmax(d.data() + 2 * size_t(cfg::VOCAB));
         }
-        check(ok, "after slot 15 took other text: 8 and 12 identical, 15 different");
+        check(ok, "after slot 15 took other text: 0 and 3 identical, 15 differs from 8");
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;
     } catch (const std::exception &ex) {

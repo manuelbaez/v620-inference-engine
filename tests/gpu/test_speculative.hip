@@ -145,8 +145,8 @@ int main(int argc, char **argv) {
             opt.warmup = false;
     }
     try {
-        QW_CHECK(!prompts.empty() && prompts.size() <= 8, "1..8 prompts");
-        opt.slot_tokens.assign(std::max<size_t>(4, prompts.size()), 32768);
+        QW_CHECK(!prompts.empty() && prompts.size() <= size_t(Engine::MAX_SLOTS), "1..16 prompts");
+        opt.slot_tokens.assign(std::max<size_t>(4, prompts.size()), prompts.size() > 8 ? 16384 : 32768);  // what fits the cards
         Engine e(opt);
         QW_CHECK(e.has_mtp(), "no MTP head loaded");
         int fails = 0;
