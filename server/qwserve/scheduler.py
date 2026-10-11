@@ -148,6 +148,12 @@ class Scheduler:
     SHARE_WAIT = os.environ.get("QW_SHARE_WAIT", "1") != "0"
     SHARE_MIN = int(os.environ.get("QW_SHARE_MIN", "2048"))
     BATCH_PREFILL = os.environ.get("QW_PREFILL_BATCH", "1") != "0"  # several prompts per prefill pass
+    # Long prompts (more than a pass holds) prefill in parallel, sharing each pass: all of them while no short
+    # prompt waits, and at least this many of a pass's prompts (with half of its tokens) when short ones do.
+    # QW_PREFILL_LONG_PARALLEL=0: one long prompt at a time (the rule until 2026-10-11).
+    LONG_PARALLEL = int(os.environ.get("QW_PREFILL_LONG_PARALLEL", "4"))
+    MAX_SEGMENTS = 8   # prompts of one engine prefill pass (Engine::MAX_SEGMENTS)
+    PIECE_ALIGN = 256  # a long prompt's share of a pass is a multiple of this
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
     # (QW_STUCK_SECONDS) is a wedged GPU. Unhealthy for EXIT_GRACE seconds (QW_EXIT_GRACE), the
     # process exits so the supervisor restarts it (QW_WATCHDOG_EXIT=0: only /health says so).
@@ -160,6 +166,7 @@ class Scheduler:
         self.raw_engine = engine  # for calls from other threads (failure()); the scheduler thread uses self.e
         self.call = None          # (engine method, time.time()) of the engine call in progress
         self.e = _Watched(engine, self)
+        self._short_pass = False  # the last prefill pass was the short prompts' own (_batch)
         self.k = mtp_drafts if engine.has_mtp else 0
         self.stats = {"steps": 0, "rows": 0, "tokens": 0, "time": 0.0}  # decode steps, request-steps, emitted tokens
         self.cache_stats = engine.cache_stats()  # refreshed by the scheduler thread (the engine is not thread-safe)
@@ -454,22 +461,54 @@ class Scheduler:
         self.prefilling.append(r)
 
     def _batch(self):
-        """The prefills to advance in one engine pass: prompts that fit whole go first (in
-        arrival order, so a short request does not wait behind a long prompt), then the oldest
-        of the rest; several while their whole prompts fit (QW_PREFILL_PIECE tokens while
-        others decode, else one prefill chunk); only the first may go in partly. [(request, tokens)]."""
+        """The prefills to advance in one engine pass, as [(request, tokens)]. A pass has `room` tokens
+        (QW_PREFILL_PIECE while others decode, else one prefill chunk) and at most MAX_SEGMENTS prompts.
+        Long prompts (more than a pass holds) share a pass in equal pieces, in arrival order, as many as fit:
+        they prefill in parallel. Prompts that fit whole go first, and when long ones are under way they get a
+        pass of their own (a short request's first token then waits for a short pass, not for the long
+        prompts' pieces), but only every other pass: in the pass after it the long ones go, and short
+        prompts that arrived meanwhile join that pass, where LONG_PARALLEL of its prompts and half of its
+        tokens stay with the long ones. So short requests never wait behind long prompts and never stop
+        them. (Prompts that share a prefix do not get here together: the later one waits at admission,
+        _shares_prefill.)"""
         room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if self.active else self.e.prefill_chunk
         short = [r for r in self.prefilling if r.left <= room and not r.media]
-        batch = []
-        for r in short + [r for r in self.prefilling if r not in short]:
-            if r.media or room <= 0 or (batch and (r.left > room or not self.BATCH_PREFILL)):
-                break  # media prompts go alone (their vision tokens are encoded per slot)
-            take = min(r.left, room)
-            batch.append((r, take))
-            room -= take
-        if not batch:  # a media prompt first in line
-            batch = [(self.prefilling[0], self.PREFILL_PIECE if self.active else self.e.prefill_chunk)]
-        return batch
+        longs = []  # the others before the first media prompt (which goes alone: its vision tokens are per slot)
+        for r in self.prefilling:
+            if r.media:
+                break
+            if r.left > room:
+                longs.append(r)
+        if not short and not longs:  # a media prompt first in line
+            return [(self.prefilling[0], room)]
+        if not self.BATCH_PREFILL:  # QW_PREFILL_BATCH=0: one prompt per pass
+            r = (short + longs)[0]
+            return [(r, min(r.left, room))]
+        whole = []  # the short prompts of this pass: the first always, more while they fit
+        def take_short(limit_n, limit_room):
+            nonlocal room
+            for r in short:
+                if len(whole) >= limit_n or (whole and r.left > room - limit_room):
+                    break
+                whole.append((r, r.left))
+                room -= r.left
+        if not self.LONG_PARALLEL:  # the rule until 2026-10-11: the short ones, or else one long prompt
+            take_short(self.MAX_SEGMENTS, 0)
+            return whole or [(longs[0], room)]
+        if short and longs and not self._short_pass:  # a pass for the short ones alone, every other pass at most
+            self._short_pass = True
+            take_short(self.MAX_SEGMENTS, 0)
+            return whole
+        self._short_pass = False
+        # together: the long prompts keep LONG_PARALLEL of the pass's prompts and half of its tokens
+        take_short(self.MAX_SEGMENTS - min(len(longs), self.LONG_PARALLEL), room // 2 if longs else 0)
+        n = min(len(longs), self.MAX_SEGMENTS - len(whole))
+        while n > 1 and room // n < self.PIECE_ALIGN:
+            n -= 1
+        if n and room > 0:
+            share = room if n == 1 else room // n // self.PIECE_ALIGN * self.PIECE_ALIGN
+            whole += [(r, min(r.left, share)) for r in longs[:n]]
+        return whole
 
     def _prefill(self):
         """Advances the prefills (see _batch): by one piece while others decode, then returns so
