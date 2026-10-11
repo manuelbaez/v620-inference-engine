@@ -2693,6 +2693,43 @@ start on a 32-row build without smaller slots. Open, if the owner wants it tried
 needs `MAX_ROWS = 32`, `--slots 14336 x 16` and the adaptive rule (`best_rate`, tuned at one stream) looked at for
 wide steps.
 
+## Requests that were cancelled, and long prompts arriving together (2026-10-11)
+
+**A cancelled request ran on.** The owner cancelled 15 requests and watched the engine prefill all of them. The
+server only learned of a gone client on its next write to the socket: a request still prefilling had nothing to write,
+so its whole prompt went in first, and one that does not stream ran to its last token (the "orphans" behind
+llama-swap during the benchmarks were this). aiohttp cancels a request's handler on disconnect only when asked to:
+`RUN_OPTIONS = {"handler_cancellation": True}` (`server/qwserve/api.py`), and the handler's `finally` sets the
+request's `cancelled`, which the scheduler already honoured in every list. `server/tests/test_disconnect.py` cuts the
+client off during prefill, during a decode that does not stream and during a streaming one, over a real listener
+(aiohttp's `TestServer` turns the option on by itself, which is why no test had shown this): the slot is free within
+0.5 s with the option, and the first two carry on without it. In production since 19:10 UTC (`qw-engine:5f3e935`):
+through llama-swap, a 49,631-token request whose client gave up after 4 s was aborted at once.
+
+**Long prompts prefill in parallel** (`Scheduler._batch`, the owner's design; `qw-engine:02aa55b`, 19:30 UTC). Until
+now prompts longer than a pass went one at a time, oldest first: the first answers early, but each finished request
+then decodes alone, in narrow steps, while the next prompt goes in. Now the long prompts share each pass in equal
+pieces (multiples of 256 tokens, at most `MAX_SEGMENTS` = 8 prompts a pass, in arrival order; the others follow as
+those finish). Short prompts (they fit a pass whole) still go first: with long ones under way they get a pass of
+their own, at most every other pass, and short prompts still waiting in the pass after it join the long ones there,
+which keep `QW_PREFILL_LONG_PARALLEL` (4) of the pass's prompts and half of its tokens. Prompts sharing a prefix
+wait at admission as before. `QW_PREFILL_LONG_PARALLEL=0` is the old rule. `server/tests/test_prefill_parallel.py`.
+
+Production, 8 prompts of 22,202 tokens arriving together (each its own text from the first token), 400 tokens of
+answer each, sampled; the second line with 4 short requests arriving from 5 s on:
+
+| | first tokens after (s) | all done | mean time to first token | short requests' first token |
+|---|---|---|---|---|
+| one at a time (before) | 11.5, 27, 42, 57, 72, 88, 104, 120 | 125.9 s | 65.3 s | |
+| ... with short requests | 12 ... 120.5 | 125.4 s | 66.4 s | 0.2-1.1 s |
+| in parallel | 60, 80, 88, 99, 102, 103, 104, 106 | **113.7 s** | 92.7 s | |
+| ... with short requests | 64 ... 107 | 114.7 s | 93.6 s | 0.6-1.1 s |
+
+The batch finishes 10% sooner and the first answer comes 49 s later: the trade the owner asked for. It is less than
+the ~90 s a pure 2,300 tok/s would give: the stats line shows 1,880-1,910 prompt tok/s while all eight prefill
+(pieces of 512 tokens at 20k of context) and 1,300-1,700 once the first ones decode beside the rest (passes of 2,048
+tokens and the decoders' share of the time). Not looked at further.
+
 ## Benchmarks against the model card (2026-10-08/09)
 
 Does what production serves (int4 experts, int8 n-gram table, fp16 arithmetic) score like the released model? Two of
