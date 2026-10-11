@@ -220,6 +220,9 @@ int main(int argc, char **argv) {
             Session ses(e);
             SamplingParams greedy;
             greedy.temperature = 0.f;
+            // tokens per second of the decode steps while every prompt is still generating (the prompts' prefill
+            // and the tail, where the streams that finished first have left, are not throughput at this width)
+            double full_rate = 0;
             auto gen_all = [&](int k) {
                 std::vector<int> slots;
                 std::vector<std::vector<int32_t>> outs(prompts.size());
@@ -231,6 +234,9 @@ int main(int argc, char **argv) {
                     outs[p].push_back(pending[p]);
                     slots.push_back(sl);
                 }
+                const double t_gen = now();
+                size_t made = 0;
+                full_rate = 0;
                 for (;;) {
                     std::vector<Session::StepReq> reqs;
                     std::vector<size_t> idx;
@@ -240,13 +246,16 @@ int main(int argc, char **argv) {
                             idx.push_back(p);
                         }
                     if (reqs.empty()) break;
+                    if (reqs.size() < prompts.size() && full_rate == 0) full_rate = double(made) / (now() - t_gen);
                     const auto &res = ses.generate(reqs, k);
                     for (size_t j = 0; j < idx.size(); ++j) {
                         auto &o = outs[idx[j]];
                         o.insert(o.end(), res[j].tokens.begin(), res[j].tokens.end());
+                        made += res[j].tokens.size();
                         pending[idx[j]] = res[j].tokens.back();
                     }
                 }
+                if (full_rate == 0) full_rate = double(made) / (now() - t_gen);
                 for (int sl : slots) ses.release(sl);
                 for (auto &o : outs) o.resize(size_t(gen));
                 return outs;
@@ -254,14 +263,16 @@ int main(int argc, char **argv) {
             for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
             double t0 = now();
             const auto plain = gen_all(0);
-            const double plain_s = now() - t0;
+            const double plain_s = now() - t0, plain_full = full_rate;
             for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
             t0 = now();
             const auto spec = gen_all(K);
-            const double spec_s = now() - t0;
+            const double spec_s = now() - t0, spec_full = full_rate;
             const double toks = double(prompts.size() * size_t(gen - 1));
             std::printf("session generate, %zu prompts at once: plain %.1f tok/s aggregate, speculative %.1f tok/s\n",
                         prompts.size(), toks / plain_s, toks / spec_s);
+            std::printf("  while all %zu generate (no prefill, no tail): plain %.1f tok/s, speculative %.1f tok/s\n",
+                        prompts.size(), plain_full, spec_full);
             for (int rep = 1; rep < repeat; ++rep) {  // the same again: any difference is wrong arithmetic
                 for (int sl = 0; sl < e.num_slots(); ++sl) e.slot_reset(sl);
                 const bool again = gen_all(K) == spec;

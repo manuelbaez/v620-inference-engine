@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
                                  {16, 1}, {8, 2}, {16, 2}};
         for (const auto &sh : shapes) {
             const int S = sh[0], k = sh[1];
+            if (S * k > Engine::MAX_BATCH_ROWS) continue;  // a build with steps of 16 rows
             std::vector<int> cur(static_cast<size_t>(S));
             for (int s = 0; s < S; ++s) {
                 e.slot_reset(s);

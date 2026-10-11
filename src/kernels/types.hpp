@@ -18,7 +18,7 @@ namespace qw::gpu {
 
 using namespace cfg;
 
-constexpr int MAX_ROWS = 32;  // 16 until 2026-10-11 (moe_route_B and the pair kernels take up to 32 rows)
+constexpr int MAX_ROWS = cfg::MAX_ROWS;  // 16 or 32 (moe_route_B and the pair kernels take up to 32 rows)
 // The spill cache's tags and miss list give a slot 4 bits, a QSA layer 4 bits and a position CACHE_POS_BITS
 // (cache_tag, cache_miss below): more slots (cfg::MAX_SLOTS), layers or a longer slot need wider fields there, and
 // the checks beside them fail the build or the start first.

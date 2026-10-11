@@ -64,6 +64,12 @@ constexpr int GDN_CONV = 4;
 constexpr int GDN_RING = 8;
 
 // MoE
+// Rows of one decode step (a row is one token of one slot). 32 is supported and tested (docs/DESIGN.md "Decode steps
+// of 32 rows"): it lets 9 to 16 streams draft one token each, costs ~0.5 GB more VRAM per card for the per-row
+// buffers and graphs (16 slots then hold 14,336 tokens in VRAM, not 18,432), and gave no gain at the measured draft
+// acceptance, so the build default stays 16.
+constexpr int MAX_ROWS = 16;
+static_assert(MAX_ROWS == 16 || MAX_ROWS == 32, "decode steps of 16 or 32 rows");
 constexpr int MAX_SLOTS = 16;  // sequence slots of an engine (kernels/types.hpp packs a slot into 4 bits)
 constexpr int N_EXPERTS = 512;
 constexpr int TOP_K = 10;

@@ -80,7 +80,7 @@ class Engine {
 public:
     static constexpr int MAX_SLOTS = cfg::MAX_SLOTS;  // 16; a decode step takes up to MAX_BATCH_ROWS rows
     static constexpr int SNAPSHOTS = 8;
-    static constexpr int MAX_BATCH_ROWS = 32;  // rows of one decode / draft step (gpu::MAX_ROWS)
+    static constexpr int MAX_BATCH_ROWS = cfg::MAX_ROWS;  // rows of one decode / draft step
 
     explicit Engine(const EngineOptions &opt);
     ~Engine();

@@ -730,7 +730,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          fixed, `test_slots16`). The raw step: 16 slots x 1 row 40.7 ms against 8 x 2 rows 38.4 ms, so ~+11%
          aggregate tok/s for 16 streams at half the speed per stream; 16 x 262k fits (g128, 18,432 in VRAM each)
          and serves production since 2026-10-11 14:49 UTC: 372-386 tok/s at 16 requests against 308-312 at 8.
-         Open: steps of 32 rows (a draft per stream at 16 streams; started 2026-10-11); why `test_speculative` reports 16 streams 24 ms per step slower
+         Steps of 32 rows: built and measured the same day, no gain on the test text, build default 16 (section "Decode steps of 32 rows"). Open: why `test_speculative` reports 16 streams 24 ms per step slower
          than its own trace; the dev-box server's step times (51-88 ms) against production's
    - [x] a GGUF quantization measured in the reference (2026-10-10, section "A GGUF quantization"): unsloth
          UD-Q4_K_XL's experts in four layers 0.053 against the original (ours 0.071, g32 0.063, 6 bits 0.051) for
@@ -2595,7 +2595,9 @@ engine greedy.
 **Memory.** 16 x 12,288 tokens in VRAM with 262,144 capacity each loads with 1.97 GiB free per card (g32 checkpoint,
 `QW_SPILL_CACHE_MB=960`; 106.4 GB of spill pinned, the same as 8 x 524k).
 
-**Speed, first measurement** (`test_speculative --session-only --gen 192`, aggregate tok/s, same build and window; see the correction below):
+**Speed, first measurement** (`test_speculative --session-only --gen 192`, aggregate tok/s, same build and window;
+wrong as a throughput figure: that total includes the prompts' prefill and the tail, see the correction below and
+"Decode steps of 32 rows"):
 
 | streams | drafts per stream | tok/s |
 |---|---|---|
@@ -2642,6 +2644,54 @@ under short sampled requests from the dev box (windows of pure decoding):
 +22% in aggregate at 16 requests; up to 8 requests behave as before; a conversation's capacity is 262k instead of
 524k. Back to 8 slots: delete the two options from the command (the g32 experiment's settings are in
 `config.yaml.bak-g32-experiment-1011`). The dev-box server's slower steps above remain unexplained.
+
+## Decode steps of 32 rows (built and measured 2026-10-11; supported, build default 16)
+
+With 16 slots, nine or more requests draft nothing: a step held 16 rows. The owner asked for 32. `cfg::MAX_ROWS` is
+now a build constant (16 or 32); with 32: `gemv_rows` has variants for 17-32 rows (and fails on an unsupported count
+instead of doing nothing, as its `default: break` did), the per-pair expert kernels serve up to 32 rows
+(`QW_MOE_PAIR_MAX`, default 32; the tiled kernel above 16 rows was slower: 67.2 against 63.2 ms), and the row-sized
+buffers, graphs and tables follow the constant. The draft rule needed no change: `min(k, MAX_ROWS / n - 1, 1)` gives
+nine to sixteen requests one draft each and leaves eight or fewer as they were.
+
+**Checks** (dev box, g128, the 32-row build): `logits_dump` bit-identical to the build before; `test_gemv` 1-32 rows
+against a CPU sum (also on the local card); `test_batch_decode`, `test_slots16`; `test_speculative` at 8, 12 and 16
+prompts (steps of up to 32 rows): plain == speculative == engine greedy; 12 prompts, 6 repeats: identical.
+
+**The raw step** (`bench/slots_decode_bench`, ms):
+
+| slots x rows | 16 x 1 | 12 x 2 | 8 x 3 | 16 x 2 | 8 x 4 |
+|---|---|---|---|---|---|
+| rows | 16 | 24 | 24 | 32 | 32 |
+| ms / step | 40.0-42.6 | 51.7 | 50.8 | 62.9-63.2 | 60.9 |
+
+A row beyond 16 costs ~1.4 ms; a step of 16 rows costs 2.5 ms per token. So a draft row pays only when more than
+~0.55 of the drafts are accepted, and at 0.75 it would give 16 x 1.75 / 63 ms = ~444 tok/s against ~393 (+13%).
+
+**Measured at the session level** (`test_speculative --session-only --gen 256`, the rate while every stream is still
+generating; the test's old total also counted the prompts' prefill and the tail after the first streams end, which
+is why it had shown 16 streams as slower):
+
+| streams | 16-row build: plain / speculative | 32-row build: plain / speculative |
+|---|---|---|
+| 8 | 293 / 315 | 289 / 313 |
+| 12 | 349 / 344 | 349 / 353 |
+| 16 | 406 / 408 | 406 / 402 |
+
+**No gain on this text.** At 16 streams the 32-row build drafts (accepted 66% of the time in the traced slot) but the
+adaptive rule chooses plain steps two times in three, and the result is the plain rate: 402 against 406. At 12
+streams +1-2%. Up to 8 streams nothing changes, as intended. (Also here: with 8 streams one draft each gives +8% on
+this text, where the 2026-10-09 measurement on other text gave more.)
+
+**VRAM.** The per-row GDN states alone are 453 MB more per card ([36 layers][rows][196,608 floats]), plus the graphs of
+17-32 rows: 16 slots of 262k fit with 14,336 tokens in VRAM each (2.12 GiB free after the load, 0.95 after warm-up and
+a step) where the 16-row build holds 18,432.
+
+**Decision: the build default stays 16** (what does not pay is not left on): production's layout would not even
+start on a 32-row build without smaller slots. Open, if the owner wants it tried: production's own traffic shows
+1.73-1.77 tokens per request-step at 8 streams (acceptance ~0.75), where 32 rows would pay ~+13% at 16 streams; that
+needs `MAX_ROWS = 32`, `--slots 14336 x 16` and the adaptive rule (`best_rate`, tuned at one stream) looked at for
+wide steps.
 
 ## Benchmarks against the model card (2026-10-08/09)
 

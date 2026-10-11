@@ -341,7 +341,7 @@ void Engine::run_draft_rank(Rank &rk) {
 // a batch job; pos[i] is row i's position.
 void Engine::stage_rows(const std::vector<Row> &rows, const std::vector<int64_t> &pos, bool embeddings) {
     const int M = int(rows.size());
-    QW_CHECK(M >= 1 && M <= gpu::MAX_ROWS, "batch: 1..32 rows");
+    QW_CHECK(M >= 1 && M <= gpu::MAX_ROWS, "batch: 1..MAX_ROWS rows");
     constexpr int MR = gpu::MAX_ROWS;
     djob_.M = M;
     djob_.i32.assign(5 * MR, 0);
