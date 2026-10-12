@@ -822,13 +822,17 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          a more precise decode path would buy nothing
    - [x] the server tells the engine where the system prompt ends (2026-10-12, section "Requests that were
          cancelled, and long prompts arriving together"): a system prompt that quotes `<|im_start|>` is shared whole
-   - [x] three or four micro-batches per pass (2026-10-12, "Three experiments on the prefill pass"): -10%, rejected;
+   - [x] three or four micro-batches per pass (2026-10-12, "Three experiments on the prefill pass"): -10% (profiled:
+         a compute kernel already runs 85% of the time with two), rejected;
          `QW_PREFILL_MB`, default 2 (bit-identical to before)
    - [~] the router from a fp16 GEMM with exact candidates (same section): +0.8 to +1.2%, accuracy unchanged;
          `QW_ROUTER16=1`, off until the owner turns it on
    - [x] experts placed on the cards by measured work (same section): balance 1.144 -> 1.054 at best, no speed
-         difference; rejected, no rebalancing while running (`QW_EXPERT_PERM` stays as a tool)
-   - [ ] the stall during warm-up seen twice on 2026-10-12 (same section)
+         difference on the dev box; no rebalancing while running
+   - [x] the two stalls of 2026-10-12 (same section): one was a cold read of the 51 GB n-gram table, the other a
+         card that stops for 10-25 s with three prefill streams (never with two; cause below the trace not found)
+   - [~] expert placement in production since 2026-10-12 16:38 UTC, compared pass by pass with no placement in
+         the stats line (same section); to be decided on the owner's work
    - [x] indexer selection at long context (2026-10-07, section "Indexer selection at long context"): the
          top-512 selection and its scores were 27% of GPU kernel time at 320k tokens of context and every card
          did all of it. Each card now scores a quarter of the groups and the cards merge their candidates, from
@@ -2898,11 +2902,49 @@ difference beyond the noise even in the best case, so the cards waiting for each
 experts' share, and rebalancing while running (moving 2.5 MB per expert between cards, swapping router rows) was
 not built.
 
-**A stall seen twice, not explained.** Two runs of the suite stopped during the engine's warm-up with one card
-waiting for the GPU and the others done (`QW_ROUTER16=check` at chunk 4,096; `QW_PREFILL_MB=3` with a 21,504-token
-chunk); both ran through when repeated. A card that fails while the others wait for its collectives looks like
-this, and the engine reported such a failure only after every card was done: it now logs it at once (`rank N
-failed: ...`). Whether the build before can do the same is not known (production once took 1,204 s to start).
+**The two stalls, explained (second window, 2026-10-12 15:36-16:38 UTC).** They were two different things.
+
+1. *The `QW_ROUTER16=check` run* was the suite's first use of the fp8 n-gram table (51 GB; the tests before it
+   use the 32 GB int4 one): its log has no "PLE table: ... read" line, the process had one thread at 90% CPU and
+   38 GB resident and growing, and no engine job was running (no watchdog line in four minutes). It was reading
+   the table from disk into the page cache, and the warm-up waits for the table. Not a stall of the engine and
+   nothing to do with the router; the same command ran through the next time (4 s, the table cached).
+2. *The three-micro-batch run* is a card that stops. The watchdog line, read in full, says cards 1, 2 and 3 timed
+   out waiting for card 0 at collectives 25-29 of the first pass, on all three channels. Repeated on purpose
+   (`bench/stall_hunt.sh`, then `QW_PREFILL_MB=3` with a 21,504-token chunk again and again): the first pass takes
+   9.1-9.6 s in 12 of 18 starts and 10-17 s longer in 6 (and that morning once for good). A kernel trace of a slow one
+   (`rocprofv3 --kernel-trace`, `ana_freeze.py` in `~/window2-1012`): 7.3 s into the pass, the three streams of
+   one card each have a kernel in flight (a QSA attention, an expert gate/up, a rocBLAS GEMM, normally 3-600 ms)
+   that all end 15.5 s later within 22 ms of each other; no kernel starts or ends on any card in between, the
+   other three cards sit in their collectives' wait kernels. So the card makes no progress for 15 s and then
+   carries on with correct results; when that lasts longer than the wait kernels' spin limit the others give up
+   (the morning's case, where the card then stayed at 99% for nine minutes until it was killed). What it is not:
+   queue evictions by the driver (the per-process `evicted_ms` counters, read on the host twice a second, grow by
+   2-3 s while the weights load and by under 0.15 s per 5 s during the slow pass); the page cache (evicting
+   rocBLAS's files changes nothing); anything the kernel logs (nothing at those times; the corrected PCIe errors
+   on port 83:00.0 come at other times). What it needs, as far as seen: three compute streams on a card. With two
+   it never happened: 7 starts with the 21,504-token chunk and 24 with 4,096 in the same hunt (`basebig`,
+   `base4k`, `new4k`, `check4k`), and every run before. Why three streams do this was not found (the trace ends at
+   the card). `QW_PREFILL_MB` above 2 now logs a warning at start; it is slower anyway.
+
+Also from this: a card's failure is logged at once (`rank N failed: ...`), and a debugger can be used on the dev box
+without root (`~/ugdb/gdb`, unpacked from the distribution's packages; the test has to be its child, as
+`bench/stall_hunt.sh` starts it).
+
+**Expert placement in production, to be judged on real work (the owner's request, 2026-10-12).** Since 16:38 UTC
+production runs `qw-engine:6208cce` with `QW_EXPERT_PERM=/cache/expert_perm_1012.txt` (the placement from the
+dev-box counts of both texts together, `perm_ab`: 18,425 of 24,576 experts on another card), `QW_MOE_STATS=quiet`
+and `QW_MOE_COUNTS_FILE=/cache/moe_counts.txt` (compose environment; backup
+`docker-compose.yaml.bak-before-expert-perm-1012`). `quiet` collects the per-pass balance in batched prefill too
+without a log line per prefill (cost: within the noise, 2,402 against 2,403-2,413 tok/s), and the stats line now
+ends with `experts, busiest card: ... prefill per pass x1.097 (x1.143 unplaced)`: the busiest card's expert tiles
+over the mean, summed over the interval's passes, micro-batches and layers, and what the same passes would have
+given with every expert on the card of its number. Both come from the same counts, so the placement is compared
+with no placement on the very same requests (the dev server with three prompts of this repo's guide gave the
+figures above). The counts file holds each expert's tiles by its checkpoint number and is rewritten every 256
+passes, so a placement can be made from production's own work (`tools/expert_balance.py /cache/moe_counts.txt
+...`). What decides: whether the placed figure stays clearly under the unplaced one on the owner's work, and
+whether prefill speed moves at all (on the dev box it did not, even at 1.054).
 
 ## Benchmarks against the model card (2026-10-08/09)
 
