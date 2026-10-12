@@ -12,6 +12,10 @@
 #   stall        pins while the GPUs compute, and decode steps timed while arenas are pinned (~10 min)
 #   compute      the collective variant end to end, decode and determinism with it, the prefill input pipeline,
 #                chunk size, the MoE balance, long context and a kernel trace of one chunk (~50 min)
+#   prefill3     three experiments on the prefill pass against the build before them (BASE, default
+#                ~/ie-head/build): QW_PREFILL_MB=3 and 4 (micro-batches per chunk), QW_ROUTER16 (the router from a
+#                fp16 GEMM and exact candidates) and QW_EXPERT_PERM (experts placed by measured work); logits
+#                compared bit for bit where they must agree, speeds in alternating rounds (~2 h)
 #
 # Run it from the build tree's parent (~/inference-engine). It never touches production: stop it first
 # (/home/server/qw-tools/prod-idle-unload.sh) and bring production back afterwards (prod-smoke.sh).
@@ -116,6 +120,55 @@ final)  # the defaults as built, after a rebuild: the gates and the numbers the 
     run f_text_ids 300 "$HOME/qwenv/bin/python" tools/text_tokens.py /mnt/llms/qwen3.8-flash-next-awq/tokenizer.json "$OUT/text_ids.txt" \
         docs/ENGINE_GUIDE.md docs/DESIGN.md src/engine/prefill.hip src/engine/engine.hpp docs/MODEL.md
     run f_moe_text 1500 env QW_MOE_STATS=1 QW_PROFILE=1 $B/prefill_bench --reps 1 --tokens-file "$OUT/text_ids.txt" 16384
+    ;;
+prefill3)
+    export QW_PLE_DIR=$FP8 QW_PREFILL_CHUNK=4096
+    BASE=${BASE:-$HOME/ie-head/build}
+    TOK=/mnt/llms/qwen3.8-flash-next-awq/tokenizer.json
+    PY="$HOME/qwenv/bin/python"
+    TA="$OUT/text_a.txt" TB="$OUT/text_b.txt"  # two texts: the placement is made from one and measured on the other
+    run text_a 300 "$PY" tools/text_tokens.py $TOK "$TA" docs/ENGINE_GUIDE.md docs/MODEL.md README.md src/engine/*.hip src/session/*.cpp src/kernels/*.hip
+    run text_b 300 "$PY" tools/text_tokens.py $TOK "$TB" docs/DESIGN.md
+    ids() { cut -d, -f"$1-$2" "$TB"; }
+    run block_store 1500 $B/test_block_store
+    # the same outputs: two micro-batches as before, bit for bit; the others at rounding level (argmax lines)
+    run dump_base 1500 $BASE/logits_dump "$OUT/base.bin"
+    run dump_mb2 1500 $B/logits_dump "$OUT/mb2.bin"
+    run dump_mb3 1500 env QW_PREFILL_MB=3 $B/logits_dump "$OUT/mb3.bin"
+    run dump_mb4 1500 env QW_PREFILL_MB=4 $B/logits_dump "$OUT/mb4.bin"
+    run dump_r16 1500 env QW_ROUTER16=1 $B/logits_dump "$OUT/r16.bin"
+    run cmp_mb2 60 cmp "$OUT/base.bin" "$OUT/mb2.bin"
+    run router_check 1500 env QW_ROUTER16=check $B/prefill_bench --reps 1 --tokens-file "$TB" 16384
+    for v in "QW_PREFILL_MB=3" "QW_PREFILL_MB=4" "QW_ROUTER16=1"; do
+        n=${v//[=_]/}
+        run "suspend_$n" 1500 env $v $B/test_suspend
+        run "batch_prefill_$n" 1500 env $v $B/test_batch_prefill --p "$(ids 1 5000)" --p "$(ids 20001 23000)" --p "$(ids 30001 37000)" --p "$(ids 40001 46100)"
+        run "snapshot_capture_$n" 1500 env $v $B/test_snapshot_capture
+    done
+    run batch_prefill_base 1500 $BASE/test_batch_prefill --p "$(ids 1 5000)" --p "$(ids 20001 23000)" --p "$(ids 30001 37000)" --p "$(ids 40001 46100)"
+    # speed, alternating: a fresh prompt and one after 40k tokens of context
+    for i in 1 2 3; do
+        for v in "QW_PREFILL_MB=2" "QW_PREFILL_MB=3" "QW_PREFILL_MB=4" "QW_ROUTER16=1"; do
+            n=${v//[=_]/}
+            run "speed_${n}_$i" 900 env $v $B/prefill_bench --reps 3 --tokens-file "$TB" 16384
+            run "speed_ctx_${n}_$i" 900 env $v $B/prefill_bench --reps 3 --tokens-file "$TB" --ctx 40960 16384
+        done
+    done
+    run profile_mb2 900 env QW_PROFILE=1 $B/prefill_bench --reps 1 --tokens-file "$TB" 16384
+    run profile_mb4 900 env QW_PROFILE=1 QW_PREFILL_MB=4 $B/prefill_bench --reps 1 --tokens-file "$TB" 16384
+    # expert placement: each expert's work on text A, the placement from it, the balance and the speed on text B
+    run counts_a 1500 env QW_MOE_STATS=1 QW_MOE_COUNTS_FILE="$OUT/counts_a.txt" $B/prefill_bench --reps 1 --tokens-file "$TA" 49152
+    run counts_b 1500 env QW_MOE_STATS=1 QW_MOE_COUNTS_FILE="$OUT/counts_b.txt" $B/prefill_bench --reps 1 --tokens-file "$TB" 49152
+    run placement 300 "$PY" tools/expert_balance.py "$OUT/counts_a.txt" "$OUT/perm_a.txt" --check "$OUT/counts_b.txt"
+    run placement_b 300 "$PY" tools/expert_balance.py "$OUT/counts_b.txt" "$OUT/perm_b.txt"
+    run balance_perm_a 3000 env QW_EXPERT_PERM="$OUT/perm_a.txt" QW_MOE_STATS=1 $B/prefill_bench --reps 1 --tokens-file "$TB" 49152
+    run balance_perm_b 3000 env QW_EXPERT_PERM="$OUT/perm_b.txt" QW_MOE_STATS=1 $B/prefill_bench --reps 1 --tokens-file "$TB" 49152
+    run dump_perm 3000 env QW_EXPERT_PERM="$OUT/perm_a.txt" $B/logits_dump "$OUT/perm.bin"
+    for i in 1 2; do
+        run "speed_noperm_$i" 900 $B/prefill_bench --reps 3 --tokens-file "$TB" 16384
+        run "speed_perm_a_$i" 3000 env QW_EXPERT_PERM="$OUT/perm_a.txt" $B/prefill_bench --reps 3 --tokens-file "$TB" 16384
+        run "speed_perm_b_$i" 3000 env QW_EXPERT_PERM="$OUT/perm_b.txt" $B/prefill_bench --reps 3 --tokens-file "$TB" 16384
+    done
     ;;
 disk)  # the disk tier's file formats through the tiers: v2 block files (the default), v1 with a buffer per rank (~10 min)
     export QW_PLE_DIR=$FP8

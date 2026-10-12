@@ -1,4 +1,4 @@
-// Chunked prefill of one slot: two micro-batches per chunk on two streams,
+// Chunked prefill of one slot: micro-batches of a chunk on a stream each,
 // the MTP layer over the chunk, and the host side of prefill().
 #include <hip/hip_runtime.h>
 
@@ -35,20 +35,28 @@ static_assert(Engine::MAX_CAPTURES == gpu::MAX_CAPTURES);
 // (distinct slots) concatenated. Row-wise work (projections, mixers, MoE,
 // collectives) runs once over all rows; the sequence kernels (GDN conv and
 // scan, QSA K/V and attention, PLE conv, MTP shift) run per segment on its
-// rows. The chunk runs as two micro-batches (A = first half of the rows, B =
-// second half) on two streams with separate collective channels, so one
-// half's collectives overlap the other half's compute. A segment can
-// straddle the halves; B then depends on A through that segment's
-// sequential state, per layer: the GDN conv tail and recurrent state, the QSA
-// K/V and compressed keys, and the PLE conv tail. The host enqueues layer l
-// of A before layer l of B, so every event wait follows its record. Short
-// chunks run as a single micro-batch.
+// rows. The chunk runs as micro-batches (equal shares of the rows in order;
+// EngineOptions::prefill_mb of them, two by default) on a stream each with
+// separate collective channels, so one's collectives overlap the others'
+// compute. A segment can straddle them; a micro-batch then depends on the one
+// before it through that segment's sequential state, per layer: the GDN conv
+// tail and recurrent state, the QSA K/V and compressed keys, and the PLE conv
+// tail. The host enqueues layer l of each micro-batch in order, so every
+// event wait follows its record. Short chunks run as a single micro-batch.
 void Engine::run_prefill_rank(Rank &rk) {
     static const bool profile = std::getenv("QW_PROFILE") != nullptr;
     static const bool no_split = std::getenv("QW_NO_SPLIT") != nullptr;
+    static const int router16 = [] {  // 0 off, 1 on, 2 check
+        const char *v = std::getenv("QW_ROUTER16");
+        return !v || std::string(v) == "0" ? 0 : std::string(v) == "check" ? 2 : 1;
+    }();
+    if (router16 == 2) {
+        if (!rk.route_chk) rk.route_chk = zeros<unsigned>(4);
+        CK(hipMemsetAsync(rk.route_chk, 0, 16, rk.s));
+    }
     const auto t_start = std::chrono::steady_clock::now();
     const int r = rk.r;
-    if (moe_stats_ && !moe_counts_[size_t(r)]) moe_counts_[size_t(r)] = pinned<int32_t>(size_t(2) * (N_LAYERS + 1) * EXP_L);
+    if (moe_stats_ && !moe_counts_[size_t(r)]) moe_counts_[size_t(r)] = pinned<int32_t>(size_t(Rank::MAX_MB) * (N_LAYERS + 1) * EXP_L);
     const auto &segs = pjob_.segs;
     const int T = pjob_.T;
     for (const PrefillSeg &sg : segs)
@@ -69,9 +77,8 @@ void Engine::run_prefill_rank(Rank &rk) {
         CK(hipMemcpyAsync(rk.rope3, pjob_.rope3, size_t(T) * 12, hipMemcpyHostToDevice, rk.s));
         rope3 = rk.rope3;
     }
-    const bool split = T >= 256;  // two micro-batches; QW_NO_SPLIT runs them serially on one stream
-    const int TA = split ? T / 2 : T;
-    QW_CHECK(TA <= rk.pb[0].C && T - TA <= rk.pb[1].C, "prefill chunk larger than its buffers");
+    const int NMB = prefill_mbs(T);  // QW_NO_SPLIT runs them serially on one stream
+    const bool split = NMB > 1;
 
     // A segment's rows inside one micro-batch.
     struct Sub {
@@ -80,7 +87,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         int64_t start;  // slot position of its first row
         int T;
         int row;    // first row in the micro-batch
-        bool cont;  // continues the segment's rows of the other micro-batch
+        bool cont;  // continues the segment's rows of the micro-batch before
         bool last;  // holds the segment's last row
     };
     struct MB {
@@ -96,10 +103,15 @@ void Engine::run_prefill_rank(Rank &rk) {
         std::vector<Sub> subs;
     };
     std::vector<MB> mbs;
-    mbs.push_back({&rk.pb[0], rk.s, rk.blas, comm_.get(), &rk.seq_base, 0, TA, 0, nullptr, {}});
-    if (split)
-        mbs.push_back({&rk.pb[1], no_split ? rk.s : rk.s2, no_split ? rk.blas : rk.blas2, comm2_.get(), &rk.seq_base2,
-                       0, T - TA, TA, nullptr, {}});
+    for (int k = 0; k < NMB; ++k) {
+        const int a = int(int64_t(T) * k / NMB), e = int(int64_t(T) * (k + 1) / NMB);
+        QW_CHECK(e - a <= rk.pb[k].C, "prefill chunk larger than its buffers");
+        if (k == 0)
+            mbs.push_back({&rk.pb[0], rk.s, rk.blas, comm_.get(), &rk.seq_base, 0, e, 0, nullptr, {}});
+        else
+            mbs.push_back({&rk.pb[k], no_split ? rk.s : rk.s_mb[size_t(k - 1)], no_split ? rk.blas : rk.blas_mb[size_t(k - 1)],
+                           comm_mb_[size_t(k - 1)].get(), &rk.seq_base_mb[size_t(k - 1)], 0, e - a, a, nullptr, {}});
+    }
     for (MB &m : mbs)
         for (int i = 0; i < int(segs.size()); ++i) {
             const PrefillSeg &sg = segs[size_t(i)];
@@ -171,10 +183,10 @@ void Engine::run_prefill_rank(Rank &rk) {
     };
     auto mb_index = [&](const MB &m) { return size_t(&m - mbs.data()); };
 
-    // B's stream starts after A's (resets, previous chunk's state)
+    // the other streams start after the first one's (resets, previous chunk's state)
     if (split) {
         CK(hipEventRecord(rk.ev[0], rk.s));
-        CK(hipStreamWaitEvent(rk.s2, rk.ev[0], 0));
+        for (size_t k = 1; k < mbs.size(); ++k) CK(hipStreamWaitEvent(mbs[k].s, rk.ev[0], 0));
     }
 
     for (auto &m : mbs) {
@@ -231,11 +243,12 @@ void Engine::run_prefill_rank(Rank &rk) {
         }
         return c;
     };
+    // (a micro-batch records after its own wait on its stream, so the order holds along the whole chain)
     auto record = [&](MB &m, int l, int what) {
-        if (split && &m == &mbs[0]) CK(hipEventRecord(rk.ev[size_t(l * 4 + what)], m.s));
+        if (&m != &mbs.back()) CK(hipEventRecord(rk.ev[mb_index(m) * Rank::EV_MB + size_t(l * 4 + what)], m.s));
     };
     auto wait = [&](MB &m, int l, int what) {
-        if (split && &m == &mbs[1]) CK(hipStreamWaitEvent(m.s, rk.ev[size_t(l * 4 + what)], 0));
+        if (&m != &mbs[0]) CK(hipStreamWaitEvent(m.s, rk.ev[(mb_index(m) - 1) * Rank::EV_MB + size_t(l * 4 + what)], 0));
     };
 
     // One decoder layer over rows [0, T) of X, the rows of `subs` (after the
@@ -260,7 +273,7 @@ void Engine::run_prefill_rank(Rank &rk) {
                 gpu::qsa_prep_T(b.P + size_t(sb.row) * QSA_PROJ_L, w.qn, w.kn, w.iqn, sb.start, sb.T,
                                 b.q16 + sb.row * QW, b.qgate + sb.row * QW, b.iq16 + sb.row * IW, sub_kv(sb, qi), s, r3);
             }
-            wait(m, l, 2);  // A's K/V and raw keys (a group can straddle the halves)
+            wait(m, l, 2);  // the K/V and raw keys of the micro-batch before (a group can straddle them)
             for (const Sub &sb : subs)
                 gpu::qsa_compress_T(sb.sl->kv(qi), w.ikn, sb.start, sb.T, sb.sl->ck[qi], s,
                                     l < N_LAYERS ? rope3 : nullptr, start0);
@@ -333,11 +346,27 @@ void Engine::run_prefill_rank(Rank &rk) {
         if (calib) cal(m, ln + ".sh_gu", b.bin, H, T, H);
         // Router logits stay fp32: fp16 output flips near-tie expert choices
         // (measured: mean |dlogprob| vs the fp32 reference 0.074 -> 0.088).
-        gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.logits, N_EXPERTS, false);
+        // QW_ROUTER16: the GEMM with fp16 output (about four times faster) only picks candidates, whose logits are
+        // then computed in fp32 (kernels/moe_route16.hip). =check: both, compared (rk.route_chk; the fp32 one is used).
         CK(hipMemsetAsync(b.counts, 0, EXP_L * 4, s));
-        gpu::moe_route_T(b.logits, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s, l < N_LAYERS ? rk.moe_use : nullptr);
+        if (router16 != 1) {
+            gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.logits, N_EXPERTS, false);
+            gpu::moe_route_T(b.logits, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s, l < N_LAYERS ? rk.moe_use : nullptr);
+        }
+        if (router16) {
+            gemm(m, w.router, N_EXPERTS, H, b.bin, H, T, b.part16, N_EXPERTS, true);
+            if (router16 == 1) {
+                gpu::moe_route16_T(b.part16, w.router, b.bin, H, T, r * EXP_L, b.tok_e, b.tok_w, b.counts, s,
+                                   l < N_LAYERS ? rk.moe_use : nullptr);
+            } else {  // (buffers the scatter and the shared expert write later serve as the second routing's)
+                CK(hipMemsetAsync(b.fill, 0, EXP_L * 4, s));
+                gpu::moe_route16_T(b.part16, w.router, b.bin, H, T, r * EXP_L, b.tok_slot, b.shp, b.fill, s, nullptr,
+                                   rk.route_chk + 3);
+                gpu::moe_route_diff_T(b.tok_e, b.tok_w, b.tok_slot, b.shp, T, rk.route_chk, s);
+            }
+        }
         if (moe_stats_)  // this micro-batch's tokens per local expert (read after the job, see collect_moe_balance)
-            CK(hipMemcpyAsync(moe_counts_[size_t(r)] + (size_t(&m != &mbs[0]) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
+            CK(hipMemcpyAsync(moe_counts_[size_t(r)] + (mb_index(m) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
                               b.counts, EXP_L * 4, hipMemcpyDeviceToHost, s));
         gpu::moe_scatter_T(b.tok_e, b.counts, T, b.offsets, b.fill, b.tok_slot, b.pair_tok, s);
         static const bool int8_experts = std::getenv("QW_INT8_EXPERTS") != nullptr;
@@ -407,7 +436,7 @@ void Engine::run_prefill_rank(Rank &rk) {
             std::vector<Sub> msubs;  // the MTP rows of each sub, packed from row 0 of Xm
             std::vector<int> first;  // row of b.emb with the next token of each one's first MTP row
             int rows = 0;
-            wait(m, N_LAYERS, 3);  // A's store write and MTP K/V
+            wait(m, N_LAYERS, 3);  // the store write and MTP K/V of the micro-batch before
             for (const Sub &sb : m.subs) {
                 const int o = (sb.cont || segs[size_t(sb.seg)].mtp_pend) ? 1 : 0;
                 const int n = sb.T - 1 + o;
@@ -501,6 +530,14 @@ void Engine::run_prefill_rank(Rank &rk) {
         for (int i = 0; i < o.rows; ++i)
             CK(hipMemcpy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,
                          hipMemcpyDeviceToHost));
+    if (router16 == 2) {
+        unsigned st[4];
+        CK(hipMemcpy(st, rk.route_chk, 16, hipMemcpyDeviceToHost));
+        float dw;
+        std::memcpy(&dw, &st[2], 4);
+        log("rank %d router16 check: %u routings, %u with other experts, largest weight difference of the rest %.2e, "
+            "%u computed all 512", r, st[0], st[1], double(dw), st[3]);
+    }
     if (profile) {
         const auto t_end = std::chrono::steady_clock::now();
         log("rank %d prefill [%lld, +%d) %zu segment(s)%s: %.1f ms", r, (long long)start0, T, segs.size(),

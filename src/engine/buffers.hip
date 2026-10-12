@@ -268,14 +268,17 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spi
         sn.pend = zeros<float>(XW);
         sn.raw_tail = zeros<float>(RAW_TAIL_FLOATS);
     }
-    // prefill: two micro-batches of half a chunk each, on two streams
+    // prefill: prefill_mb micro-batches of an equal share of a chunk each, on a stream each
     QW_CHECK(opt.prefill_chunk >= 512 && opt.prefill_chunk % 2 == 0, "prefill_chunk must be even and >= 512");
-    alloc_prefill(rk.pb[0], opt.prefill_chunk / 2, max_slot_tokens, mtp);
-    alloc_prefill(rk.pb[1], opt.prefill_chunk / 2, max_slot_tokens, mtp);
-    CK(hipStreamCreateWithFlags(&rk.s2, hipStreamNonBlocking));
+    QW_CHECK(opt.prefill_mb >= 2 && opt.prefill_mb <= Rank::MAX_MB, "prefill_mb must be 2..4");
+    for (int k = 0; k < opt.prefill_mb; ++k)
+        alloc_prefill(rk.pb[k], (opt.prefill_chunk + opt.prefill_mb - 1) / opt.prefill_mb, max_slot_tokens, mtp);
+    for (int k = 0; k + 1 < opt.prefill_mb; ++k) {
+        CK(hipStreamCreateWithFlags(&rk.s_mb[size_t(k)], hipStreamNonBlocking));
+        if (rocblas_create_handle(&rk.blas_mb[size_t(k)]) != rocblas_status_success) fail("rocblas_create_handle");
+        rocblas_set_stream(rk.blas_mb[size_t(k)], rk.s_mb[size_t(k)]);
+    }
     for (auto &ev : rk.ev) CK(hipEventCreateWithFlags(&ev, hipEventDisableTiming));
-    if (rocblas_create_handle(&rk.blas2) != rocblas_status_success) fail("rocblas_create_handle");
-    rocblas_set_stream(rk.blas2, rk.s2);
     if (rocblas_create_handle(&rk.blas) != rocblas_status_success) fail("rocblas_create_handle");
     rocblas_set_stream(rk.blas, rk.s);
     alloc_slots(rk, opt, spill, mtp);
@@ -308,8 +311,8 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spi
         rk.stage_k = zeros<uint16_t>(n * HEAD_DIM);
         rk.stage_v = zeros<uint16_t>(n * HEAD_DIM);
         CK(hipStreamCreateWithFlags(&rk.s3, hipStreamNonBlocking));
-        for (hipEvent_t *e : {&rk.stage_ready, &rk.stage_free, &rk.stage_done[0], &rk.stage_done[1]})
-            CK(hipEventCreateWithFlags(e, hipEventDisableTiming));
+        for (hipEvent_t *e : {&rk.stage_ready, &rk.stage_free}) CK(hipEventCreateWithFlags(e, hipEventDisableTiming));
+        for (hipEvent_t &e : rk.stage_done) CK(hipEventCreateWithFlags(&e, hipEventDisableTiming));
     }
     alloc_batch(rk.bt, max_slot_tokens, mtp);
     CK(hipDeviceSynchronize());

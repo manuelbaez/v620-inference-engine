@@ -95,13 +95,18 @@ struct LayerW {
 struct Rank {
     int r = 0, dev = 0;
     hipStream_t s = nullptr;
-    rocblas_handle blas = nullptr, blas2 = nullptr;
-    hipStream_t s2 = nullptr;  // second prefill micro-batch
-    PrefillBuf pb[2];
-    uint32_t seq_base2 = 0;  // sequence base on the second comm channel
-    // micro-batch B waits on A per layer: [layer][0 gdn ring | 1 gdn scan | 2 qsa kv | 3 ple ring]
-    // (layer N_LAYERS is the MTP pass)
-    std::array<hipEvent_t, (N_LAYERS + 1) * 4> ev{};
+    rocblas_handle blas = nullptr;
+    // prefill micro-batches (EngineOptions::prefill_mb of them): the first uses s, blas and seq_base, the others
+    // their own stream, rocBLAS handle and sequence base on their collective channel
+    static constexpr int MAX_MB = 4;
+    std::array<hipStream_t, MAX_MB - 1> s_mb{};
+    std::array<rocblas_handle, MAX_MB - 1> blas_mb{};
+    std::array<uint32_t, MAX_MB - 1> seq_base_mb{};
+    PrefillBuf pb[MAX_MB];
+    // each micro-batch waits on the one before it per layer: [micro-batch][layer][0 gdn ring | 1 gdn scan |
+    // 2 qsa kv | 3 ple ring] (layer N_LAYERS is the MTP pass)
+    static constexpr int EV_MB = (N_LAYERS + 1) * 4;
+    std::array<hipEvent_t, (MAX_MB - 1) * EV_MB> ev{};
     std::vector<LayerW> L;
     HcW final_hc{};
     uint16_t *lm_head = nullptr;  // [VOCAB_L][H]
@@ -140,7 +145,8 @@ struct Rank {
     size_t stage_tokens = 0;
     hipStream_t s3 = nullptr;
     hipEvent_t stage_ready = nullptr, stage_free = nullptr;
-    std::array<hipEvent_t, 2> stage_done{};
+    std::array<hipEvent_t, MAX_MB> stage_done{};
+    unsigned *route_chk = nullptr;  // QW_ROUTER16=check: gpu::moe_route_diff_T's stats and the wide count
     gpu::SlotPtrs *dtab = nullptr;
     // Routed-expert work of this rank: (token, expert) pairs it computed, [0] in prefill, [1] in decode, counted by
     // the routing kernels on the device and copied to the pinned host copy now and then (Engine::moe_use).
@@ -226,7 +232,9 @@ struct Rank {
 
 // Loads rank rk.r's shard of every weight (weights.hip).
 // cache_dir: the converted-weights cache (EngineOptions::weight_cache_dir), or "".
-void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp, const std::string &cache_dir);
+// expert_perm: empty, or [N_LAYERS][N_EXPERTS]: the checkpoint's expert at each of the engine's expert indices
+void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp, const std::string &cache_dir,
+                       const std::vector<int32_t> &expert_perm = {});
 // Rows of a slot's ring of raw indexer keys: a prefill chunk, the 3 positions before it, a snapshot's tail.
 inline int raw_ring_rows(const EngineOptions &opt) {
     return opt.prefill_chunk + gpu::RAW_TAIL + 64;

@@ -43,7 +43,9 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     const size_t slot = std::max({size_t(64 * 1024), size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096,
                                   size_t(gpu::PREFILL_QB) * IDX_TOPK_BLOCKS * sizeof(gpu::IdxCand) + 4096});
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
-    comm2_ = std::make_unique<Comm>(opt_.devices, slot);
+    if (const char *v = std::getenv("QW_PREFILL_MB")) opt_.prefill_mb = std::atoi(v);
+    QW_CHECK(opt_.prefill_mb >= 2 && opt_.prefill_mb <= Rank::MAX_MB, "QW_PREFILL_MB must be 2..4");
+    for (int k = 1; k < opt_.prefill_mb; ++k) comm_mb_.push_back(std::make_unique<Comm>(opt_.devices, slot));
     QW_CHECK(!opt_.slot_tokens.empty() && opt_.slot_tokens.size() <= size_t(MAX_SLOTS), "1..16 slots");
     static_assert(N_QSA + 1 <= 16, "the spill cache's tags hold a QSA layer in 4 bits");
     for (int c : opt_.slot_tokens) QW_CHECK(c > 0 && c % 256 == 0, "slot sizes must be positive multiples of 256");
@@ -89,6 +91,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
     moe_stats_ = std::getenv("QW_MOE_STATS") != nullptr;
+    load_expert_perm();
     if (const char *p = std::getenv("QW_PREFILL_PIPELINE")) pipeline_ = std::atoi(p) != 0;
 
     // QW_START_WAIT_S: when another process holds the cards' memory (a test on the box that shares them, a model still
@@ -199,7 +202,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         rk.dev = opt_.devices[size_t(r)];
         CK(hipSetDevice(rk.dev));
         CK(hipStreamCreateWithFlags(&rk.s, hipStreamNonBlocking));
-        load_rank_weights(rk, st_, pool, mtp_, opt_.weight_cache_dir);
+        load_rank_weights(rk, st_, pool, mtp_, opt_.weight_cache_dir, expert_perm_);
         alloc_rank_buffers(rk, opt_, spill_.get(), max_slot_tokens(), mtp_);
         size_t free_b = 0, total_b = 0;
         CK(hipMemGetInfo(&free_b, &total_b));
@@ -396,10 +399,12 @@ void Engine::dispatch() {
         while (!done_cv_.wait_for(lk, std::chrono::seconds(60), [&] { return done_ == RANKS; })) {
             waited += 60;
             const char *kind = job_ == Job::Prefill ? "prefill" : job_ == Job::Mtp ? "mtp" : job_ == Job::Draft ? "draft" : "decode";
+            std::string errs = Comm::describe_error(comm_->error());
+            for (auto &c : comm_mb_) errs += " / " + Comm::describe_error(c->error());
             log("watchdog: %s job (M=%d, prefill T=%d) running for %d s; rank phases %d %d %d %d "
-                "(1 enqueueing, 2 waiting for GPU, 0 done); comm errors: %s / %s",
+                "(1 enqueueing, 2 waiting for GPU, 0 done); comm errors: %s",
                 kind, djob_.M, pjob_.T, waited, phase_[0].load(), phase_[1].load(), phase_[2].load(), phase_[3].load(),
-                Comm::describe_error(comm_->error()).c_str(), Comm::describe_error(comm2_->error()).c_str());
+                errs.c_str());
         }
     }
     if (guards_enabled() && check_guards())
@@ -410,7 +415,9 @@ void Engine::dispatch() {
              " job (M=" + std::to_string(djob_.M) + ")");
     if (!error_.empty()) fail(error_);
     if (comm_->error()) fail("collective timed out: " + Comm::describe_error(comm_->error()));
-    if (comm2_->error()) fail("collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error()));
+    for (size_t k = 0; k < comm_mb_.size(); ++k)
+        if (comm_mb_[k]->error())
+            fail("collective timed out (prefill channel " + std::to_string(k + 2) + "): " + Comm::describe_error(comm_mb_[k]->error()));
 }
 
 std::string Engine::failure() const {
@@ -419,7 +426,9 @@ std::string Engine::failure() const {
         if (!error_.empty()) return error_;
     }
     if (comm_->error()) return "collective timed out: " + Comm::describe_error(comm_->error());
-    if (comm2_->error()) return "collective timed out (prefill channel 2): " + Comm::describe_error(comm2_->error());
+    for (size_t k = 0; k < comm_mb_.size(); ++k)
+        if (comm_mb_[k]->error())
+            return "collective timed out (prefill channel " + std::to_string(k + 2) + "): " + Comm::describe_error(comm_mb_[k]->error());
     return {};
 }
 

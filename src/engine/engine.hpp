@@ -66,7 +66,11 @@ struct EngineOptions {
     // small exchange per 256 queries and layer: -2 to -4% below 65k tokens of context, +7% at 100k, +26% at 230k,
     // +46% at 360k (docs/DESIGN.md "Indexer selection at long context"). QW_IDX_SHARD_MIN.
     int idx_shard_min = 65536;
-    int prefill_chunk = 8192;  // tokens per prefill step (two micro-batches of half)
+    int prefill_chunk = 8192;  // tokens per prefill step (prefill_mb micro-batches)
+    // Micro-batches a prefill chunk runs as, each on its own stream and collective channel, so that one's
+    // collectives overlap the others' compute (2..Rank::MAX_MB; a chunk under 128 tokens per micro-batch uses
+    // fewer). QW_PREFILL_MB.
+    int prefill_mb = 2;
     bool warmup = true;        // run a throwaway prefill + decodes at load (loads rocBLAS kernels, captures graphs)
     int load_threads = 12;     // host threads per rank for weight conversion
     bool mtp = true;           // load the MTP head (speculative decoding drafts)
@@ -91,6 +95,8 @@ public:
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
     int prefill_chunk() const { return opt_.prefill_chunk; }
+    // micro-batches a chunk of T tokens runs as
+    int prefill_mbs(int T) const { return T >= 256 ? std::min(opt_.prefill_mb, T / 128) : 1; }
     // QW_PREFILL_PIPELINE (default on) at construction; tests and benchmarks may change it between prefills
     void set_prefill_pipeline(bool on) { pipeline_ = on; }
     // Empties a slot (its state is zeroed lazily by the next prefill/decode).
@@ -328,6 +334,14 @@ private:
         std::vector<double> layer_max, layer_mean;                            // tiles per layer, summed over chunks
     } moe_bal_;
     bool moe_stats_ = false;
+    // QW_MOE_COUNTS_FILE (with QW_MOE_STATS): the tiles of each expert, [layer][N_EXPERTS] summed over the prefill
+    // chunks so far, are written there with each report (what tools/expert_balance.py places the experts from).
+    std::vector<uint64_t> moe_expert_tiles_;
+    // QW_EXPERT_PERM: a placement of the experts over the cards (a file of N_LAYERS lines of N_EXPERTS checkpoint
+    // expert numbers, in the engine's order: the first EXP_L go to card 0, ...). The router's rows move with them,
+    // so the model is the same up to rounding.
+    std::vector<int32_t> expert_perm_;
+    void load_expert_perm();
     int expert_group_ = cfg::QGROUP;  // the checkpoint's expert format (check_config): QGROUP or QGROUP_Z
 
 public:
@@ -351,7 +365,8 @@ private:
     // A slot's spilled rows are about to change other than through decode: its cached rows become stale.
     void spill_cache_bump(int slot);
     NgramHasher hasher_;
-    std::unique_ptr<Comm> comm_, comm2_;  // comm2_: second prefill micro-batch
+    std::unique_ptr<Comm> comm_;                   // decode, and the first prefill micro-batch
+    std::vector<std::unique_ptr<Comm>> comm_mb_;  // the other prefill micro-batches' channels
     std::vector<std::unique_ptr<Rank>> ranks_;
     std::vector<std::thread> threads_;
 

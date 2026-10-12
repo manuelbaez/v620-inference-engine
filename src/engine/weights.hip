@@ -265,8 +265,10 @@ HcW load_hc(WeightCache &wc, const SafeTensors &st, int r, const std::string &p,
 // One decoder layer. The MTP layer's routed experts are bf16 (fused
 // gate_up): they are quantized here to the same int4 g128 layout (they only
 // draft tokens, which the full model verifies).
+// perm: if not null, the layer's expert placement: the engine's expert i (rank i / EXP_L) is the checkpoint's perm[i].
 void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const std::string &p,
-                bool qsa, bool bf16_experts) {
+                bool qsa, bool bf16_experts, const int32_t *perm = nullptr) {
+    const auto expert = [&](int64_t i) { return perm ? int64_t(perm[i]) : i; };
     const std::string ln = layer_name(p);
     w.attn_hc = load_hc(wc, st, r, p + "attn_hyper_connection.", true, ln + ".attn_hc");
     w.mlp_hc = load_hc(wc, st, r, p + "mlp_hyper_connection.", true, ln + ".mlp_hc");
@@ -345,13 +347,15 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
     const std::string mp = p + "mlp.";
     w.router = wc.item<uint16_t>([&] {
         std::vector<uint16_t> router;
-        add_rows(router, st.get(mp + "gate.weight", DType::BF16, {N_EXPERTS, H}), 0, N_EXPERTS);
+        const TensorView &g = st.get(mp + "gate.weight", DType::BF16, {N_EXPERTS, H});
+        if (!perm) add_rows(router, g, 0, N_EXPERTS);
+        for (int i = 0; perm && i < N_EXPERTS; ++i) add_rows(router, g, expert(i), 1);
         return router;
     });
     // The checkpoint's expert format: a scale per QGROUP inputs, or a scale per QGROUP_Z with or without zero points
     // (then one word per group holds both, core/config.hpp).
     if (!bf16_experts) {
-        const std::string e0 = mp + "experts." + std::to_string(r * EXP_L) + ".gate_proj.weight_";
+        const std::string e0 = mp + "experts." + std::to_string(expert(r * EXP_L)) + ".gate_proj.weight_";
         w.egroup = int(H / st.get(e0 + "scale").dim(1));
         QW_CHECK(w.egroup == QGROUP || w.egroup == QGROUP_Z, e0 + "scale: unsupported group size");
         QW_CHECK(w.egroup == QGROUP_Z || !st.has(e0 + "zero_point"), e0 + "zero_point: zero points need groups of 32");
@@ -366,7 +370,7 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
             scales.resize(size_t(EXP_L) * groups);
             pool.parallel_for(EXP_L, 1, [&](int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) {
-                    const std::string ep = mp + "experts." + std::to_string(r * EXP_L + i) + "." + proj;
+                    const std::string ep = mp + "experts." + std::to_string(expert(r * EXP_L + i)) + "." + proj;
                     const TensorView &pw = st.get(ep + ".weight_packed", DType::I32, {rows, K / 8});
                     const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / G});
                     pack_int4_words(pw.i32(), packed.data() + size_t(i) * words, words);
@@ -443,7 +447,8 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
 
 }  // namespace
 
-void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp, const std::string &cache_dir) {
+void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool mtp, const std::string &cache_dir,
+                       const std::vector<int32_t> &expert_perm) {
     const int r = rk.r;
     const auto t0 = std::chrono::steady_clock::now();
     // The cache's key: the checkpoint's files (path, size, modification time), the rank, the MTP head, the layout.
@@ -463,9 +468,12 @@ void load_rank_weights(Rank &rk, const SafeTensors &st, ThreadPool &pool, bool m
         mix(meta, sizeof meta);
     }
     const bool int8 = std::getenv("QW_INT8_DENSE") || std::getenv("QW_INT8_DUMP") || std::getenv("QW_INT8_DIR");
-    WeightCache wc(int8 ? std::string() : cache_dir, key, r, pool);
+    // (an expert placement, QW_EXPERT_PERM, is an experiment: converted every time)
+    WeightCache wc(int8 || !expert_perm.empty() ? std::string() : cache_dir, key, r, pool);
     rk.L.resize(N_LAYERS);
-    for (int l = 0; l < N_LAYERS; ++l) load_layer(wc, rk.L[size_t(l)], st, pool, r, layer_prefix(l), is_qsa(l), false);
+    for (int l = 0; l < N_LAYERS; ++l)
+        load_layer(wc, rk.L[size_t(l)], st, pool, r, layer_prefix(l), is_qsa(l), false,
+                   expert_perm.empty() ? nullptr : expert_perm.data() + size_t(l) * N_EXPERTS);
     if (mtp) {
         load_layer(wc, rk.mtp, st, pool, r, "mtp.layers.0.", true, true);
         rk.mtp_final = load_hc(wc, st, r, "mtp.hyper_connection_mixer.", false, "mtp.final_hc");

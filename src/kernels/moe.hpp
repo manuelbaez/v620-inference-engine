@@ -17,6 +17,16 @@ namespace qw::gpu {
 // rank's routed-expert work: Engine::moe_use).
 void moe_route_T(const float *logits, int T, int first, int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s,
                  unsigned long long *use = nullptr);
+// The same from fp16 router logits [T][512] (moe_route16.hip): they pick 16 candidates per token, whose logits are
+// computed again in fp32 from the router's weights W [512][H] and the token's input X (fp16 rows of ldx); wide: if
+// not null, counts the tokens that needed all 512 computed.
+void moe_route16_T(const uint16_t *logits16, const uint16_t *W, const uint16_t *X, int ldx, int T, int first,
+                   int32_t *tok_e, float *tok_w, int32_t *counts, hipStream_t s, unsigned long long *use = nullptr,
+                   unsigned *wide = nullptr);
+// Two routings compared: stats [0] += tokens, [1] += tokens with another expert list, [2] = max(bits of the largest
+// weight difference among the others).
+void moe_route_diff_T(const int32_t *ea, const float *wa, const int32_t *eb, const float *wb, int T, unsigned *stats,
+                      hipStream_t s);
 // offsets = exclusive scan(counts); slot of each (token, j) pair; pair_tok[slot] = t.
 void moe_scatter_T(const int32_t *tok_e, const int32_t *counts, int T, int32_t *offsets, int32_t *fill,
                    int32_t *tok_slot, int32_t *pair_tok, hipStream_t s);

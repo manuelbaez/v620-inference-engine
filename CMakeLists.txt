@@ -66,6 +66,7 @@ set(QW_HIP_SOURCES
   src/kernels/gdn.hip
   src/kernels/qsa.hip
   src/kernels/moe_route.hip
+  src/kernels/moe_route16.hip
   src/kernels/moe_experts.hip
   src/kernels/moe_w4a8.hip
   src/kernels/ple.hip
