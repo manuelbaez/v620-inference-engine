@@ -98,6 +98,8 @@ class Request:
         self.share = {}      # id() of a prefilling request -> length of the prefix this prompt shares with it
         self.t_share = None  # when it first waited for such a request's prefill (Scheduler._shares_prefill)
         self.share_on = None  # id() of the request it is waiting for
+        self.started = False  # its "start" event went out (a suspended request begins a second time)
+        self.suspended = 0    # times it gave its slot to a short request (Scheduler._suspend)
 
     def prompt_np(self):
         """The prompt as an int32 array (a view of the C API's array: no copy)."""
@@ -153,8 +155,12 @@ class Scheduler:
     # QW_PREFILL_LONG_PARALLEL=0: one long prompt at a time (the rule until 2026-10-11).
     LONG_PARALLEL = int(os.environ.get("QW_PREFILL_LONG_PARALLEL", "4"))
     # Slots that prompts longer than a prefill pass leave free while they prefill, for short requests
-    # (QW_SHORT_SLOTS=0: none, as until 2026-10-12).
-    SHORT_SLOTS = int(os.environ.get("QW_SHORT_SLOTS", "4"))
+    # (QW_SHORT_SLOTS, default 0: none; PREEMPT below does this job without idle slots).
+    SHORT_SLOTS = int(os.environ.get("QW_SHORT_SLOTS", "0"))
+    # A short request that finds every slot taken takes the slot of a long prompt still prefilling, which waits
+    # first in line and continues from the prefix cache (QW_PREEMPT=0: off; the long prompts always keep
+    # LONG_PARALLEL slots).
+    PREEMPT = os.environ.get("QW_PREEMPT", "1") != "0"
     MAX_SEGMENTS = int(os.environ.get("QW_PREFILL_MAX_SEGMENTS", "16"))  # prompts of one engine prefill pass (Engine::MAX_SEGMENTS; 8 until 2026-10-12)
     PIECE_ALIGN = 256  # a long prompt's share of a pass is a multiple of this
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
@@ -382,6 +388,12 @@ class Scheduler:
                 self._finish(r, "abort")
                 continue
             if slot < 0:
+                victim = self._victim(r)
+                if victim is not None:  # a short request and every slot taken: a long prompt gives up its slot
+                    self._suspend(victim)
+                    i += 1  # the suspended request is now first in the waiting list
+                    slot = self.e.acquire(r.prompt, need, r.media)
+            if slot < 0:
                 r.no_slot_at = self.slot_epoch
                 i += 1  # keeps waiting; later ones may fit the free slots
                 continue
@@ -392,7 +404,7 @@ class Scheduler:
                 room = self.e.capacity[slot] - n
                 r.limit = min(r.max_new, room) if r.max_new else room
                 self.e.set_stop_tokens(slot, sorted(r.end_ids))
-                r.t_admit = time.time()
+                r.t_admit = r.t_admit or time.time()  # (a suspended request keeps its first admission)
                 if self.e.prefetch(slot, r.prompt, r.media):  # cached entries on disk: load them in the background
                     self.loading.append(r)
                     continue
@@ -402,6 +414,34 @@ class Scheduler:
                 continue
             self._begin(r)
         return moved
+
+    def _victim(self, r):
+        """The long prompt that gives its slot to r, a short request that found none: one still more than a pass
+        from the end of its prefill, the one suspended least often and, among those, admitted last. None when r is
+        not short, when PREEMPT is off, or when only LONG_PARALLEL long prompts are prefilling (those keep their
+        slots)."""
+        chunk = self.e.prefill_chunk
+        if not self.PREEMPT or r.media or len(r.prompt) > chunk or not hasattr(self.raw_engine, "suspend"):
+            return None
+        longs = [p for p in self.prefilling if not p.media and p.left > chunk]
+        if len(longs) <= self.LONG_PARALLEL:
+            return None
+        return min(longs, key=lambda p: (p.suspended, -p.t_admit))
+
+    def _suspend(self, v):
+        """Takes v out of its slot: what is prefilled of its prompt goes to the prefix cache (Engine.suspend), the
+        slot is released, and v waits first in line; when it has a slot again its prompt continues from the cache."""
+        done = len(v.prompt) - v.left
+        saved = self.e.suspend(v.slot)
+        self.e.release(v.slot)
+        self.slot_epoch += 1
+        self.prefilling.remove(v)
+        v.slot = -1
+        v.no_slot_at = None
+        v.suspended += 1
+        self.waiting.insert(0, v)
+        print(f"request {v.rid}: suspended at {done} of {len(v.prompt)} prompt tokens ({saved} saved to the prefix "
+              f"cache) for a short request", flush=True)
 
     def _long_prompts_full(self, r):
         """True while r, a prompt longer than a prefill pass, has to wait because long prompts still prefilling hold
@@ -466,13 +506,16 @@ class Scheduler:
         """Restores what the caches hold of r's prompt into its slot and queues the rest for prefill."""
         r.t_begin = time.time()
         try:
-            r.cached, r.keep = self.e.begin_prompt(r.slot, r.prompt, r.media)
-            r.left = len(r.prompt) - r.cached
-            self.win["prompt"] += len(r.prompt)
-            self.win["cached"] += r.cached
-            self.metrics.add_admitted(len(r.prompt), r.cached)
+            cached, r.keep = self.e.begin_prompt(r.slot, r.prompt, r.media)
+            r.left = len(r.prompt) - cached
+            if not r.started:  # (a suspended request begins again: what it gets back is its own work, not a cache hit)
+                r.started = True
+                r.cached = cached
+                self.win["prompt"] += len(r.prompt)
+                self.win["cached"] += r.cached
+                self.metrics.add_admitted(len(r.prompt), r.cached)
+                r.emit("start", r.cached)
             self.cache_stats = self.e.cache_stats()
-            r.emit("start", r.cached)
         except Exception as ex:  # noqa: BLE001
             r.emit("error", str(ex))
             self._finish(r, "abort")

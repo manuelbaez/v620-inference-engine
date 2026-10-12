@@ -44,6 +44,12 @@ public:
     // Returns -1 if none fits right now.
     int acquire(const std::vector<int32_t> &prompt, int64_t max_new);
     void release(int slot);
+    // For a request that gives its slot to another one and continues later (the server's scheduler does this to
+    // long prompts when a short request finds no slot): saves what the slot holds of the prompt being prefilled to
+    // the block store, from where begin_prompt restores it when the request has a slot again. The caller then
+    // releases the slot. Returns the tokens saved; 0 when there is no store or nothing to save (the request then
+    // starts over).
+    int64_t suspend(int slot);
 
     // Makes `slot` hold exactly `prompt`, with logits for its last token
     // available to sample_prompt(). Returns the reused prompt tokens.

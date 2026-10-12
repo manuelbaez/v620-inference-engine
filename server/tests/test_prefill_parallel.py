@@ -23,8 +23,30 @@ def request(name, n):
     return r
 
 
-def sched(names_sizes, slots=16):
-    e = FakeEngine()
+class SuspendEngine(FakeEngine):
+    """FakeEngine with the prefix cache's part in a suspension: suspend() keeps how far the slot's prompt is, and
+    begin_prompt gives that back to the same prompt."""
+
+    def __init__(self):
+        super().__init__()
+        self.total, self.key, self.saved, self.suspends = {}, {}, {}, []
+
+    def begin_prompt(self, slot, tokens, media=None):
+        key = (tokens[0], len(tokens))
+        cached = self.saved.get(key, 0)
+        self.total[slot], self.key[slot] = len(tokens), key
+        self.left[slot] = len(tokens) - cached
+        return cached, None
+
+    def suspend(self, slot):
+        done = self.total[slot] - self.left[slot]
+        self.saved[self.key[slot]] = done
+        self.suspends.append(slot)
+        return done
+
+
+def sched(names_sizes, slots=16, engine=FakeEngine):
+    e = engine()
     e.capacity = [262144] * slots
     e.busy = [False] * slots
     s = Scheduler(e)
@@ -94,7 +116,40 @@ def main():
     check("the first passes take all five", [len(c) for c in e.calls[:3]], [5, 5, 5])
     s.shutdown(1)
 
-    # sixteen long prompts and sixteen slots: four slots stay free for short requests
+    # sixteen long prompts and sixteen slots: a short request takes the slot of the long prompt admitted last
+    s, e = sched([(f"L{i}", 30000) for i in range(16)], engine=SuspendEngine)
+    check("16 long prompts, 16 slots: all prefill", (len(s.prefilling), len(s.waiting)), (16, 0))
+    for r in s.prefilling:  # three passes of 256 tokens each have gone in
+        r.left -= 768
+        e.left[r.slot] -= 768
+    starts = []
+    victim = s.prefilling[-1]
+    victim.emit = lambda kind, payload=None: starts.append(kind)
+    short = request("short", 50)
+    s.waiting.append(short)
+    s._admit()
+    check("a short request arrives: the last long prompt gives it its slot and waits first in line",
+          ([r.name for r in s.waiting], "short" in [r.name for r in s.prefilling], len(s.prefilling)), (["L15"], True, 16))
+    check("what it had prefilled went to the prefix cache", e.saved[(victim.prompt[0], 30000)], 768)
+    check("the short request's pass is its own", shape(s), [("short", 50)])
+    s.prefilling.remove(short)  # it is prefilled and decoded
+    s._finish(short, "stop")
+    s._admit()
+    check("when the short request is done the long prompt continues where it was",
+          ([r.name for r in s.waiting], victim.left, victim.suspended, starts.count("start")), ([], 30000 - 768, 1, 0))
+    for r in list(s.prefilling[4:]):  # only four long prompts left prefilling, the other slots decode
+        s.prefilling.remove(r)
+        s.active.append(r)
+    s.waiting.append(request("short2", 50))
+    s._admit()
+    check("four long prompts keep their slots: the next short request waits", [r.name for r in s.waiting], ["short2"])
+    s.active = []
+    s.shutdown(1)
+
+    # with slots kept free instead (QW_SHORT_SLOTS=4, no preemption): four of sixteen long prompts wait
+    s, e = sched([(f"L{i}", 30000) for i in range(16)])
+    s.shutdown(1)
+    Scheduler.SHORT_SLOTS = 4
     s, e = sched([(f"L{i}", 30000) for i in range(16)])
     check("16 long prompts, 16 slots: 12 prefill, 4 wait for a slot", (len(s.prefilling), len(s.waiting)), (12, 4))
     s.waiting.append(request("short", 50))
@@ -112,6 +167,7 @@ def main():
     s._admit()
     check("QW_SHORT_SLOTS=0: long prompts take every slot", (len(s.prefilling), len(s.waiting)), (16, 0))
     s.shutdown(1)
+    Scheduler.SHORT_SLOTS = 0
 
     print("FAILED" if fails else "all ok")
     return 1 if fails else 0

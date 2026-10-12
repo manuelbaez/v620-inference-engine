@@ -94,6 +94,7 @@ class Engine:
             "qw_slot_len": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_acquire": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64]),
             "qw_release": (ctypes.c_int, [P, ctypes.c_int]),
+            "qw_suspend": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_set_prompt": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64]),
             "qw_set_prompt_media": (ctypes.c_int64, [P, ctypes.c_int, I32P, ctypes.c_int64,
                                                       ctypes.POINTER(MediaStruct), ctypes.c_int]),
@@ -270,6 +271,13 @@ class Engine:
         t = SlotTiming()
         self._check(self.lib.qw_get_slot_timing(self.h, slot, ctypes.byref(t)))
         return {name: getattr(t, name) for name, _ in SlotTiming._fields_}
+
+    def suspend(self, slot):
+        """Saves what the slot holds of the prompt being prefilled to the prefix cache (the request gives up its
+        slot and continues later; release() follows). Returns the tokens saved."""
+        n = self.lib.qw_suspend(self.h, slot)
+        self._check(0 if n >= 0 else -1)
+        return n
 
     def slot_len(self, slot):
         """Tokens the slot holds now (a conversation stays in its slot after its request ended)."""

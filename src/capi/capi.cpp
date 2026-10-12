@@ -116,6 +116,10 @@ int qw_acquire(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new) 
     return guarded(h, [&] { return h->session->acquire(std::vector<int32_t>(tokens, tokens + n), max_new); }, -1);
 }
 
+int64_t qw_suspend(qw_handle *h, int slot) {
+    return guarded(h, [&] { return h->session->suspend(slot); }, int64_t(-1));
+}
+
 int qw_release(qw_handle *h, int slot) {
     return guarded(
         h,

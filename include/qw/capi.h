@@ -70,6 +70,9 @@ int64_t qw_slot_len(qw_handle *h, int slot);
  * the one that can reuse the most of `tokens`. Returns the slot, or -1 when
  * none is free (not an error: qw_error is empty). */
 int qw_acquire(qw_handle *h, const int32_t *tokens, int64_t n, int64_t max_new);
+// Saves what the slot holds of a prompt still being prefilled to the prefix cache, for a request that gives up its
+// slot and continues later (qw_release follows). Returns the tokens saved (0: nothing, it starts over), -1 on error.
+int64_t qw_suspend(qw_handle *h, int slot);
 int qw_release(qw_handle *h, int slot);
 
 /* Makes `slot` hold exactly tokens[0..n). Returns the reused prompt tokens. */

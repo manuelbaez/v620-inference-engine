@@ -226,6 +226,31 @@ void Session::count_reuse(const std::vector<int32_t> &prompt, int64_t reused) {
     }
 }
 
+int64_t Session::suspend(int slot) {
+    SlotInfo &si = slots_[size_t(slot)];
+    const int64_t n = int64_t(si.hist.size());
+    if (!store_ || n == 0) return 0;
+    if (store_->has_snapshot(si.hist)) return n;
+    for (int i = 0; i < int(snaps_.size()); ++i)  // the last pass's snapshot of the slot, if the pool still has it
+        if (snaps_[size_t(i)].valid && snaps_[size_t(i)].slot == slot && int64_t(snaps_[size_t(i)].tokens.size()) == n) {
+            save_to_store(slot, i, si.hist, &snaps_[size_t(i)].logits, false);
+            return n;
+        }
+    // else a snapshot taken now, saved like a capture: without logits (the prompt does not end here), in a pool
+    // entry that stays invalid, so that nothing restores it expecting logits
+    int idx = -1;
+    for (int i = 0; i < int(snaps_.size()); ++i) {
+        const Snap &s = snaps_[size_t(i)];
+        if (idx < 0 || (!s.valid && snaps_[size_t(idx)].valid) ||
+            (s.valid == snaps_[size_t(idx)].valid && s.used < snaps_[size_t(idx)].used))
+            idx = i;
+    }
+    snaps_[size_t(idx)].valid = false;
+    e_.snapshot_save(idx, slot);
+    save_to_store(slot, idx, si.hist, nullptr, false);
+    return n;
+}
+
 void Session::persist() {
     if (!store_) return;
     for (int slot = 0; slot < num_slots(); ++slot) {  // each slot's newest snapshot
