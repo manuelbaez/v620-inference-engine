@@ -2771,8 +2771,23 @@ the scheduler. Dev-box server, 16 slots, 16 prompts of ~22,200 tokens and three 
 prompt that fits one prefill pass (4,096 tokens). It is now a prompt of at most `QW_SHORT_PASSES` passes: with 4,
 prompts up to 16,384 tokens go before the long ones (a piece per pass when they do not fit one: their own pass, then
 half of the pass they share with the long prompts) and may take a long prompt's slot; longer ones share passes and
-can be suspended. Scheduler only (`server/tests/test_prefill_parallel.py`); not measured on the GPUs, and production
-stays at 1 until the owner sets it.
+can be suspended. Scheduler only (`server/tests/test_prefill_parallel.py`); not measured on the GPUs. Production runs
+`QW_SHORT_PASSES=4` since 2026-10-12 02:12 UTC (`qw-engine:cace516`, the compose environment; backup
+`docker-compose.yaml.bak-before-short-passes-1012`).
+
+**System prompts are reused; the dev-box "0 of 16" was the test's text (2026-10-12).** Production, one after the
+other: conversation A = a system prompt + a question, then B and C = the same system prompt + other questions. B and
+C took 606 of 627, 2,850 of 2,871 and 9,934 of 9,955 prompt tokens from the store (restored in 8-43 ms): the snapshot
+captured at the system prompt's end. The dev-box runs that showed none used excerpts of this file as system
+prompts, and this file contains the literal string `<|im_start|>` (three times): the tokenizer turns it into the
+boundary token, `Session::system_end` takes the first one after the prompt's start as the system prompt's end, and the
+anchor snapshot lands there (466 and 1,382 tokens in, exactly what those conversations reused) while the capture at
+the real end is an ordinary one that the thinning (`QW_SNAP_KEEP_GAP`) may drop. The two test conversations whose
+excerpt had no such string reused their whole system prompt. So: no fault for ordinary system prompts; one that quotes
+`<|im_start|>` is cached up to the quote only (the server could pass the template's real boundary instead of the
+session searching for the token: not done). In the same test one new conversation reused 8,192 of 9,934 tokens: it
+landed in the slot that held the first conversation and took that slot's chunk-end snapshot; the store no longer
+offered the longer one (the same literal was in that excerpt). Not chased further.
 
 Three prompts were suspended (all before their first piece, so nothing had to be saved; the saving path is what the
 GPU test covers), no errors, every long prompt answered.
