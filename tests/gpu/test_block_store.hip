@@ -146,17 +146,18 @@ int main() {
                     s.set_prompt(1 - slot, {1});
                 }
         }
-        // a system prompt that contains the boundary token (it quotes <|im_start|>): searching for the token finds
-        // the quote, so only the part before it is shared; told where the system prompt ends, all of it is
+        // a system prompt that contains the boundary token (it quotes <|im_start|>) less than the snapshots' least
+        // distance before its end: searching for the token finds the quote, the end gets no snapshot and only the
+        // part before the quote is shared; told where the system prompt ends, all of it is
         for (int hint : {0, 1, 2}) {  // none, the true end, a wrong one (not a boundary token: ignored)
             setenv("QW_HOST_CACHE_GB", "8", 1);
             e.slot_reset(0);
             e.slot_reset(1);
             Session s(e);
             s.set_boundary_token(BOUNDARY);
-            const auto quoting = cat(text(1500, 31), text(1500, 32));
+            const auto quoting = cat(text(2700, 31), text(300, 32));
             const auto q1 = cat(quoting, text(800, 33)), q2 = cat(quoting, text(700, 34));
-            const int64_t end = int64_t(quoting.size()), quote = 1500;
+            const int64_t end = int64_t(quoting.size()), quote = 2700;
             int64_t reused = 0;
             for (const auto *q : {&q1, &q2}) {
                 const int slot = s.acquire(*q, 16);

@@ -363,6 +363,8 @@ void Engine::rank_loop(int r) {
                 run_decode_rank(rk);
         } catch (const std::exception &e) {
             err = e.what();
+            // at once: the other ranks may wait for this one's collectives for as long as the caller lets them
+            log("rank %d failed: %s", r, err.c_str());
         }
         phase_[size_t(r)] = 0;
         {

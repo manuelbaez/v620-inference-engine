@@ -820,6 +820,15 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          costs half to three quarters of all of them, and a token computed in fp32 on a history built with fp16 is as
          far off as one computed with fp16 (0.055 against 0.056). The arithmetic is at the floor of fp16 state;
          a more precise decode path would buy nothing
+   - [x] the server tells the engine where the system prompt ends (2026-10-12, section "Requests that were
+         cancelled, and long prompts arriving together"): a system prompt that quotes `<|im_start|>` is shared whole
+   - [x] three or four micro-batches per pass (2026-10-12, "Three experiments on the prefill pass"): -10%, rejected;
+         `QW_PREFILL_MB`, default 2 (bit-identical to before)
+   - [~] the router from a fp16 GEMM with exact candidates (same section): +0.8 to +1.2%, accuracy unchanged;
+         `QW_ROUTER16=1`, off until the owner turns it on
+   - [x] experts placed on the cards by measured work (same section): balance 1.144 -> 1.054 at best, no speed
+         difference; rejected, no rebalancing while running (`QW_EXPERT_PERM` stays as a tool)
+   - [ ] the stall during warm-up seen twice on 2026-10-12 (same section)
    - [x] indexer selection at long context (2026-10-07, section "Indexer selection at long context"): the
          top-512 selection and its scores were 27% of GPU kernel time at 320k tokens of context and every card
          did all of it. Each card now scores a quarter of the groups and the cards merge their candidates, from
@@ -2784,10 +2793,22 @@ boundary token, `Session::system_end` takes the first one after the prompt's sta
 anchor snapshot lands there (466 and 1,382 tokens in, exactly what those conversations reused) while the capture at
 the real end is an ordinary one that the thinning (`QW_SNAP_KEEP_GAP`) may drop. The two test conversations whose
 excerpt had no such string reused their whole system prompt. So: no fault for ordinary system prompts; one that quotes
-`<|im_start|>` is cached up to the quote only (the server could pass the template's real boundary instead of the
-session searching for the token: not done). In the same test one new conversation reused 8,192 of 9,934 tokens: it
+`<|im_start|>` was cached up to the quote only (fixed, next paragraph). In the same test one new conversation reused 8,192 of 9,934 tokens: it
 landed in the slot that held the first conversation and took that slot's chunk-end snapshot; the store no longer
 offered the longer one (the same literal was in that excerpt). Not chased further.
+
+**The server tells the engine where the system prompt ends (2026-10-12).** `ChatPrompt.encode_chat` renders the
+system message a second time with a marker as the next message; the text before the marker's `<|im_start|>` is the
+system block (tools included, as the template puts them there), and if the real prompt starts with exactly that
+text, the tokenizer's offsets give the index of the token that starts the next message. The chat template is not
+changed. The index goes with the request (`Request.sys_end`, `qw_set_system_end` before `qw_begin_prompt`,
+`Session::set_system_end`), and `Session::system_end` uses it when that token is the boundary token; otherwise (no
+system message, media in the prompt, a template that does something else, an old server) it searches as before.
+`qw_release` clears it. Checks: `server/tests/test_system_end.py` (the test template and the checkpoint's: plain and
+quoting system prompts, content given as parts, tools, later turns give the same place, the scheduler passes it
+before the prompt begins); `tests/gpu/test_block_store` (a 3,001-token system prompt with the boundary token 300
+tokens before its end: the next conversation reuses 2,700 tokens without the hint or with a wrong one, all 3,001
+with it).
 
 Three prompts were suspended (all before their first piece, so nothing had to be saved; the saving path is what the
 GPU test covers), no errors, every long prompt answered.
@@ -2796,6 +2817,73 @@ The batch finishes 10% sooner and the first answer comes 49 s later: the trade t
 the ~90 s a pure 2,300 tok/s would give: the stats line shows 1,880-1,910 prompt tok/s while all eight prefill
 (pieces of 512 tokens at 20k of context) and 1,300-1,700 once the first ones decode beside the rest (passes of 2,048
 tokens and the decoders' share of the time). Not looked at further.
+
+## Three experiments on the prefill pass (measured 2026-10-12)
+
+The owner's list after "what could make prefill faster": more micro-batches per pass, experts balanced over the
+cards, a custom kernel for the router. All three were built behind environment switches (off by default) and
+measured in one window (`bench/run_suite.sh prefill3`, logs in `~/prefill3-1012` on the dev box): the g128
+checkpoint, fp8 n-gram table, chunk 4,096, 16,384 tokens of real text (this file, tokenized) prefilled fresh and
+after 40,960 tokens of context, best of 3 repetitions per run, three alternating rounds. The rounds of one variant
+agree within 0.4%.
+
+| | fresh, tok/s (rounds) | after 40k, tok/s (rounds) |
+|---|---|---|
+| two micro-batches (the default) | 2,384 / 2,374 / 2,394 | 2,254 / 2,241 / 2,249 |
+| `QW_PREFILL_MB=3` | 2,145 / 2,143 / 2,135 (-10.2%) | 2,012 / 2,019 / 2,011 (-10.4%) |
+| `QW_PREFILL_MB=4` | 2,143 / 2,132 / 2,135 (-10.4%) | 2,034 / 2,027 / 2,021 (-9.8%) |
+| `QW_ROUTER16=1` | 2,400 / 2,408 / 2,401 (+0.8%) | 2,272 / 2,272 / 2,281 (+1.2%) |
+
+**More micro-batches: rejected (-10%).** A chunk now runs as `EngineOptions::prefill_mb` micro-batches (2 to 4;
+`Rank::MAX_MB`), each with its stream, rocBLAS handle, collective channel and buffers of an equal share of the
+chunk, and each waiting per layer on the one before it for the state a segment carries across (the events are per
+micro-batch; a micro-batch records after its own wait, so the order holds along the chain). With two the outputs
+are bit-identical to the build before (`logits_dump`, `cmp`); with three and four they differ in rounding (the same
+argmax after the prefill; `test_suspend` and `test_snapshot_capture` pass; `test_batch_prefill` reports the same one
+or two tolerance failures per run as the build before on these text prompts). Three and four are both 10% slower
+and use 10-12% more energy per token (4.84-4.88 kJ against 4.37). Why was not profiled; what changes is that every
+micro-batch makes every collective of the pass (so 1.5 and 2 times as many, each with a smaller payload), the GEMMs
+get 1,365 and 1,024 rows instead of 2,048, and three or four streams share a card that two already keep busy. The
+code stays (the default is the old behaviour, bit for bit); the option is not worth using.
+
+**The router from a fp16 GEMM: +0.8 to +1.2%, same accuracy; off, the owner decides.** The router's logits must be
+fp32 (fp16 logits flip near-tie choices, 0.074 -> 0.088), and rocBLAS computes a GEMM with fp32 output at 6-11
+TFLOPS against 30-36 with fp16 output. A hand-written fp32 GEMM would not beat that by much (the card's fp32 peak is
+~20 TFLOPS). What `QW_ROUTER16=1` does instead (`kernels/moe_route16.hip`): the GEMM with fp16 output only picks 16
+candidates per token; their logits are computed again in fp32 from the router's weights and the token's input (16
+dot products of 2,560, a wave each), and the top-10 and their weights come from those. A token whose 10th exact
+logit is not clear of the best expert left out, by four times what a fp16 logit can be off, gets all 512 computed.
+The softmax over all 512 was never needed: the weights are renormalized over the top-10. `QW_ROUTER16=check` runs
+both routings and compares them: per card and 16,384-token prompt, 10-47 of 200,703 routings choose another expert
+list (0.005-0.02%: near ties, where the two fp32 sums differ in their order of addition), the weights of the others
+differ by at most 3e-6, and 0-6 tokens needed all 512. Against the fp32 reference on the 4,000-token set: mean
+|dlogprob| 0.0523 with it, 0.0535 without (each run twice, identical files; not a difference that means anything).
+`test_speculative --gen 256 --k 5 --repeat 6` passes with it, `test_suspend` too; `test_snapshot_capture` fails one
+of its noise comparisons on the token-soup prompt (0.17 against a noise floor of 0.04 measured on the same run; the
+three-micro-batch run of the same test gives 0.075 against 0.073), which is what a different rounding does there.
+Decode is not touched (its router is a GEMV). The gain is about what the arithmetic gave: the router is 98 GEMMs of
+5.4 GFLOP per pass, ~5% of it at 8 TFLOPS.
+
+**Experts placed by measured work: the balance improves, the speed does not; rejected, and no periodic
+rebalancing.** `QW_MOE_STATS=1 QW_MOE_COUNTS_FILE=f` writes each expert's tiles per layer over a workload,
+`tools/expert_balance.py` places 128 experts per card and layer with equal sums, and `QW_EXPERT_PERM=file` loads
+that placement (the router's rows move with the experts, so the model is the same up to tie order; same argmax
+after the prefill in `logits_dump`). On 49,152 tokens of real text the busiest card has 1.144 times the mean's
+expert tiles per micro-batch and layer (1.20 in token pairs; the cumulative per-card counters of production, 1.01-
+1.07, hide this because the busiest card changes from pass to pass). With the placement made from another text
+(the engine guide and the sources) it is 1.103; with the placement made from the measured text itself, the best a
+static or periodically refreshed placement could do, 1.054. The sums over a whole text can be made equal (1.11 ->
+1.0001); what is left is the pass-to-pass variation. Speed, 16,384 tokens, two rounds: 2,393 / 2,377 tok/s without,
+2,375 / 2,369 with the other text's placement, 2,396 / 2,383 with its own; 49,152 tokens: 2,327, 2,321, 2,328. No
+difference beyond the noise even in the best case, so the cards waiting for each other is not explained by the
+experts' share, and rebalancing while running (moving 2.5 MB per expert between cards, swapping router rows) was
+not built.
+
+**A stall seen twice, not explained.** Two runs of the suite stopped during the engine's warm-up with one card
+waiting for the GPU and the others done (`QW_ROUTER16=check` at chunk 4,096; `QW_PREFILL_MB=3` with a 21,504-token
+chunk); both ran through when repeated. A card that fails while the others wait for its collectives looks like
+this, and the engine reported such a failure only after every card was done: it now logs it at once (`rank N
+failed: ...`). Whether the build before can do the same is not known (production once took 1,204 s to start).
 
 ## Benchmarks against the model card (2026-10-08/09)
 
