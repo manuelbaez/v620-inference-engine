@@ -826,7 +826,7 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          a compute kernel already runs 85% of the time with two), rejected;
          `QW_PREFILL_MB`, default 2 (bit-identical to before)
    - [~] the router from a fp16 GEMM with exact candidates (same section): +0.8 to +1.2%, accuracy unchanged;
-         `QW_ROUTER16=1`, off until the owner turns it on
+         `QW_ROUTER16=1`, in production's compose environment from its next start
    - [x] experts placed on the cards by measured work (same section): balance 1.144 -> 1.054 at best, no speed
          difference on the dev box; no rebalancing while running
    - [x] the two stalls of 2026-10-12 (same section): one was a cold read of the 51 GB n-gram table, the other a
@@ -2869,7 +2869,8 @@ So the overlap two micro-batches give is nearly all there is to get this way; wh
 (the collectives themselves) and in the kernels. The
 code stays (the default is the old behaviour, bit for bit); the option is not worth using.
 
-**The router from a fp16 GEMM: +0.8 to +1.2%, same accuracy; off, the owner decides.** The router's logits must be
+**The router from a fp16 GEMM: +0.8 to +1.2%, same accuracy; off in the code, set for production's next start
+(the owner, 2026-10-12; compose backup `docker-compose.yaml.bak-before-router16-1012`).** The router's logits must be
 fp32 (fp16 logits flip near-tie choices, 0.074 -> 0.088), and rocBLAS computes a GEMM with fp32 output at 6-11
 TFLOPS against 30-36 with fp16 output. A hand-written fp32 GEMM would not beat that by much (the card's fp32 peak is
 ~20 TFLOPS). What `QW_ROUTER16=1` does instead (`kernels/moe_route16.hip`): the GEMM with fp16 output only picks 16
