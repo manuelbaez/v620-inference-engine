@@ -46,6 +46,9 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     if (const char *v = std::getenv("QW_PREFILL_MB")) opt_.prefill_mb = std::atoi(v);
     QW_CHECK(opt_.prefill_mb >= 2 && opt_.prefill_mb <= Rank::MAX_MB, "QW_PREFILL_MB must be 2..4");
     for (int k = 1; k < opt_.prefill_mb; ++k) comm_mb_.push_back(std::make_unique<Comm>(opt_.devices, slot));
+    if (opt_.prefill_mb > 2)  // (docs/DESIGN.md "Three experiments on the prefill pass")
+        log("QW_PREFILL_MB=%d: slower than 2, and with three streams a card was seen to stop for 10-25 s in a pass "
+            "(or for good); an experiment, not for serving", opt_.prefill_mb);
     QW_CHECK(!opt_.slot_tokens.empty() && opt_.slot_tokens.size() <= size_t(MAX_SLOTS), "1..16 slots");
     static_assert(N_QSA + 1 <= 16, "the spill cache's tags hold a QSA layer in 4 bits");
     for (int c : opt_.slot_tokens) QW_CHECK(c > 0 && c % 256 == 0, "slot sizes must be positive multiples of 256");

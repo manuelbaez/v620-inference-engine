@@ -2841,9 +2841,28 @@ micro-batch; a micro-batch records after its own wait, so the order holds along 
 are bit-identical to the build before (`logits_dump`, `cmp`); with three and four they differ in rounding (the same
 argmax after the prefill; `test_suspend` and `test_snapshot_capture` pass; `test_batch_prefill` reports the same one
 or two tolerance failures per run as the build before on these text prompts). Three and four are both 10% slower
-and use 10-12% more energy per token (4.84-4.88 kJ against 4.37). Why was not profiled; what changes is that every
-micro-batch makes every collective of the pass (so 1.5 and 2 times as many, each with a smaller payload), the GEMMs
-get 1,365 and 1,024 rows instead of 2,048, and three or four streams share a card that two already keep busy. The
+and use 10-12% more energy per token (4.84-4.88 kJ against 4.37). Profiled the same day (`rocprofv3 --kernel-trace`, the timed 16,384-token prefill, per card; `ana_trace.py` in
+`~/window2-1012` on the dev box):
+
+| per card, ms | two micro-batches | four |
+|---|---|---|
+| wall | 6,759 | 7,524 |
+| some compute kernel is running | 5,737 (85%) | 6,559 |
+| only collective kernels (push, wait) are running | 820 (12%) | 699 |
+| nothing is running | 202 (3%) | 266 |
+| kernel durations summed over the streams | 12,647 | 17,617 |
+| rocBLAS GEMMs with fp16 output (calls) | 1,935 (3,920) | 3,370 (7,104) |
+| QSA attention (calls) | 2,287 (832) | 3,293 (832) |
+| expert gate/up and down (calls each) | 2,449 (392) | 3,211 (784) |
+| collective kernels | 3,631 | 5,063 |
+
+With two micro-batches a compute kernel already runs 85% of the time and the card only waits (collective kernels
+alone, or nothing) for 15%. Four streams win back 121 ms of that waiting and pay 822 ms for it: the same work takes
+longer in more and smaller kernels running against each other. The GEMMs take 74% longer in total for twice the
+calls at half the rows, the attention kernels (the same 832 calls) 44% longer because they now share the card with
+up to three other streams, the experts 31% longer (half the tokens per expert and micro-batch, so emptier tiles).
+So the overlap two micro-batches give is nearly all there is to get this way; what is left to gain is in the 15%
+(the collectives themselves) and in the kernels. The
 code stays (the default is the old behaviour, bit for bit); the option is not worth using.
 
 **The router from a fp16 GEMM: +0.8 to +1.2%, same accuracy; off, the owner decides.** The router's logits must be
