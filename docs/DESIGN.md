@@ -2745,6 +2745,31 @@ period, from the request log) to watch production: before the change, 0-2 cold r
 In the same runs no new conversation reused an existing system prompt of ~3,000 tokens from the store on either
 build: not looked at yet.
 
+**A short request takes a long prompt's slot (2026-10-12, `qw-engine:1f01456`).** The owner sent 16 prompts of
+~95,000 tokens and then a short one, which waited: the stats line read `prefilling 16, waiting 1 | slots 16/16`. It
+was not waiting for a pass (new arrivals are admitted after every pass, 4,096 tokens or 2,048 while something
+decodes, and short prompts get their own pass) but for a slot, and each long prompt holds its slot for the minutes
+its prefill takes. The owner's design: the short request takes a long prompt's place, and the long prompt continues
+afterwards. `Session::suspend(slot)` saves what the slot holds of the prompt to the block store (the last pass's
+snapshot of the slot when the pool still has it, else a snapshot taken now and saved like a capture, without logits
+and never valid in the pool); the scheduler (`_victim`, `_suspend`) picks a prompt still more than a pass from its
+end (suspended least often, then admitted last), releases its slot and puts it first in the waiting list; with a slot
+again it restores its part from the store and goes on (`started` keeps its "start" event and its cache figures to
+the first time). The long prompts keep `QW_PREFILL_LONG_PARALLEL` (4) slots; `QW_PREEMPT=0` turns it off;
+`QW_SHORT_SLOTS=N` instead keeps N slots free of long prompts (written first, default 0 now).
+`tests/gpu/test_suspend`: a prompt suspended at 3,072 of 9,000 tokens, its slot used by another request, resumed
+from the store: logits bit-identical to the same pieces without the interruption, in both snapshot cases;
+`logits_dump` identical, `test_block_store` and `test_host_tier` pass; `server/tests/test_prefill_parallel.py` covers
+the scheduler. Dev-box server, 16 slots, 16 prompts of ~22,200 tokens and three short requests from 5 s on:
+
+| | short requests' first token | all 16 long prompts done |
+|---|---|---|
+| `QW_PREEMPT=0` | 6.8, 7.0, 7.4 s | 181.8 s |
+| preemption | **0.2, 0.5, 0.8 s** | 187.8 s |
+
+Three prompts were suspended (all before their first piece, so nothing had to be saved; the saving path is what the
+GPU test covers), no errors, every long prompt answered.
+
 The batch finishes 10% sooner and the first answer comes 49 s later: the trade the owner asked for. It is less than
 the ~90 s a pure 2,300 tok/s would give: the stats line shows 1,880-1,910 prompt tok/s while all eight prefill
 (pieces of 512 tokens at 20k of context) and 1,300-1,700 once the first ones decode beside the rest (passes of 2,048
