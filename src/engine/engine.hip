@@ -91,6 +91,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     logits_.resize(VOCAB);
     mtp_ = opt_.mtp && !std::getenv("QW_NO_MTP") && st_.has("mtp.fc_embedding.weight");
     moe_stats_ = std::getenv("QW_MOE_STATS") != nullptr;
+    moe_quiet_ = moe_stats_ && std::string(std::getenv("QW_MOE_STATS")) == "quiet";
     load_expert_perm();
     if (const char *p = std::getenv("QW_PREFILL_PIPELINE")) pipeline_ = std::atoi(p) != 0;
 
@@ -481,6 +482,12 @@ const std::vector<float> &Engine::step(int32_t token) {
     const auto &l = decode({{0, token}});
     logits_.assign(l.begin(), l.begin() + VOCAB);
     return logits_;
+}
+
+void Engine::moe_balance(double out[3]) const {
+    out[0] = moe_total_max_;
+    out[1] = moe_total_mean_;
+    out[2] = moe_total_max_by_number_;
 }
 
 void Engine::moe_use(unsigned long long out[RANKS][2]) const {

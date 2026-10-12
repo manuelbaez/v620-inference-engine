@@ -62,6 +62,10 @@ int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out);
 // Routed-expert work per card since the start: out[2 * r] the (token, expert) pairs card r computed in prefill,
 // out[2 * r + 1] in decode (4 cards: 8 values). Uneven counts mean the cards wait for the busiest one.
 int qw_get_moe_use(qw_handle *h, unsigned long long *out);
+// With QW_MOE_STATS (=quiet in a server): expert tiles since the start, summed over the prefill passes' micro-batches
+// and layers: out[0] the busiest card's, out[1] the cards' mean, out[2] the busiest card's had the experts not been
+// placed (QW_EXPERT_PERM; else equal to out[0]). Zeros without the statistics.
+int qw_get_moe_balance(qw_handle *h, double *out);
 
 int qw_num_slots(qw_handle *h);
 int64_t qw_slot_capacity(qw_handle *h, int slot);

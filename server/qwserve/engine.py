@@ -119,6 +119,7 @@ class Engine:
             "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
             "qw_get_slot_timing": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(SlotTiming)]),
             "qw_get_moe_use": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_ulonglong)]),
+            "qw_get_moe_balance": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_double)]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
                                            I32P, I32P]),
@@ -294,6 +295,13 @@ class Engine:
         u = (ctypes.c_ulonglong * 8)()
         self._check(self.lib.qw_get_moe_use(self.h, u))
         return [(u[2 * r], u[2 * r + 1]) for r in range(4)]
+
+    def moe_balance(self):
+        """(busiest card's expert tiles, the cards' mean, the busiest card's without the expert placement) summed
+        over the prefill passes since the start; zeros unless the engine collects them (QW_MOE_STATS)."""
+        b = (ctypes.c_double * 3)()
+        self._check(self.lib.qw_get_moe_balance(self.h, b))
+        return b[0], b[1], b[2]
 
     def persist(self):
         """Saves the slots' conversations to the disk prefix cache."""

@@ -334,9 +334,15 @@ private:
         std::vector<double> layer_max, layer_mean;                            // tiles per layer, summed over chunks
     } moe_bal_;
     bool moe_stats_ = false;
-    // QW_MOE_COUNTS_FILE (with QW_MOE_STATS): the tiles of each expert, [layer][N_EXPERTS] summed over the prefill
-    // chunks so far, are written there with each report (what tools/expert_balance.py places the experts from).
+    bool moe_quiet_ = false;                         // QW_MOE_STATS=quiet: collect, no report per prefill (a server)
+    double moe_total_max_ = 0, moe_total_mean_ = 0;  // max_tiles and mean_tiles since the start (moe_balance())
+    double moe_total_max_by_number_ = 0;             // max_tiles without the placement (QW_EXPERT_PERM), same passes
+    // QW_MOE_COUNTS_FILE (with QW_MOE_STATS): the tiles of each expert, [layer][N_EXPERTS] by the checkpoint's expert
+    // number, summed over the prefill passes so far, are written there with each report and every 256 passes (what
+    // tools/expert_balance.py places the experts from).
     std::vector<uint64_t> moe_expert_tiles_;
+    uint64_t moe_passes_ = 0;
+    void write_moe_counts() const;
     // QW_EXPERT_PERM: a placement of the experts over the cards (a file of N_LAYERS lines of N_EXPERTS checkpoint
     // expert numbers, in the engine's order: the first EXP_L go to card 0, ...). The router's rows move with them,
     // so the model is the same up to rounding.
@@ -348,6 +354,12 @@ public:
     // Routed-expert work per rank since the start: (token, expert) pairs each card computed, out[r][0] in prefill and
     // out[r][1] in decode (the main layers; a few steps behind). Uneven counts are cards waiting for the busiest one.
     void moe_use(unsigned long long out[RANKS][2]) const;
+    // With QW_MOE_STATS: since the start, summed over the prefill passes' micro-batches and layers, out[0] the
+    // busiest card's expert tiles and out[1] the cards' mean. Their ratio over an interval is the factor the routed
+    // experts' phase takes longer by because the cards wait for the busiest one (the per-card totals of moe_use hide
+    // it: the busiest card changes from pass to pass). out[2]: what out[0] would be on the same passes with every
+    // expert on the card of its number (equal to out[0] without QW_EXPERT_PERM). Zeros without the statistics.
+    void moe_balance(double out[3]) const;
 
 private:
     void collect_moe_balance();

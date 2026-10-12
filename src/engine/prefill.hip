@@ -679,7 +679,7 @@ const std::vector<float> &Engine::prefill(int slot, const std::vector<int32_t> &
     if (profile && chunks)
         log("prefill %zu tokens in %.0f ms (%d chunks): host inputs %.0f ms, jobs %.0f ms, after_chunk %.0f ms",
             tokens.size(), ms(t_begin, clk::now()), chunks, t_inputs, t_job, t_after);
-    if (moe_stats_) log_moe_balance();
+    if (moe_stats_ && !moe_quiet_) log_moe_balance();
     return logits_;
 }
 
@@ -722,6 +722,7 @@ const std::vector<std::vector<float>> &Engine::prefill_batch(const std::vector<S
     for (auto &l : seg_logits_) l.resize(VOCAB);
     job_ = Job::Prefill;
     dispatch();
+    if (moe_stats_) collect_moe_balance();
     for (const Segment &g : segs) prefill_commit(g.slot, g.tokens);
     return seg_logits_;
 }

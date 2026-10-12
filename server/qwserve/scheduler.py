@@ -295,6 +295,14 @@ class Scheduler:
             d = [u[i] - l[i] for u, l in zip(use, last)]
             if sum(d) >= 4000:  # enough pairs for the ratio to mean something
                 parts.append(f"{name} x{max(d) * len(d) / sum(d):.2f}")
+        try:  # per pass (QW_MOE_STATS): what the cards wait for; the totals above hide a busiest card that changes
+            bal = self.e.moe_balance()
+            last_b, self._moe_bal = getattr(self, "_moe_bal", bal), bal
+            if bal[1] - last_b[1] >= 1000:
+                d = [b - l for b, l in zip(bal, last_b)]
+                parts.append(f"prefill per pass x{d[0] / d[1]:.3f}" + (f" (x{d[2] / d[1]:.3f} unplaced)" if d[2] != d[0] else ""))
+        except Exception:
+            pass
         return " | experts, busiest card: " + ", ".join(parts) if parts else ""
 
     def _stats(self, force=False):

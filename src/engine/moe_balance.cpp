@@ -20,13 +20,19 @@ void Engine::collect_moe_balance() {
     for (int mb = 0; mb < nmb; ++mb)
         for (int l = 0; l < layers; ++l) {
             double tmax = 0, tsum = 0, pmax = 0, psum = 0;
+            double by_number[RANKS] = {};  // the cards' tiles had each expert been on the card of its number
             for (int r = 0; r < RANKS; ++r) {
                 const int32_t *c = moe_counts_[size_t(r)] + (size_t(mb) * size_t(layers) + size_t(l)) * size_t(cfg::EXP_L);
                 double tiles = 0, pairs = 0;
                 for (int e = 0; e < cfg::EXP_L; ++e) {
                     tiles += (c[e] + gpu::MT - 1) / gpu::MT;
                     pairs += c[e];
-                    moe_expert_tiles_[size_t(l) * cfg::N_EXPERTS + size_t(r * cfg::EXP_L + e)] += uint64_t((c[e] + gpu::MT - 1) / gpu::MT);
+                    {  // (by the checkpoint's expert number, whatever the placement)
+                        const size_t i = size_t(r * cfg::EXP_L + e);
+                        const size_t ck = l < cfg::N_LAYERS && !expert_perm_.empty() ? size_t(expert_perm_[size_t(l) * cfg::N_EXPERTS + i]) : i;
+                        moe_expert_tiles_[size_t(l) * cfg::N_EXPERTS + ck] += uint64_t((c[e] + gpu::MT - 1) / gpu::MT);
+                        by_number[ck / size_t(cfg::EXP_L)] += (c[e] + gpu::MT - 1) / gpu::MT;
+                    }
                 }
                 tmax = std::max(tmax, tiles);
                 tsum += tiles;
@@ -35,12 +41,28 @@ void Engine::collect_moe_balance() {
             }
             moe_bal_.max_tiles += tmax;
             moe_bal_.mean_tiles += tsum / RANKS;
+            moe_total_max_ += tmax;
+            moe_total_mean_ += tsum / RANKS;
+            moe_total_max_by_number_ += *std::max_element(by_number, by_number + RANKS);
             moe_bal_.max_pairs += pmax;
             moe_bal_.mean_pairs += psum / RANKS;
             moe_bal_.layer_max[size_t(l)] += tmax;
             moe_bal_.layer_mean[size_t(l)] += tsum / RANKS;
         }
     ++moe_bal_.chunks;
+    if (++moe_passes_ % 256 == 0) write_moe_counts();  // (a server never reports: the file follows the workload)
+}
+
+void Engine::write_moe_counts() const {
+    const char *f = std::getenv("QW_MOE_COUNTS_FILE");
+    if (!f || !*f) return;
+    const std::string tmp = std::string(f) + ".tmp";
+    {
+        std::ofstream out(tmp);
+        for (size_t i = 0; i < moe_expert_tiles_.size(); ++i)
+            out << moe_expert_tiles_[i] << ((i + 1) % cfg::N_EXPERTS ? ' ' : '\n');
+    }
+    std::rename(tmp.c_str(), f);
 }
 
 void Engine::log_moe_balance() {
@@ -59,11 +81,7 @@ void Engine::log_moe_balance() {
         moe_bal_.chunks, moe_bal_.max_tiles / std::max(moe_bal_.mean_tiles, 1.0),
         moe_bal_.max_pairs / std::max(moe_bal_.mean_pairs, 1.0), w.c_str());
     moe_bal_ = MoeBalance{};
-    if (const char *f = std::getenv("QW_MOE_COUNTS_FILE")) {
-        std::ofstream out(f);
-        for (size_t i = 0; i < moe_expert_tiles_.size(); ++i)
-            out << moe_expert_tiles_[i] << ((i + 1) % cfg::N_EXPERTS ? ' ' : '\n');
-    }
+    write_moe_counts();
 }
 
 void Engine::load_expert_perm() {

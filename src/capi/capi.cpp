@@ -281,6 +281,16 @@ int qw_get_moe_use(qw_handle *h, unsigned long long *out) {
         -1);
 }
 
+int qw_get_moe_balance(qw_handle *h, double *out) {
+    return guarded(
+        h,
+        [&] {
+            h->engine->moe_balance(out);
+            return 0;
+        },
+        -1);
+}
+
 int qw_has_mtp(qw_handle *h) {
     return h->engine->has_mtp() ? 1 : 0;
 }
