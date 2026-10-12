@@ -146,6 +146,36 @@ int main() {
                     s.set_prompt(1 - slot, {1});
                 }
         }
+        // a system prompt that contains the boundary token (it quotes <|im_start|>): searching for the token finds
+        // the quote, so only the part before it is shared; told where the system prompt ends, all of it is
+        for (int hint : {0, 1, 2}) {  // none, the true end, a wrong one (not a boundary token: ignored)
+            setenv("QW_HOST_CACHE_GB", "8", 1);
+            e.slot_reset(0);
+            e.slot_reset(1);
+            Session s(e);
+            s.set_boundary_token(BOUNDARY);
+            const auto quoting = cat(text(1500, 31), text(1500, 32));
+            const auto q1 = cat(quoting, text(800, 33)), q2 = cat(quoting, text(700, 34));
+            const int64_t end = int64_t(quoting.size()), quote = 1500;
+            int64_t reused = 0;
+            for (const auto *q : {&q1, &q2}) {
+                const int slot = s.acquire(*q, 16);
+                QW_CHECK(slot >= 0, "no slot");
+                if (hint) s.set_system_end(slot, hint == 1 ? end : end - 5);
+                reused = s.set_prompt(slot, *q);
+            }
+            const std::vector<float> got = e.logits();
+            e.slot_reset(0);
+            const std::vector<float> fresh = e.prefill(0, q2);
+            const int32_t top = argmax(fresh);
+            const double d = std::fabs(logprob(fresh, top) - logprob(got, top));
+            const bool ok = reused == (hint == 1 ? end : quote) && argmax(got) == top && d < 0.25;
+            fails += !ok;
+            std::printf("system prompt of %lld tokens with the boundary token at %lld, %s: the next conversation reuses "
+                        "%lld, |dlogprob| %.4f %s\n", (long long)end, (long long)quote,
+                        hint == 0 ? "no hint" : hint == 1 ? "told its end" : "a wrong hint", (long long)reused, d, ok ? "" : "FAIL");
+            s.set_prompt(0, {1});
+        }
         std::printf("%s\n", fails ? "FAILED" : "all ok");
         return fails ? 1 : 0;
     } catch (const std::exception &ex) {

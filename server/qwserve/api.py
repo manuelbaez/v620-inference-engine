@@ -73,10 +73,11 @@ class Server:
 
     async def prepare(self, body):
         """The chat request's template and tokens, off the event loop: (thinking, tools,
-        think_budget, prompt_ids)."""
+        think_budget, prompt_ids, system_end: where the system prompt ends in prompt_ids, or -1)."""
         def work():
             text, thinking, tools, think_budget = self.render(body)
-            return thinking, tools, think_budget, self.encode(text)
+            ids, system_end = self.prompt.encode_chat(body, text)
+            return thinking, tools, think_budget, ids, system_end
         return await self.offload(work)
 
     # --- generation
@@ -92,7 +93,7 @@ class Server:
         media = await loop.run_in_executor(None, lambda: [vision.media_of_part(self.vision, p) for p in parts])
         return vision.expand(prompt_ids, media, self.tok), media
 
-    async def run(self, prompt_ids, body, media=None, think_budget=None, rid="-"):
+    async def run(self, prompt_ids, body, media=None, think_budget=None, rid="-", system_end=-1):
         """Async generator of (kind, payload) events of one request: 'start'
         (cached prompt tokens), 'token' (id, logprob, top), 'eos', then 'end'
         (finish reason) or 'error'."""
@@ -104,6 +105,7 @@ class Server:
 
         req = Request(prompt_ids, body, emit, self.eos_ids, media, self.sampling_defaults)
         req.rid = rid
+        req.sys_end = system_end if not media else -1  # (media placeholders are expanded after this was found)
         if think_budget is not None:  # the prompt ends inside <think>: cap the thinking
             req.think_left = think_budget
             req.think_close = self.think_close
@@ -162,7 +164,7 @@ class Server:
         if int(body.get("n") or 1) != 1:
             return web.json_response({"error": {"message": "n > 1 is not supported", "type": "invalid_request_error"}}, status=400)
         try:
-            thinking, tools, think_budget, prompt_ids = await self.prepare(body)
+            thinking, tools, think_budget, prompt_ids, system_end = await self.prepare(body)
         except (jinja2.exceptions.TemplateError, ValueError) as e:
             return web.json_response({"error": {"message": str(e), "type": "invalid_request_error"}}, status=400)
         try:
@@ -209,7 +211,7 @@ class Server:
         timings = None  # llama.cpp-style per-request timings (llama-swap's activity log reads them)
         reasoning_tokens = 0
         try:
-            async for kind, payload in self.run(prompt_ids, body, media, think_budget, rid[-12:]):
+            async for kind, payload in self.run(prompt_ids, body, media, think_budget, rid[-12:], system_end):
                 if kind == "error":
                     raise RuntimeError(payload)
                 if kind == "start":

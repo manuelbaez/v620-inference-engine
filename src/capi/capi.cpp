@@ -234,6 +234,16 @@ int qw_persist(qw_handle *h) {
         -1);
 }
 
+int qw_set_system_end(qw_handle *h, int slot, int64_t pos) {
+    return guarded(
+        h,
+        [&] {
+            h->session->set_system_end(slot, pos);
+            return 0;
+        },
+        -1);
+}
+
 int qw_set_boundary_token(qw_handle *h, int32_t id) {
     h->session->set_boundary_token(id);
     return 0;

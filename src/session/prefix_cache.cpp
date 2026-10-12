@@ -38,14 +38,14 @@ bool Session::prefetch(int slot, const std::vector<int32_t> &prompt, const std::
     return hit.n > 0 && store_->load(hit);
 }
 
-std::vector<Engine::Capture> Session::plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
+std::vector<Engine::Capture> Session::plan_captures(int slot, const std::vector<int32_t> &prompt, int64_t from, int64_t to,
                                                     int max_caps, bool append) {
     std::vector<Engine::Capture> caps;
     if (!store_ || boundary_ < 0 || max_caps <= 0) return caps;
     const int64_t chunk = e_.prefill_chunk(), n = to;
     // chunk k of this prefill covers positions (from + k * chunk, from + (k + 1) * chunk]
     std::vector<std::vector<int64_t>> per_chunk(size_t((n - from + chunk - 1) / chunk));
-    const int64_t sys = system_end(prompt);  // captured even when it is closer than min_gap_ to the start
+    const int64_t sys = system_end(slot, prompt);  // captured even when it is closer than min_gap_ to the start
     for (int64_t p = from + 1, last = from; p < n; ++p) {
         if (prompt[size_t(p)] != boundary_ || (p - last < min_gap_ && !(p == sys && p >= sys_min_))) continue;
         last = p;
@@ -84,8 +84,8 @@ void Session::prefill_range(int slot, const std::vector<int32_t> &prompt, int64_
     const int64_t from = int64_t(hist.size());
     const std::vector<int32_t> rest(prompt.begin() + ptrdiff_t(from), prompt.begin() + ptrdiff_t(to));
     drop_snapshots_after(slot, from);
-    const auto caps = plan_captures(prompt, from, to);
-    const int64_t sys_end = system_end(prompt);
+    const auto caps = plan_captures(slot, prompt, from, to);
+    const int64_t sys_end = system_end(slot, prompt);
     // Pins the memory the saves of positions (pos, end] will need, in the background, while the GPUs prefill: the
     // next reserve_ahead_ chunks (QW_RESERVE_AHEAD), or 0: everything up to `to` at once. All at once starts every
     // arena of a long prompt together (105k tokens: 51 pins of 0.5-9 s, 2026-10-02) and holds memory for saves that a
@@ -155,7 +155,7 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
     for (const Piece &pc : pieces) {
         const auto &prompt = slots_[size_t(pc.slot)].pending;
         drop_snapshots_after(pc.slot, pc.from);
-        auto caps = plan_captures(prompt, pc.from, pc.to,
+        auto caps = plan_captures(pc.slot, prompt, pc.from, pc.to,
                                   std::min(caps_each, Engine::SNAPSHOTS - int(reserved_.size())), true);
         blocks += size_t(pc.to - pc.from) / BlockStore::BLOCK + 2 * (caps.size() + 1);
         snaps += caps.size() + 1;
@@ -168,7 +168,7 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
     for (size_t i = 0; i < pieces.size(); ++i) {  // the captures first: their snapshots are free again after this
         const Piece &pc = pieces[i];
         const auto &prompt = slots_[size_t(pc.slot)].pending;
-        const int64_t sys_end = system_end(prompt);
+        const int64_t sys_end = system_end(pc.slot, prompt);
         for (const Engine::Capture &c : segs[i].captures)
             save_to_store(pc.slot, c.snap, std::vector<int32_t>(prompt.begin(), prompt.begin() + ptrdiff_t(c.pos)),
                           nullptr, c.pos == sys_end);
@@ -178,7 +178,7 @@ std::vector<bool> Session::prefill_batch(const std::vector<std::pair<int, int64_
         const Piece &pc = pieces[i];
         SlotInfo &si = slots_[size_t(pc.slot)];
         const auto &prompt = si.pending;
-        const int64_t sys_end = system_end(prompt);
+        const int64_t sys_end = system_end(pc.slot, prompt);
         si.hist.insert(si.hist.end(), prompt.begin() + ptrdiff_t(pc.from), prompt.begin() + ptrdiff_t(pc.to));
         const int idx = save_snapshot(pc.slot, &logits[i]);
         const bool keep = pc.to == int64_t(prompt.size()) || pc.to % e_.prefill_chunk() == 0;

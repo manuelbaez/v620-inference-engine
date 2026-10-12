@@ -41,6 +41,9 @@ int qw_engine_failure(qw_handle *h, char *buf, int buflen);
 /* Token that starts a chat message (<|im_start|>): prefill snapshots the state
  * before such tokens, so prompts sharing a prefix up to a message reuse it. */
 int qw_set_boundary_token(qw_handle *h, int32_t id);
+// Where the system prompt of the prompt about to begin in `slot` ends: the position of the token that starts the
+// next message (-1: let the engine take the first boundary token). Call before qw_begin_prompt; qw_release clears it.
+int qw_set_system_end(qw_handle *h, int slot, int64_t pos);
 typedef struct qw_cache_stats {
     uint64_t hits, tokens_restored, snapshots_saved;
     uint64_t ram_bytes, disk_bytes, blocks, snapshots;

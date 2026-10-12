@@ -115,6 +115,7 @@ class Engine:
             "qw_has_mtp": (ctypes.c_int, [P]),
             "qw_persist": (ctypes.c_int, [P]),
             "qw_set_boundary_token": (ctypes.c_int, [P, ctypes.c_int32]),
+            "qw_set_system_end": (ctypes.c_int, [P, ctypes.c_int, ctypes.c_int64]),
             "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
             "qw_get_slot_timing": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(SlotTiming)]),
             "qw_get_moe_use": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_ulonglong)]),
@@ -255,6 +256,11 @@ class Engine:
         self._check(self.lib.qw_generate(self.h, n, arr, k, toks, lps, counts, firsts, stopped))
         return [(list(toks[i * w:i * w + counts[i]]), list(lps[i * w:i * w + counts[i]]), firsts[i], bool(stopped[i]))
                 for i in range(n)]
+
+    def set_system_end(self, slot, pos):
+        """Where the system prompt of the prompt about to begin in the slot ends (the token index of the next
+        message's start; -1: unknown). Before begin_prompt."""
+        self._check(self.lib.qw_set_system_end(self.h, slot, pos))
 
     def set_boundary_token(self, token_id):
         """Token that starts a chat message: prefill snapshots the state before it."""

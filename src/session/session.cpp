@@ -157,8 +157,10 @@ int Session::acquire(const std::vector<int32_t> &prompt, int64_t max_new) {
     return best;
 }
 
-int64_t Session::system_end(const std::vector<int32_t> &prompt) const {
+int64_t Session::system_end(int slot, const std::vector<int32_t> &prompt) const {
     if (boundary_ < 0) return -1;
+    const int64_t hint = slots_[size_t(slot)].sys_hint;
+    if (hint > 0 && hint < int64_t(prompt.size()) && prompt[size_t(hint)] == boundary_) return hint;
     for (size_t p = 1; p < prompt.size(); ++p)
         if (prompt[p] == boundary_) return int64_t(p);
     return -1;
@@ -177,6 +179,7 @@ void Session::release(int slot) {
     SlotInfo &si = slots_[size_t(slot)];
     si.busy = false;
     si.last_use = std::chrono::steady_clock::now();
+    si.sys_hint = -1;
     si.stop.clear();
     si.drafts_for = -1;
     si.pending.clear();  // an unfinished prefill: the slot keeps what went in

@@ -98,6 +98,7 @@ class Request:
         self.share = {}      # id() of a prefilling request -> length of the prefix this prompt shares with it
         self.t_share = None  # when it first waited for such a request's prefill (Scheduler._shares_prefill)
         self.share_on = None  # id() of the request it is waiting for
+        self.sys_end = -1     # where its system prompt ends in the prompt (the API knows from the template), or -1
         self.started = False  # its "start" event went out (a suspended request begins a second time)
         self.suspended = 0    # times it gave its slot to a short request (Scheduler._suspend)
 
@@ -510,6 +511,8 @@ class Scheduler:
         """Restores what the caches hold of r's prompt into its slot and queues the rest for prefill."""
         r.t_begin = time.time()
         try:
+            if r.sys_end > 0 and hasattr(self.raw_engine, "set_system_end"):
+                self.e.set_system_end(r.slot, r.sys_end)
             cached, r.keep = self.e.begin_prompt(r.slot, r.prompt, r.media)
             r.left = len(r.prompt) - cached
             if not r.started:  # (a suspended request begins again: what it gets back is its own work, not a cache hit)

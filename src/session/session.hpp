@@ -121,6 +121,9 @@ public:
     // Token that starts a chat message (<|im_start|>): prefill snapshots the
     // state before such tokens. -1: no message boundaries.
     void set_boundary_token(int32_t id) { boundary_ = id; }
+    // Position of the token that starts the message after the system prompt, in the prompt the slot's request is
+    // about to begin (cleared by release). Ignored unless that token is the boundary token.
+    void set_system_end(int slot, int64_t pos) { slots_[size_t(slot)].sys_hint = pos; }
     BlockStore::Stats cache_stats() const { return store_ ? store_->stats() : BlockStore::Stats{}; }
     // Prompt-level counters: prompt tokens, tokens reused exactly, and tokens
     // after the reuse point in chunks already seen in an earlier prompt at any
@@ -178,6 +181,7 @@ private:
         // next plain stretch's length, and decoded tokens whose MTP rows are missing
         int plain_left = 0, plain_len = 32, mtp_lag = 0;
         std::vector<int32_t> pending;  // prompt being prefilled (begin_prompt .. prefill_some)
+        int64_t sys_hint = -1;         // where the caller says its system prompt ends (set_system_end), or -1
         std::vector<Media> pending_media;
         std::vector<float> logits;  // after the prompt's last token (sample_prompt)
         uint64_t epoch = 0;         // bumped when hist is replaced (GPU penalty counts rebuild)
@@ -189,7 +193,7 @@ private:
     // at least min_gap_ apart, at most Engine::MAX_CAPTURES per prefill chunk.
     // At most max_caps per chunk; append: keep the VRAM snapshots already
     // reserved (for another slot's captures in the same batched pass).
-    std::vector<Engine::Capture> plan_captures(const std::vector<int32_t> &prompt, int64_t from, int64_t to,
+    std::vector<Engine::Capture> plan_captures(int slot, const std::vector<int32_t> &prompt, int64_t from, int64_t to,
                                                int max_caps = Engine::MAX_CAPTURES, bool append = false);
     void prefill_range(int slot, const std::vector<int32_t> &prompt, int64_t to);  // [hist.size(), to)
     int64_t begin_keys(int slot, const std::vector<int32_t> &prompt);
@@ -201,7 +205,10 @@ private:
     // Where a prompt's first message ends (the next message's start token): the end of the system prompt, which
     // every conversation with that system prompt shares. Always snapshotted when it holds sys_min_ tokens or more
     // (QW_SNAP_SYSTEM_MIN, default 256; the other boundaries need min_gap_), and kept by the cache's thinning. -1: none.
-    int64_t system_end(const std::vector<int32_t> &prompt) const;
+    // The caller may say where it is (set_system_end, before begin_prompt; the server knows from the chat template):
+    // otherwise it is the first boundary token after the prompt's start, which is wrong for a system prompt that
+    // quotes that token.
+    int64_t system_end(int slot, const std::vector<int32_t> &prompt) const;
     int64_t sys_min_ = 256;
     void set_prompt_logits(int slot, const std::vector<float> &l);  // the prompt's logits come from a cache
     void count_reuse(const std::vector<int32_t> &prompt, int64_t reused);

@@ -96,6 +96,38 @@ class ChatPrompt:
         # so on a worker thread only this keeps the event loop free (a 100k-token prompt takes ~0.1 s)
         return self.tok.encode_batch([text], add_special_tokens=False)[0].ids
 
+    SYSTEM_MARK = "\u241fqw system prompt ends here\u241f"
+
+    def encode_chat(self, body, text):
+        """(ids, system_end) of a rendered chat prompt: system_end is the index of the token that starts the
+        message after the system prompt, or -1 when the first message is not a system message or the place
+        cannot be told for sure. The engine keeps a cache snapshot there for every conversation that shares
+        the system prompt; left to itself it takes the first <|im_start|> token after the prompt's start, which is
+        inside the system prompt when that quotes the string. Here the place comes from the template: the same
+        system message rendered with a marker as the next message gives the text of the system block."""
+        enc = self.tok.encode_batch([text], add_special_tokens=False)[0]
+        ids = enc.ids
+        msgs = body.get("messages") or []
+        if len(msgs) < 2 or msgs[0].get("role") not in ("system", "developer"):
+            return ids, -1
+        probe = dict(body, messages=[msgs[0], {"role": "user", "content": self.SYSTEM_MARK}], add_generation_prompt=False)
+        try:
+            other = self.render(probe)[0]
+        except (jinja2.exceptions.TemplateError, ValueError):
+            return ids, -1
+        at = other.rfind("<|im_start|>", 0, max(other.rfind(self.SYSTEM_MARK), 0))
+        if at <= 0 or text[:at] != other[:at] or not text.startswith("<|im_start|>", at):
+            return ids, -1
+        lo, hi = 0, len(ids)  # the token that starts at character `at`
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if enc.offsets[mid][0] < at:
+                lo = mid + 1
+            else:
+                hi = mid
+        ok = lo < len(ids) and enc.offsets[lo][0] == at and ids[lo] == self.tok.token_to_id("<|im_start|>")
+        return ids, (lo if ok else -1)
+
 
 # reasoning_effort values of the OpenAI / vLLM APIs onto this template's levels (low, medium, xhigh)
 EFFORT_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh"}
