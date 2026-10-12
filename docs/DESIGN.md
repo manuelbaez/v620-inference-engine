@@ -2767,6 +2767,13 @@ the scheduler. Dev-box server, 16 slots, 16 prompts of ~22,200 tokens and three 
 | `QW_PREEMPT=0` | 6.8, 7.0, 7.4 s | 181.8 s |
 | preemption | **0.2, 0.5, 0.8 s** | 187.8 s |
 
+**What counts as short (`QW_SHORT_PASSES`, default 1; the owner's request, 2026-10-12).** A short request was a
+prompt that fits one prefill pass (4,096 tokens). It is now a prompt of at most `QW_SHORT_PASSES` passes: with 4,
+prompts up to 16,384 tokens go before the long ones (a piece per pass when they do not fit one: their own pass, then
+half of the pass they share with the long prompts) and may take a long prompt's slot; longer ones share passes and
+can be suspended. Scheduler only (`server/tests/test_prefill_parallel.py`); not measured on the GPUs, and production
+stays at 1 until the owner sets it.
+
 Three prompts were suspended (all before their first piece, so nothing had to be saved; the saving path is what the
 GPU test covers), no errors, every long prompt answered.
 

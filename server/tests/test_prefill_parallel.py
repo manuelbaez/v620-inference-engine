@@ -116,6 +116,26 @@ def main():
     check("the first passes take all five", [len(c) for c in e.calls[:3]], [5, 5, 5])
     s.shutdown(1)
 
+    # QW_SHORT_PASSES=4: a prompt of up to four passes is a short one
+    Scheduler.SHORT_PASSES = 4
+    s, _ = sched([(f"L{i}", 30000) for i in range(3)] + [("m0", 10000), ("m1", 3000)])
+    check("SHORT_PASSES=4: prompts of 10,000 and 3,000 tokens are short: their own pass, the first a piece", shape(s),
+          [("m0", 4096)])
+    check("... then with the long ones, which keep half the pass", shape(s),
+          [("m0", 2048), ("L0", 512), ("L1", 512), ("L2", 512)])
+    for r in s.prefilling:
+        if r.name == "m0":
+            r.left = 500
+    check("... and whole once they fit", shape(s), [("m0", 500), ("m1", 3000)])
+    s.shutdown(1)
+    s, e = sched([(f"L{i}", 30000) for i in range(16)], engine=SuspendEngine)
+    s.waiting.append(request("m", 12000))
+    s._admit()
+    check("SHORT_PASSES=4: a 12,000-token request takes a long prompt's slot", ("m" in [r.name for r in s.prefilling], [r.name for r in s.waiting]),
+          (True, ["L15"]))
+    s.shutdown(1)
+    Scheduler.SHORT_PASSES = 1
+
     # sixteen long prompts and sixteen slots: a short request takes the slot of the long prompt admitted last
     s, e = sched([(f"L{i}", 30000) for i in range(16)], engine=SuspendEngine)
     check("16 long prompts, 16 slots: all prefill", (len(s.prefilling), len(s.waiting)), (16, 0))

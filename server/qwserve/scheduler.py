@@ -161,6 +161,10 @@ class Scheduler:
     # first in line and continues from the prefix cache (QW_PREEMPT=0: off; the long prompts always keep
     # LONG_PARALLEL slots).
     PREEMPT = os.environ.get("QW_PREEMPT", "1") != "0"
+    # What counts as a short request: a prompt of at most this many prefill passes (QW_SHORT_PASSES x the prefill
+    # chunk, 4,096 tokens in production). Short prompts go before long ones in a pass and may take a long
+    # prompt's slot; the others share passes and can be suspended.
+    SHORT_PASSES = max(1, int(os.environ.get("QW_SHORT_PASSES", "1")))
     MAX_SEGMENTS = int(os.environ.get("QW_PREFILL_MAX_SEGMENTS", "16"))  # prompts of one engine prefill pass (Engine::MAX_SEGMENTS; 8 until 2026-10-12)
     PIECE_ALIGN = 256  # a long prompt's share of a pass is a multiple of this
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
@@ -416,11 +420,11 @@ class Scheduler:
         return moved
 
     def _victim(self, r):
-        """The long prompt that gives its slot to r, a short request that found none: one still more than a pass
-        from the end of its prefill, the one suspended least often and, among those, admitted last. None when r is
+        """The long prompt that gives its slot to r, a short request that found none: one still more than
+        SHORT_PASSES passes from the end of its prefill, the one suspended least often and, among those, admitted last. None when r is
         not short, when PREEMPT is off, or when only LONG_PARALLEL long prompts are prefilling (those keep their
         slots)."""
-        chunk = self.e.prefill_chunk
+        chunk = self.SHORT_PASSES * self.e.prefill_chunk
         if not self.PREEMPT or r.media or len(r.prompt) > chunk or not hasattr(self.raw_engine, "suspend"):
             return None
         longs = [p for p in self.prefilling if not p.media and p.left > chunk]
@@ -449,7 +453,7 @@ class Scheduler:
         minutes to prefill and keep their slot all that time; without this, sixteen of them arriving together took
         every slot and a short request sent after them waited for one to finish entirely. (A long prompt that is
         mostly cached counts as long here too: what the caches hold of it is only known once it has a slot.)"""
-        chunk = self.e.prefill_chunk
+        chunk = self.SHORT_PASSES * self.e.prefill_chunk
         if not self.SHORT_SLOTS or len(r.prompt) <= chunk:
             return False
         held = sum(len(p.prompt) > chunk for p in self.loading) + sum(p.left > chunk for p in self.prefilling)
@@ -525,8 +529,9 @@ class Scheduler:
     def _batch(self):
         """The prefills to advance in one engine pass, as [(request, tokens)]. A pass has `room` tokens
         (QW_PREFILL_PIECE while others decode, else one prefill chunk) and at most MAX_SEGMENTS prompts.
-        Long prompts (more than a pass holds) share a pass in equal pieces, in arrival order, as many as fit:
-        they prefill in parallel. Prompts that fit whole go first, and when long ones are under way they get a
+        Long prompts (more than SHORT_PASSES passes hold) share a pass in equal pieces, in arrival order, as many
+        as fit: they prefill in parallel. Short prompts go first (whole, or with SHORT_PASSES > 1 a piece when
+        they do not fit the pass), and when long ones are under way they get a
         pass of their own (a short request's first token then waits for a short pass, not for the long
         prompts' pieces), but only every other pass: in the pass after it the long ones go, and short
         prompts that arrived meanwhile join that pass, where LONG_PARALLEL of its prompts and half of its
@@ -534,12 +539,14 @@ class Scheduler:
         them. (Prompts that share a prefix do not get here together: the later one waits at admission,
         _shares_prefill.)"""
         room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if self.active else self.e.prefill_chunk
-        short = [r for r in self.prefilling if r.left <= room and not r.media]
+        full = room  # the pass, before anything is taken from it
+        most = self.SHORT_PASSES * room  # a short prompt: this many tokens or fewer still to go
+        short = [r for r in self.prefilling if r.left <= most and not r.media]
         longs = []  # the others before the first media prompt (which goes alone: its vision tokens are per slot)
         for r in self.prefilling:
             if r.media:
                 break
-            if r.left > room:
+            if r.left > most:
                 longs.append(r)
         if not short and not longs:  # a media prompt first in line
             return [(self.prefilling[0], room)]
@@ -550,10 +557,17 @@ class Scheduler:
         def take_short(limit_n, limit_room):
             nonlocal room
             for r in short:
-                if len(whole) >= limit_n or (whole and r.left > room - limit_room):
+                avail = room - limit_room
+                if len(whole) >= limit_n:
                     break
-                whole.append((r, r.left))
-                room -= r.left
+                if r.left <= avail or (not whole and r.left <= full):
+                    take = r.left
+                elif r.left > full and avail >= self.PIECE_ALIGN:  # SHORT_PASSES > 1: a piece of a short prompt
+                    take = avail // self.PIECE_ALIGN * self.PIECE_ALIGN
+                else:
+                    break
+                whole.append((r, take))
+                room -= take
         if not self.LONG_PARALLEL:  # the rule until 2026-10-11: the short ones, or else one long prompt
             take_short(self.MAX_SEGMENTS, 0)
             return whole or [(longs[0], room)]
