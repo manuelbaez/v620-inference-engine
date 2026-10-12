@@ -152,6 +152,9 @@ class Scheduler:
     # prompt waits, and at least this many of a pass's prompts (with half of its tokens) when short ones do.
     # QW_PREFILL_LONG_PARALLEL=0: one long prompt at a time (the rule until 2026-10-11).
     LONG_PARALLEL = int(os.environ.get("QW_PREFILL_LONG_PARALLEL", "4"))
+    # Slots that prompts longer than a prefill pass leave free while they prefill, for short requests
+    # (QW_SHORT_SLOTS=0: none, as until 2026-10-12).
+    SHORT_SLOTS = int(os.environ.get("QW_SHORT_SLOTS", "4"))
     MAX_SEGMENTS = int(os.environ.get("QW_PREFILL_MAX_SEGMENTS", "16"))  # prompts of one engine prefill pass (Engine::MAX_SEGMENTS; 8 until 2026-10-12)
     PIECE_ALIGN = 256  # a long prompt's share of a pass is a multiple of this
     # A prefill chunk or decode step takes seconds at most: an engine call running this long
@@ -363,6 +366,9 @@ class Scheduler:
             if self._shares_prefill(r):  # another request is prefilling the start of this prompt: wait for it
                 i += 1
                 continue
+            if self._long_prompts_full(r):  # the slots long prompts may hold while they prefill are taken
+                i += 1
+                continue
             n = len(r.prompt)
             need = r.max_new if r.max_new else self.DEFAULT_RESERVE
             need = max(1, min(need, self.e.max_tokens - n))
@@ -396,6 +402,19 @@ class Scheduler:
                 continue
             self._begin(r)
         return moved
+
+    def _long_prompts_full(self, r):
+        """True while r, a prompt longer than a prefill pass, has to wait because long prompts still prefilling hold
+        all the slots they may: every slot but SHORT_SLOTS (at most a quarter of the slots). Long prompts take
+        minutes to prefill and keep their slot all that time; without this, sixteen of them arriving together took
+        every slot and a short request sent after them waited for one to finish entirely. (A long prompt that is
+        mostly cached counts as long here too: what the caches hold of it is only known once it has a slot.)"""
+        chunk = self.e.prefill_chunk
+        if not self.SHORT_SLOTS or len(r.prompt) <= chunk:
+            return False
+        held = sum(len(p.prompt) > chunk for p in self.loading) + sum(p.left > chunk for p in self.prefilling)
+        slots = len(self.e.capacity)
+        return held >= slots - min(self.SHORT_SLOTS, slots // 4)
 
     def _shares_prefill(self, r):
         """True while a request being prefilled still has SHARE_MIN or more tokens to go of a prefix it shares with r

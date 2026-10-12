@@ -94,6 +94,25 @@ def main():
     check("the first passes take all five", [len(c) for c in e.calls[:3]], [5, 5, 5])
     s.shutdown(1)
 
+    # sixteen long prompts and sixteen slots: four slots stay free for short requests
+    s, e = sched([(f"L{i}", 30000) for i in range(16)])
+    check("16 long prompts, 16 slots: 12 prefill, 4 wait for a slot", (len(s.prefilling), len(s.waiting)), (12, 4))
+    s.waiting.append(request("short", 50))
+    s._admit()
+    check("a short request sent after them gets a slot at once", "short" in [r.name for r in s.prefilling], True)
+    check("... and the first pass is its own", shape(s), [("short", 50)])
+    for r in [r for r in s.prefilling if r.name == "short"]:  # the short request is done
+        s.prefilling.remove(r)
+        e.release(r.slot)
+    done = s.prefilling[0]
+    done.left = 100  # one long prompt nearly in: its place among the long ones is free
+    s._admit()
+    check("when a long prompt is nearly in, the next one starts", (len(s.prefilling), len(s.waiting)), (13, 3))
+    s.SHORT_SLOTS = 0
+    s._admit()
+    check("QW_SHORT_SLOTS=0: long prompts take every slot", (len(s.prefilling), len(s.waiting)), (16, 0))
+    s.shutdown(1)
+
     print("FAILED" if fails else "all ok")
     return 1 if fails else 0
 
