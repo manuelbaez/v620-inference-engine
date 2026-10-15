@@ -107,8 +107,10 @@ class Metrics:
             "prompt_demand_tps": round(w["prefill"] / dt, 1), "gen_demand_tps": round(w["gen"] / dt, 1),
             "running": running, "waiting": waiting + prefilling,
             "kv_pct": round(100 * kv_used / max(1, kv_capacity), 1),
-            # both directions per card (GB/s); the kinds are in snapshot()["pcie"]
-            **({f"pcie{r}": round(sum(c), 3) for r, c in enumerate(pcie)} if pcie else {})})
+            # both directions per card (GB/s), and the spilled KV decode read from host RAM (MB/s: it is small);
+            # the kinds are in snapshot()["pcie"]
+            **({f"pcie{r}": round(sum(c), 3) for r, c in enumerate(pcie)} if pcie else {}),
+            **({f"spill{r}": round(c[4] * 1000, 1) for r, c in enumerate(pcie)} if pcie else {})})
         self._win = self._new_window(now)
 
     def idle(self):

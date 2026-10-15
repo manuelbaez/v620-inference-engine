@@ -42,6 +42,7 @@ def main():
         check("per kind, GB/s over the interval", m.pcie[0] == [0.2, 0.4, 0.6, 0.8, 1.0])
         check("the chart's value is both directions together", h["pcie0"] == 3.0 and h["pcie2"] == 2.0)
         check("idle cards read zero", h["pcie1"] == 0 and h["pcie3"] == 0)
+        check("the spill chart's value is the spilled KV read", h["spill0"] == 1000.0 and h["spill2"] == 0)
         check("the snapshot carries the kinds", m.snapshot()["pcie"][2][3] == 2.0)
 
         now[0] += 1
@@ -55,7 +56,8 @@ def main():
 
     m2 = Metrics()  # an engine without the counts
     m2.sample(0, 0, 0, 0, 1, force=True)
-    check("no source: no PCIe keys", "pcie0" not in m2.history[-1] and m2.snapshot()["pcie"] == [])
+    check("no source: no PCIe keys",
+          "pcie0" not in m2.history[-1] and "spill0" not in m2.history[-1] and m2.snapshot()["pcie"] == [])
 
     def broken():
         raise RuntimeError("engine gone")

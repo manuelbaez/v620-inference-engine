@@ -2,12 +2,12 @@
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --text: #1c2330; --muted: #667085; --line: #e4e7ec;
   --accent: #2f6fed; --accent2: #d9480f; --ok: #16a34a; --warn: #d97706; --bad: #dc2626;
-  --bar: #e9edf3;
+  --bar: #e9edf3; --violet: #7c3aed;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --bg: #0f1318; --panel: #171c23; --text: #e6e9ee; --muted: #8b95a5; --line: #262d37;
-    --accent: #5b8ff9; --accent2: #f4845f; --bar: #232a34;
+    --accent: #5b8ff9; --accent2: #f4845f; --bar: #232a34; --violet: #b18cf7;
   }
 }
 * { box-sizing: border-box; }
@@ -25,6 +25,7 @@ main { padding: 0 16px 24px; display: grid; gap: 16px; }
 .card .s { color: var(--muted); font-size: 12px; margin-top: 2px; }
 h2 { font-size: 14px; margin: 4px 0 8px; color: var(--muted); font-weight: 600; }
 .panels { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+.stack { display: grid; gap: 12px; align-content: start; min-width: 0; }
 .bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin: 6px 0 2px; }
 .bar > div { height: 100%; background: var(--accent); }
 .bar.split { display: flex; position: relative; }

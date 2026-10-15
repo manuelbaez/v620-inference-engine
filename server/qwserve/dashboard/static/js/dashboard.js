@@ -61,9 +61,11 @@ function renderCharts(d) {
     {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
   lineChart($("chart-pcie"), h, PCIE_COLORS.map((color, r) =>
     ({key: "pcie" + r, color, label: "GPU " + r, fmt: fmt.gbps})), win, 1);
+  lineChart($("chart-spill"), h, PCIE_COLORS.map((color, r) =>
+    ({key: "spill" + r, color, label: "GPU " + r, fmt: v => v.toFixed(1) + " MB/s"})), win, 10);
 }
 
-const PCIE_COLORS = ["--accent", "--accent2", "--ok", "--warn"];
+const PCIE_COLORS = ["--accent", "--accent2", "--ok", "--violet"];  // one per card, distinct in both themes
 
 // Per card over the last sample: in (host copies, peers, spilled KV reads) and out (host copies, peers).
 function pcieLines(pcie) {

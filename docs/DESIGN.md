@@ -3059,7 +3059,8 @@ Decode runs as captured graphs, whose collectives are enqueued once: while a gra
 tally (`pcie::Capture`), added on every launch. Not counted: decode's writes of new rows into spilled slots (~13 KB
 per row), spilled rows read without the spill cache, control words. `Engine::pcie_bytes`, `qw_get_pcie_bytes`; the
 scheduler reads the counts when the dashboard records a sample (every 5 s), and the dashboard charts both directions
-per card and lists the kinds per card. The CLI (`qw_gpu`) prints the bytes of its prompt and decode phases.
+per card and lists the kinds per card, and charts the spilled KV read per card in MB/s under the PCIe chart. The CLI
+(`qw_gpu`) prints the bytes of its prompt and decode phases.
 
 Checks: `tests/gpu/test_pcie_traffic` (collective bytes exact, 2,949,120 B to the peers per rank for its three
 collectives; copies on the right rank, device-to-device not counted; a captured graph counts nothing at capture and
