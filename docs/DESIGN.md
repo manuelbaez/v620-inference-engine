@@ -663,6 +663,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          KV in the GPUs, per-card VRAM and power, host cache, disk tier, PLE table, averages of
          TTFT, request time and decode speed, recent requests. A collector thread builds the
          snapshot every 2 s; the handler only returns it; figures to one decimal
+   - [~] PCIe traffic per card on the dashboard (2026-10-15, section "PCIe traffic per card"): counted by the
+         engine, since the cards have no byte counters. In production since 2026-10-15 23:26 UTC (`qw-engine:ae98caa`);
+         open: the speed A/B against the build before and the graph / `QW_NOGRAPH=1` byte comparison (two windows
+         were cut short by llama-swap restarting the model right after the unload)
    - [x] disk-tier loads off the scheduler thread (`Session::prefetch`, `BlockStore::load`): a
          97k-token prompt restored from disk after a restart blocked every request for ~54 s
          (TTFT 53.9 s, other streams stalled). Now the request waits in a loading state while a
@@ -3035,3 +3039,33 @@ No extra kernel; the logits are bit-identical to the build before (`logits_dump`
 pass. `Engine::moe_use`, `qw_get_moe_use`. The dashboard got a bar per slot the same day (tokens held, the part in
 VRAM and the part spilled to host RAM; `qw_slot_vram_tokens`, `qw_slot_len`), sizes in GiB and whole numbers on the
 Requests axis.
+
+## PCIe traffic per card (2026-10-15)
+
+The question was how busy each card's PCIe link is. There is no hardware counter to read: amdgpu has no `pcie_bw`
+for Navi 21, `gpu_metrics` (v1.3) reports only the link speed and width, and the EPYC's IOMMU counters count address
+translations, not bytes, and need root (the container has neither them nor the data-fabric PMU). So the engine counts
+the bytes it moves (`src/comm/pcie_traffic.{hpp,cpp}`), per rank and kind:
+
+- host -> GPU and GPU -> host copies: every `hipMemcpy` / `hipMemcpyAsync` goes through `pcie::copy` /
+  `pcie::copy_async`, which count on the rank of the current HIP device (device-to-device copies are not counted);
+- to and from the peers: `Comm::exchange` counts its payload once per peer in each direction (the collectives are
+  symmetric: every rank sends and receives the same size);
+- spilled KV read from host memory in decode: the spill cache's fill kernel adds the step's misses (rows the
+  attention read from host memory) and the rows it copies in, on a device counter that is copied to the host with
+  the expert counts every 64th step (1 KiB per row, K and V).
+
+Decode runs as captured graphs, whose collectives are enqueued once: while a graph is captured its bytes go to a
+tally (`pcie::Capture`), added on every launch. Not counted: decode's writes of new rows into spilled slots (~13 KB
+per row), spilled rows read without the spill cache, control words. `Engine::pcie_bytes`, `qw_get_pcie_bytes`; the
+scheduler reads the counts when the dashboard records a sample (every 5 s), and the dashboard charts both directions
+per card and lists the kinds per card. The CLI (`qw_gpu`) prints the bytes of its prompt and decode phases.
+
+Checks: `tests/gpu/test_pcie_traffic` (collective bytes exact, 2,949,120 B to the peers per rank for its three
+collectives; copies on the right rank, device-to-device not counted; a captured graph counts nothing at capture and
+its tally once per launch), `server/tests/test_dashboard_pcie.py` (rates per interval, none after idle). In
+production during the smoke test: 2.03 GB/s from and to the peers per card, 0.07 GB/s host -> GPU, 0.03 GB/s
+GPU -> host, the four cards equal. Open: the speed A/B against `c439991` (the cost is one call and an atomic add per
+copy and collective, and one atomic per spill miss) and the comparison of decode bytes with graphs against
+`QW_NOGRAPH=1`, which must be equal.
+
