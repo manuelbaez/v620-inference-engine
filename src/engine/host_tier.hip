@@ -9,6 +9,7 @@
 #include <cstring>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -36,7 +37,7 @@ struct KvLayout {
 void copy_split_out(uint8_t *dst, const uint8_t *dev, const uint8_t *host, int64_t vt, int64_t p0, int64_t n, size_t row,
                     hipStream_t s) {
     const int64_t nd = std::max<int64_t>(0, std::min<int64_t>(n, vt - p0));  // positions in VRAM
-    if (nd) CK(hipMemcpyAsync(dst, dev + size_t(p0) * row, size_t(nd) * row, hipMemcpyDeviceToHost, s));
+    if (nd) CK(pcie::copy_async(dst, dev + size_t(p0) * row, size_t(nd) * row, hipMemcpyDeviceToHost, s));
     if (n > nd) {
         CK(hipStreamSynchronize(s));
         std::memcpy(dst + size_t(nd) * row, host + size_t(p0 + nd - vt) * row, size_t(n - nd) * row);
@@ -45,7 +46,7 @@ void copy_split_out(uint8_t *dst, const uint8_t *dev, const uint8_t *host, int64
 void copy_split_in(uint8_t *dev, uint8_t *host, const uint8_t *src, int64_t vt, int64_t p0, int64_t n, size_t row,
                    hipStream_t s) {
     const int64_t nd = std::max<int64_t>(0, std::min<int64_t>(n, vt - p0));
-    if (nd) CK(hipMemcpyAsync(dev + size_t(p0) * row, src, size_t(nd) * row, hipMemcpyHostToDevice, s));
+    if (nd) CK(pcie::copy_async(dev + size_t(p0) * row, src, size_t(nd) * row, hipMemcpyHostToDevice, s));
     if (n > nd) {
         CK(hipStreamSynchronize(s));
         std::memcpy(host + size_t(p0 + nd - vt) * row, src + size_t(nd) * row, size_t(n - nd) * row);
@@ -83,7 +84,7 @@ void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
         // a block in VRAM: laid out on the card, then one copy (39 copies of 16-128 KB otherwise; QW_KV_PACK=0)
         if (pack && p0 + n <= vt && size_t(layers) * lay.per_layer <= rk.pack_bytes) {
             gpu::kv_pack(rk.dtab, slot, layers, p0, int(n), rk.pack, rk.s);
-            CK(hipMemcpyAsync(p, rk.pack, size_t(layers) * lay.per_layer, d2h, rk.s));
+            CK(pcie::copy_async(p, rk.pack, size_t(layers) * lay.per_layer, d2h, rk.s));
             continue;
         }
         for (int i = 0; i < layers; ++i) {
@@ -93,8 +94,8 @@ void Engine::export_kv(int slot, int64_t p0, int64_t n, const RankBufs &dst) {
             copy_split_out(p + lay.k, reinterpret_cast<const uint8_t *>(sl.V[qi]), sp ? reinterpret_cast<const uint8_t *>(sl.Vh[qi]) : nullptr,
                            vt, p0, n, HEAD_DIM * 2, rk.s);
             if (lay.ck)
-                CK(hipMemcpyAsync(p + 2 * lay.k, sl.ck[size_t(i)] + p0 / IDX_RATIO * IDX_DIM, lay.ck, d2h,
-                                  rk.s));
+                CK(pcie::copy_async(p + 2 * lay.k, sl.ck[size_t(i)] + p0 / IDX_RATIO * IDX_DIM, lay.ck, d2h,
+                                    rk.s));
             p += lay.per_layer;
         }
     }
@@ -120,8 +121,8 @@ void Engine::import_kv(int slot, int64_t p0, int64_t n, const RankBufs &src) {
             copy_split_in(reinterpret_cast<uint8_t *>(sl.V[qi]), sp ? reinterpret_cast<uint8_t *>(sl.Vh[qi]) : nullptr, p + lay.k, vt,
                           p0, n, HEAD_DIM * 2, rk.s);
             if (lay.ck)
-                CK(hipMemcpyAsync(sl.ck[size_t(i)] + p0 / IDX_RATIO * IDX_DIM, p + 2 * lay.k, lay.ck, h2d,
-                                  rk.s));
+                CK(pcie::copy_async(sl.ck[size_t(i)] + p0 / IDX_RATIO * IDX_DIM, p + 2 * lay.k, lay.ck, h2d,
+                                    rk.s));
             p += lay.per_layer;
         }
     }
@@ -134,15 +135,15 @@ void Engine::export_recurrent(int snap, const RankBufs &dst) {
         CK(hipSetDevice(rk.dev));
         uint8_t *p = dst[r];
         const auto &sn = rk.snaps[size_t(snap)];
-        CK(hipMemcpyAsync(p, sn.S, SLOT_S * 4, hipMemcpyDeviceToHost, rk.s));
+        CK(pcie::copy_async(p, sn.S, SLOT_S * 4, hipMemcpyDeviceToHost, rk.s));
         p += SLOT_S * 4;
-        CK(hipMemcpyAsync(p, sn.ring, SLOT_RING * 4, hipMemcpyDeviceToHost, rk.s));
+        CK(pcie::copy_async(p, sn.ring, SLOT_RING * 4, hipMemcpyDeviceToHost, rk.s));
         p += SLOT_RING * 4;
-        CK(hipMemcpyAsync(p, sn.ple, SLOT_PLE * 4, hipMemcpyDeviceToHost, rk.s));
+        CK(pcie::copy_async(p, sn.ple, SLOT_PLE * 4, hipMemcpyDeviceToHost, rk.s));
         p += SLOT_PLE * 4;
-        CK(hipMemcpyAsync(p, sn.pend, XW * 4, hipMemcpyDeviceToHost, rk.s));
+        CK(pcie::copy_async(p, sn.pend, XW * 4, hipMemcpyDeviceToHost, rk.s));
         p += XW * 4;
-        CK(hipMemcpyAsync(p, sn.raw_tail, RAW_TAIL_FLOATS * 4, hipMemcpyDeviceToHost, rk.s));
+        CK(pcie::copy_async(p, sn.raw_tail, RAW_TAIL_FLOATS * 4, hipMemcpyDeviceToHost, rk.s));
     }
 }
 
@@ -154,13 +155,13 @@ void Engine::import_recurrent(int slot, const RankBufs &src, int64_t n, const st
         CK(hipSetDevice(rk.dev));
         const uint8_t *p = src[r];
         auto &sl = rk.slots[size_t(slot)];
-        CK(hipMemcpyAsync(sl.S, p, SLOT_S * 4, hipMemcpyHostToDevice, rk.s));
+        CK(pcie::copy_async(sl.S, p, SLOT_S * 4, hipMemcpyHostToDevice, rk.s));
         p += SLOT_S * 4;
-        CK(hipMemcpyAsync(sl.ring, p, SLOT_RING * 4, hipMemcpyHostToDevice, rk.s));
+        CK(pcie::copy_async(sl.ring, p, SLOT_RING * 4, hipMemcpyHostToDevice, rk.s));
         p += SLOT_RING * 4;
-        CK(hipMemcpyAsync(sl.ple, p, SLOT_PLE * 4, hipMemcpyHostToDevice, rk.s));
+        CK(pcie::copy_async(sl.ple, p, SLOT_PLE * 4, hipMemcpyHostToDevice, rk.s));
         p += SLOT_PLE * 4;
-        CK(hipMemcpyAsync(sl.pend, p, XW * 4, hipMemcpyHostToDevice, rk.s));
+        CK(pcie::copy_async(sl.pend, p, XW * 4, hipMemcpyHostToDevice, rk.s));
         p += XW * 4;
         raw_tail_copy(sl, N_QSA + int(mtp_), n, reinterpret_cast<float *>(const_cast<uint8_t *>(p)), false,
                       hipMemcpyHostToDevice, rk.s);
@@ -182,14 +183,14 @@ namespace {
 void copy_slot_rows(const uint8_t *sdev, const uint8_t *shost, int64_t svt, uint8_t *ddev, uint8_t *dhost, int64_t dvt,
                     int64_t n, size_t row, hipStream_t s) {
     const int64_t a = std::min({svt, dvt, n}), b = std::min(std::max(svt, dvt), n);
-    if (a > 0) CK(hipMemcpyAsync(ddev, sdev, size_t(a) * row, hipMemcpyDeviceToDevice, s));
+    if (a > 0) CK(pcie::copy_async(ddev, sdev, size_t(a) * row, hipMemcpyDeviceToDevice, s));
     if (b > a) {
         if (svt < dvt)  // the source spilled here, the destination holds it in VRAM
-            CK(hipMemcpyAsync(ddev + size_t(a) * row, shost + size_t(a - svt) * row, size_t(b - a) * row,
-                              hipMemcpyHostToDevice, s));
+            CK(pcie::copy_async(ddev + size_t(a) * row, shost + size_t(a - svt) * row, size_t(b - a) * row,
+                                hipMemcpyHostToDevice, s));
         else
-            CK(hipMemcpyAsync(dhost + size_t(a - dvt) * row, sdev + size_t(a) * row, size_t(b - a) * row,
-                              hipMemcpyDeviceToHost, s));
+            CK(pcie::copy_async(dhost + size_t(a - dvt) * row, sdev + size_t(a) * row, size_t(b - a) * row,
+                                hipMemcpyDeviceToHost, s));
     }
     if (n > b) {
         CK(hipStreamSynchronize(s));
@@ -222,14 +223,14 @@ void Engine::slot_copy(int dst, int src) {
                            b.Vh.empty() ? nullptr : u8(b.Vh[qi]), bvt, n, HEAD_DIM * 2, rk.s);
             // compressed keys of the complete groups; the raw keys' ring whole (the same row for a position in both)
             if (n / IDX_RATIO)
-                CK(hipMemcpyAsync(b.ck[qi], a.ck[qi], size_t(n / IDX_RATIO) * IDX_DIM * 2, d2d, rk.s));
-            CK(hipMemcpyAsync(b.raw_k[qi], a.raw_k[qi], size_t(a.raw_ring) * IDX_DIM * 4, d2d, rk.s));
+                CK(pcie::copy_async(b.ck[qi], a.ck[qi], size_t(n / IDX_RATIO) * IDX_DIM * 2, d2d, rk.s));
+            CK(pcie::copy_async(b.raw_k[qi], a.raw_k[qi], size_t(a.raw_ring) * IDX_DIM * 4, d2d, rk.s));
         }
-        CK(hipMemcpyAsync(b.S, a.S, SLOT_S * 4, d2d, rk.s));
-        CK(hipMemcpyAsync(b.ring, a.ring, SLOT_RING * 4, d2d, rk.s));
-        CK(hipMemcpyAsync(b.ple, a.ple, SLOT_PLE * 4, d2d, rk.s));
-        CK(hipMemcpyAsync(b.pend, a.pend, XW * 4, d2d, rk.s));
-        if (mtp_) CK(hipMemcpyAsync(b.hist, a.hist, size_t(gpu::MTP_HIST) * XW * 4, d2d, rk.s));
+        CK(pcie::copy_async(b.S, a.S, SLOT_S * 4, d2d, rk.s));
+        CK(pcie::copy_async(b.ring, a.ring, SLOT_RING * 4, d2d, rk.s));
+        CK(pcie::copy_async(b.ple, a.ple, SLOT_PLE * 4, d2d, rk.s));
+        CK(pcie::copy_async(b.pend, a.pend, XW * 4, d2d, rk.s));
+        if (mtp_) CK(pcie::copy_async(b.hist, a.hist, size_t(gpu::MTP_HIST) * XW * 4, d2d, rk.s));
     }
     host_copies_wait();
     SlotHost &to = slots_[size_t(dst)];
@@ -248,7 +249,7 @@ std::array<unsigned long long, 2> Engine::spill_cache_stats() {
     if (!rk.cache.stats) return v;
     CK(hipSetDevice(rk.dev));
     CK(hipStreamSynchronize(rk.s));
-    CK(hipMemcpy(v.data(), rk.cache.stats, 16, hipMemcpyDeviceToHost));
+    CK(pcie::copy(v.data(), rk.cache.stats, 16, hipMemcpyDeviceToHost));
     CK(hipMemset(rk.cache.stats, 0, 16));
     return v;
 }
@@ -259,7 +260,7 @@ std::vector<unsigned long long> Engine::spill_locality() {
     if (!rk.loc_stats) return v;
     CK(hipSetDevice(rk.dev));
     CK(hipStreamSynchronize(rk.s));
-    CK(hipMemcpy(v.data(), rk.loc_stats, v.size() * 8, hipMemcpyDeviceToHost));
+    CK(pcie::copy(v.data(), rk.loc_stats, v.size() * 8, hipMemcpyDeviceToHost));
     CK(hipMemset(rk.loc_stats, 0, v.size() * 8));
     return v;
 }

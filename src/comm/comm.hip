@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <string>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 
 namespace qw {
@@ -270,7 +271,7 @@ void Comm::bump_base(int r, uint32_t delta, hipStream_t s) {
 void Comm::set_base(int r, uint32_t base, hipStream_t s) {
     // The staging word is only rewritten after the previous step synchronized.
     *base_host_[size_t(r)] = base;
-    ck(hipMemcpyAsync(base_[size_t(r)], base_host_[size_t(r)], 4, hipMemcpyHostToDevice, s), "set base");
+    ck(pcie::copy_async(base_[size_t(r)], base_host_[size_t(r)], 4, hipMemcpyHostToDevice, s), "set base");
 }
 
 void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t src_row_stride, size_t src_dest_offset,
@@ -278,6 +279,9 @@ void Comm::exchange(int r, const void *src, int rows, size_t row_bytes, size_t s
     const size_t bytes = size_t(rows) * row_bytes;
     QW_CHECK(row_bytes % 16 == 0 && src_row_stride % 16 == 0 && bytes <= slot_, "comm: bad message size");
     QW_CHECK(k > 0, "comm: sequence offsets start at 1");
+    // each peer gets this payload (its slice, for a reduce-scatter) and sends one as large
+    pcie::add(r, pcie::PeerOut, uint64_t(bytes) * (RANKS - 1));
+    pcie::add(r, pcie::PeerIn, uint64_t(bytes) * (RANKS - 1));
     PushArgs pa;
     pa.src = static_cast<const uint8_t *>(src);
     // Large payloads (prefill) whose rows are contiguous in the source and in

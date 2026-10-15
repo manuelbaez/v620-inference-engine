@@ -11,6 +11,7 @@
 #include <future>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -74,7 +75,7 @@ void Engine::run_prefill_rank(Rank &rk) {
             rk.rope3 = zeros<int32_t>(size_t(opt_.prefill_chunk) * 3);
             rk.rope3_cap = opt_.prefill_chunk;
         }
-        CK(hipMemcpyAsync(rk.rope3, pjob_.rope3, size_t(T) * 12, hipMemcpyHostToDevice, rk.s));
+        CK(pcie::copy_async(rk.rope3, pjob_.rope3, size_t(T) * 12, hipMemcpyHostToDevice, rk.s));
         rope3 = rk.rope3;
     }
     const int NMB = prefill_mbs(T);  // QW_NO_SPLIT runs them serially on one stream
@@ -149,8 +150,8 @@ void Engine::run_prefill_rank(Rank &rk) {
             const int64_t n = first_of(i) - sl.vt;
             if (n <= 0) continue;
             const size_t o = size_t(stage_off[i]) * HEAD_DIM;
-            CK(hipMemcpyAsync(rk.stage_k + o, sl.Kh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
-            CK(hipMemcpyAsync(rk.stage_v + o, sl.Vh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
+            CK(pcie::copy_async(rk.stage_k + o, sl.Kh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
+            CK(pcie::copy_async(rk.stage_v + o, sl.Vh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
         }
         CK(hipEventRecord(rk.stage_ready, rk.s3));
     };
@@ -165,10 +166,10 @@ void Engine::run_prefill_rank(Rank &rk) {
             const int64_t a = std::max<int64_t>(first_of(i), sl.vt) - sl.vt, e = end_of(i) - sl.vt;
             if (e <= a) continue;
             const size_t o = (size_t(stage_off[i]) + size_t(a)) * HEAD_DIM;
-            CK(hipMemcpyAsync(sl.Kh[qi] + size_t(a) * HEAD_DIM, rk.stage_k + o, size_t(e - a) * HEAD_DIM * 2,
-                              hipMemcpyDeviceToHost, rk.s3));
-            CK(hipMemcpyAsync(sl.Vh[qi] + size_t(a) * HEAD_DIM, rk.stage_v + o, size_t(e - a) * HEAD_DIM * 2,
-                              hipMemcpyDeviceToHost, rk.s3));
+            CK(pcie::copy_async(sl.Kh[qi] + size_t(a) * HEAD_DIM, rk.stage_k + o, size_t(e - a) * HEAD_DIM * 2,
+                                hipMemcpyDeviceToHost, rk.s3));
+            CK(pcie::copy_async(sl.Vh[qi] + size_t(a) * HEAD_DIM, rk.stage_v + o, size_t(e - a) * HEAD_DIM * 2,
+                                hipMemcpyDeviceToHost, rk.s3));
         }
         CK(hipEventRecord(rk.stage_free, rk.s3));
     };
@@ -194,8 +195,8 @@ void Engine::run_prefill_rank(Rank &rk) {
         for (int t = 0; t < m.T; ++t)
             std::memcpy(b.h_emb + size_t(t) * SH, pjob_.emb + size_t(m.row0 + t) * H + r * SH, SH * 4);
         std::memcpy(b.h_ple, pjob_.ple + size_t(m.row0) * H, size_t(m.T) * H * 2);
-        CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(m.T) * SH * 4, hipMemcpyHostToDevice, m.s));
-        CK(hipMemcpyAsync(b.ple_e, b.h_ple, size_t(m.T) * H * 2, hipMemcpyHostToDevice, m.s));
+        CK(pcie::copy_async(b.emb, b.h_emb, size_t(m.T) * SH * 4, hipMemcpyHostToDevice, m.s));
+        CK(pcie::copy_async(b.ple_e, b.h_ple, size_t(m.T) * H * 2, hipMemcpyHostToDevice, m.s));
         m.comm->set_base(r, *m.seq_base, m.s);
         gpu::embed_T(b.X, b.emb, m.T, m.s);
     }
@@ -366,8 +367,8 @@ void Engine::run_prefill_rank(Rank &rk) {
             }
         }
         if (moe_stats_)  // this micro-batch's tokens per local expert (read after the job, see collect_moe_balance)
-            CK(hipMemcpyAsync(moe_counts_[size_t(r)] + (mb_index(m) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
-                              b.counts, EXP_L * 4, hipMemcpyDeviceToHost, s));
+            CK(pcie::copy_async(moe_counts_[size_t(r)] + (mb_index(m) * (N_LAYERS + 1) + size_t(l)) * EXP_L,
+                                b.counts, EXP_L * 4, hipMemcpyDeviceToHost, s));
         gpu::moe_scatter_T(b.tok_e, b.counts, T, b.offsets, b.fill, b.tok_slot, b.pair_tok, s);
         static const bool int8_experts = std::getenv("QW_INT8_EXPERTS") != nullptr;
         gpu::moe_experts_T(w.eg, w.egs, w.eu, w.eus, w.ed, w.eds, b.counts, b.offsets, b.pair_tok, b.bin, T, b.tiles,
@@ -416,9 +417,9 @@ void Engine::run_prefill_rank(Rank &rk) {
         for (const Sub &sb : m.subs)
             for (const Capture &cp : segs[size_t(sb.seg)].captures)  // a capture's MTP input: its last token's hidden
                 if (cp.pos > sb.start && cp.pos <= sb.start + sb.T)
-                    CK(hipMemcpyAsync(rk.snaps[size_t(cp.snap)].pend,
-                                      m.b->X + size_t(sb.row + cp.pos - 1 - sb.start) * XW, XW * 4,
-                                      hipMemcpyDeviceToDevice, m.s));
+                    CK(pcie::copy_async(rk.snaps[size_t(cp.snap)].pend,
+                                        m.b->X + size_t(sb.row + cp.pos - 1 - sb.start) * XW, XW * 4,
+                                        hipMemcpyDeviceToDevice, m.s));
     }
     // MTP layer over the rows whose next token is known: row t of a segment
     // pairs X[t] with token t + 1. A segment's rows start one early, from the
@@ -452,8 +453,8 @@ void Engine::run_prefill_rank(Rank &rk) {
                 if (msubs.size() > 1) {
                     emb = b.m_emb;
                     for (size_t j = 0; j < msubs.size(); ++j)
-                        CK(hipMemcpyAsync(b.m_emb + size_t(msubs[j].row) * SH, b.emb + size_t(first[j]) * SH,
-                                          size_t(msubs[j].T) * SH * 4, hipMemcpyDeviceToDevice, s));
+                        CK(pcie::copy_async(b.m_emb + size_t(msubs[j].row) * SH, b.emb + size_t(first[j]) * SH,
+                                            size_t(msubs[j].T) * SH * 4, hipMemcpyDeviceToDevice, s));
                 }
                 gpu::mtp_ssq(b.Xm, emb, rows, b.m_send, s);
                 allreduce(m, b.m_send, b.m_red, 4, rows);
@@ -468,8 +469,8 @@ void Engine::run_prefill_rank(Rank &rk) {
                 m.pend = nullptr;  // the MTP output is not needed here
             }
             for (const Sub &sb : m.subs)
-                CK(hipMemcpyAsync(sb.sl->pend, b.X + size_t(sb.row + sb.T - 1) * XW, XW * 4, hipMemcpyDeviceToDevice,
-                                  s));
+                CK(pcie::copy_async(sb.sl->pend, b.X + size_t(sb.row + sb.T - 1) * XW, XW * 4, hipMemcpyDeviceToDevice,
+                                    s));
             record(m, N_LAYERS, 3);
         }
     if (mtp_) stage_out(size_t(N_QSA), mtp_first, mtp_end);
@@ -499,8 +500,8 @@ void Engine::run_prefill_rank(Rank &rk) {
             } else {
                 X = b.xg;
                 for (size_t i = 0; i < ends.size(); ++i)
-                    CK(hipMemcpyAsync(b.xg + i * XW, b.X + size_t(ends[i]->row + ends[i]->T - 1) * XW, XW * 4,
-                                      hipMemcpyDeviceToDevice, m.s));
+                    CK(pcie::copy_async(b.xg + i * XW, b.X + size_t(ends[i]->row + ends[i]->T - 1) * XW, XW * 4,
+                                        hipMemcpyDeviceToDevice, m.s));
             }
             o.rows = int(ends.size());
             for (const Sub *sb : ends) o.dst.push_back(seg_logits_[size_t(sb->seg)].data() + size_t(r) * VOCAB_L);
@@ -525,14 +526,14 @@ void Engine::run_prefill_rank(Rank &rk) {
             captured = true;
         }
     if (captured) CK(hipStreamSynchronize(rk.s));
-    CK(hipMemcpyAsync(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, rk.s));  // (a count for the stats)
+    CK(pcie::copy_async(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, rk.s));  // (a count for the stats)
     for (const Out &o : outs)
         for (int i = 0; i < o.rows; ++i)
-            CK(hipMemcpy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,
-                         hipMemcpyDeviceToHost));
+            CK(pcie::copy(o.dst[size_t(i)], o.m->b->lm_logits + size_t(i) * VOCAB_L, VOCAB_L * 4,
+                          hipMemcpyDeviceToHost));
     if (router16 == 2) {
         unsigned st[4];
-        CK(hipMemcpy(st, rk.route_chk, 16, hipMemcpyDeviceToHost));
+        CK(pcie::copy(st, rk.route_chk, 16, hipMemcpyDeviceToHost));
         float dw;
         std::memcpy(&dw, &st[2], 4);
         log("rank %d router16 check: %u routings, %u with other experts, largest weight difference of the rest %.2e, "

@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/rank.hpp"
@@ -106,7 +107,7 @@ public:
                      "weight cache " + path_ + ": a piece does not match what the loader expects (delete it)");
             T *d;
             CK(hipMalloc(&d, std::max<size_t>(bytes, 1)));
-            if (bytes) CK(hipMemcpy(d, map_ + off_ + sizeof pc, bytes, hipMemcpyHostToDevice));
+            if (bytes) CK(pcie::copy(d, map_ + off_ + sizeof pc, bytes, hipMemcpyHostToDevice));
             off_ += sizeof pc + (bytes + 63) / 64 * 64;
             ++pieces_;
             upload_s += since(t0);

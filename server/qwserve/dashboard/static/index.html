@@ -51,6 +51,11 @@
       <div class="legend"><span style="--c:var(--accent)">prompt + generated tokens of the requests in progress</span></div>
     </div>
     <div class="card">
+      <h2>PCIe traffic per card (GB/s, both directions)</h2>
+      <canvas id="chart-pcie"></canvas>
+      <div class="legend"><span style="--c:var(--accent)">GPU 0</span><span style="--c:var(--accent2)">GPU 1</span><span style="--c:var(--ok)">GPU 2</span><span style="--c:var(--warn)">GPU 3</span><em>bytes the engine moves, as it counts them (the cards have no counters)</em></div>
+    </div>
+    <div class="card">
       <h2>Slots</h2>
       <div id="slots"></div>
       <div class="legend"><span style="--c:var(--accent)">in VRAM</span><span style="--c:var(--accent2)">in host RAM (spilled)</span><em id="slots-scale"></em></div>

@@ -9,6 +9,7 @@
 #include <functional>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -25,7 +26,7 @@ void raw_tail_copy(const Rank::Slot &sl, int layers, int64_t n, float *tail, boo
         for (int64_t p = std::max<int64_t>(0, first); p < n;) {  // at most two pieces: the ring wraps once
             const int64_t at = p % sl.raw_ring, run = std::min<int64_t>(n - p, sl.raw_ring - at);
             float *rp = ring + at * IDX_DIM, *tp = t + (p - first) * IDX_DIM;
-            CK(hipMemcpyAsync(to_tail ? tp : rp, to_tail ? rp : tp, size_t(run) * IDX_DIM * 4, kind, s));
+            CK(pcie::copy_async(to_tail ? tp : rp, to_tail ? rp : tp, size_t(run) * IDX_DIM * 4, kind, s));
             p += run;
         }
     }
@@ -38,10 +39,10 @@ void Engine::snapshot_save(int snap, int slot) {
         CK(hipSetDevice(rk.dev));
         auto &sn = rk.snaps[size_t(snap)];
         auto &sl = rk.slots[size_t(slot)];
-        CK(hipMemcpyAsync(sn.S, sl.S, SLOT_S * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sn.ring, sl.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sn.ple, sl.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sn.pend, sl.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sn.S, sl.S, SLOT_S * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sn.ring, sl.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sn.ple, sl.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sn.pend, sl.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
         raw_tail_copy(sl, N_QSA + int(mtp_), slots_[size_t(slot)].len, sn.raw_tail, true, hipMemcpyDeviceToDevice, rk.s);
     }
     for (auto &rkp : ranks_) CK(hipStreamSynchronize(rkp->s));
@@ -55,10 +56,10 @@ void Engine::snapshot_restore(int snap, int slot, int64_t n, const std::vector<i
         CK(hipSetDevice(rk.dev));
         auto &sn = rk.snaps[size_t(snap)];
         auto &sl = rk.slots[size_t(slot)];
-        CK(hipMemcpyAsync(sl.S, sn.S, SLOT_S * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sl.ring, sn.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sl.ple, sn.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
-        CK(hipMemcpyAsync(sl.pend, sn.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sl.S, sn.S, SLOT_S * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sl.ring, sn.ring, SLOT_RING * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sl.ple, sn.ple, SLOT_PLE * 4, hipMemcpyDeviceToDevice, rk.s));
+        CK(pcie::copy_async(sl.pend, sn.pend, XW * 4, hipMemcpyDeviceToDevice, rk.s));
         raw_tail_copy(sl, N_QSA + int(mtp_), n, sn.raw_tail, false, hipMemcpyDeviceToDevice, rk.s);
     }
     for (auto &rkp : ranks_) CK(hipStreamSynchronize(rkp->s));

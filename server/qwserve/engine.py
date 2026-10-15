@@ -6,6 +6,9 @@ import json
 
 assert array.array("i").itemsize == 4  # the C API takes int32 token ids
 
+# qw_get_pcie_bytes's values per card, in order
+PCIE_KINDS = ("host_to_gpu", "gpu_to_host", "from_peers", "to_peers", "spill_read")
+
 
 class Tokens(list):
     """A token list that remembers its int32 array for the C API. The scheduler hands one
@@ -119,6 +122,7 @@ class Engine:
             "qw_get_cache_stats": (ctypes.c_int, [P, ctypes.POINTER(CacheStats)]),
             "qw_get_slot_timing": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(SlotTiming)]),
             "qw_get_moe_use": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_ulonglong)]),
+            "qw_get_pcie_bytes": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_ulonglong)]),
             "qw_get_moe_balance": (ctypes.c_int, [P, ctypes.POINTER(ctypes.c_double)]),
             "qw_set_stop_tokens": (ctypes.c_int, [P, ctypes.c_int, I32P, ctypes.c_int]),
             "qw_generate": (ctypes.c_int, [P, ctypes.c_int, ctypes.POINTER(StepReq), ctypes.c_int, I32P, FP, I32P,
@@ -295,6 +299,14 @@ class Engine:
         u = (ctypes.c_ulonglong * 8)()
         self._check(self.lib.qw_get_moe_use(self.h, u))
         return [(u[2 * r], u[2 * r + 1]) for r in range(4)]
+
+    def pcie_bytes(self):
+        """PCIe bytes per card since the start, counted by the engine: for each of the 4 cards, a tuple of
+        PCIE_KINDS (host -> GPU and GPU -> host copies, from and to the peers, spilled KV read from host RAM)."""
+        u = (ctypes.c_ulonglong * (4 * len(PCIE_KINDS)))()
+        self._check(self.lib.qw_get_pcie_bytes(self.h, u))
+        n = len(PCIE_KINDS)
+        return [tuple(u[n * r:n * (r + 1)]) for r in range(4)]
 
     def moe_balance(self):
         """(busiest card's expert tiles, the cards' mean, the busiest card's without the expert placement) summed

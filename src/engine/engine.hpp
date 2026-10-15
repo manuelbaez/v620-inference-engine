@@ -23,6 +23,7 @@
 #include <rocblas/rocblas.h>
 
 #include "comm/comm.hpp"
+#include "comm/pcie_traffic.hpp"
 #include "core/ple.hpp"
 #include "core/safetensors.hpp"
 #include "kernels/sampling_types.hpp"
@@ -351,6 +352,9 @@ private:
     int expert_group_ = cfg::QGROUP;  // the checkpoint's expert format (check_config): QGROUP or QGROUP_Z
 
 public:
+    // PCIe bytes per rank since the start, by pcie::Kind, as counted by the engine (comm/pcie_traffic.hpp); decode's
+    // spilled-row reads are a few steps behind.
+    std::array<pcie::Bytes, RANKS> pcie_bytes() const;
     // Routed-expert work per rank since the start: (token, expert) pairs each card computed, out[r][0] in prefill and
     // out[r][1] in decode (the main layers; a few steps behind). Uneven counts are cards waiting for the busiest one.
     void moe_use(unsigned long long out[RANKS][2]) const;

@@ -18,6 +18,9 @@ export const seconds = s => s == null ? "-"
 
 export const rate = r => r == null ? "-" : r.toFixed(1) + " tok/s";
 
+// Decimal GB/s, as link speeds are specified (PCIe 4.0 x16: ~32 GB/s per direction).
+export const gbps = g => g == null ? "-" : g < 0.1 && g > 0 ? (g * 1000).toFixed(0) + " MB/s" : g.toFixed(1) + " GB/s";
+
 export const percent = p => p == null ? "-" : p.toFixed(1) + "%";
 
 export const duration = s => {

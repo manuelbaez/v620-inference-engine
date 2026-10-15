@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -49,7 +50,7 @@ void Engine::calib_dump(const std::string &dir) {
         std::filesystem::create_directories(sub);
         for (auto &[name, c] : rk.calib) {
             std::vector<float> h(size_t(c.K) * c.K);
-            CK(hipMemcpy(h.data(), c.H, h.size() * 4, hipMemcpyDeviceToHost));
+            CK(pcie::copy(h.data(), c.H, h.size() * 4, hipMemcpyDeviceToHost));
             std::FILE *f = std::fopen((sub + name + ".h").c_str(), "wb");
             QW_CHECK(f, "cannot write " + sub + name + ".h");
             const int64_t K = c.K;

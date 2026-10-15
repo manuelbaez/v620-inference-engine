@@ -5,6 +5,7 @@
 
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "core/config.hpp"
 #include "engine/device_mem.hpp"
@@ -50,8 +51,8 @@ void Engine::apply_penalty_updates(Rank &rk) {
             b.pen_tok = zeros<int32_t>(b.pen_cap);
             b.pen_gen = zeros<uint8_t>(b.pen_cap);
         }
-        CK(hipMemcpyAsync(b.pen_tok, ps.tok.data(), n * 4, hipMemcpyHostToDevice, s));
-        CK(hipMemcpyAsync(b.pen_gen, ps.gen.data(), n, hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.pen_tok, ps.tok.data(), n * 4, hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.pen_gen, ps.gen.data(), n, hipMemcpyHostToDevice, s));
         gpu::penalty_add(counts, b.pen_tok, b.pen_gen, int(n), VOCAB_L, rk.r * VOCAB_L, s);
     }
 }
@@ -61,8 +62,8 @@ void Engine::row_logits(int row, float *out) {
     for (auto &rkp : ranks_) {
         Rank &rk = *rkp;
         CK(hipSetDevice(rk.dev));
-        CK(hipMemcpy(out + size_t(rk.r) * VOCAB_L, rk.bt.logits + size_t(row) * VOCAB_L, VOCAB_L * 4,
-                     hipMemcpyDeviceToHost));
+        CK(pcie::copy(out + size_t(rk.r) * VOCAB_L, rk.bt.logits + size_t(row) * VOCAB_L, VOCAB_L * 4,
+                      hipMemcpyDeviceToHost));
     }
 }
 

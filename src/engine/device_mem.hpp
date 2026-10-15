@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 
 namespace qw {
@@ -19,7 +20,7 @@ template <typename T>
 T *upload(const std::vector<T> &v) {
     T *d;
     CK(hipMalloc(&d, v.size() * sizeof(T)));
-    CK(hipMemcpy(d, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice));
+    CK(pcie::copy(d, v.data(), v.size() * sizeof(T), hipMemcpyHostToDevice));
     return d;
 }
 

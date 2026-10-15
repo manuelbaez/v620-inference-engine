@@ -70,6 +70,7 @@ struct SpillCache {
     uint32_t *miss_n = nullptr;
     uint32_t miss_cap = 0;
     unsigned long long *stats = nullptr;  // [2] hits, misses (QW_SPILL_CACHE_STATS), or null
+    unsigned long long *host_rows = nullptr;  // positions whose K and V rows were read from host memory, or null
 };
 constexpr unsigned long long CACHE_LOCK = ~0ull;
 static_assert(cfg::MAX_SLOTS <= 16, "the spill cache's tags hold a slot in 4 bits");

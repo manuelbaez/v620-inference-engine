@@ -67,6 +67,19 @@ int main(int argc, char **argv) {
         Engine eng(opt);
         auto t1 = now();
         log("loaded in %.1f s", secs(t0, t1));
+        // PCIe bytes per card that a phase moved, as the engine counts them (comm/pcie_traffic.hpp)
+        auto pcie_since = [&](const char *phase, const std::array<pcie::Bytes, cfg::RANKS> &from) {
+            const auto to = eng.pcie_bytes();
+            for (int r = 0; r < cfg::RANKS; ++r) {
+                auto d = [&](pcie::Kind k) { return double(to[size_t(r)][k] - from[size_t(r)][k]) / 1e6; };
+                log("PCIe %s, card %d: host->GPU %.3f MB, GPU->host %.3f MB, from peers %.3f MB, to peers %.3f MB, "
+                    "spilled KV read %.3f MB",
+                    phase, r, d(pcie::HostToGpu), d(pcie::GpuToHost), d(pcie::PeerIn), d(pcie::PeerOut),
+                    d(pcie::SpillRead));
+            }
+            return to;
+        };
+        auto pcie0 = eng.pcie_bytes();
 
         FILE *f = lp_file.empty() ? nullptr : std::fopen(lp_file.c_str(), "w");
         std::vector<float> lp(cfg::VOCAB);
@@ -114,6 +127,7 @@ int main(int argc, char **argv) {
         auto t2 = now();
         log("prompt: %zu tokens in %.2f s (%.1f tok/s, %s)", prompt.size(), secs(t1, t2), prompt.size() / secs(t1, t2),
             tbt ? "token-by-token" : "prefill");
+        pcie0 = pcie_since("prompt", pcie0);
         std::printf("generated:");
         auto t3 = now();
         for (int i = 0; i < gen; ++i) {
@@ -136,6 +150,7 @@ int main(int argc, char **argv) {
         auto t4 = now();
         std::printf("\n");
         if (gen > 1) log("decode: %.2f tok/s", (gen - 1) / secs(t3, t4));
+        pcie_since("decode", pcie0);
     } catch (const std::exception &e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;

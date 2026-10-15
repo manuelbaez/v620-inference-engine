@@ -28,7 +28,7 @@ int check_guards() {
     std::vector<uint8_t> h(GUARD_BYTES);
     for (const auto &a : g_allocs) {
         CK(hipSetDevice(a.device));
-        CK(hipMemcpy(h.data(), static_cast<uint8_t *>(a.ptr) + a.bytes, GUARD_BYTES, hipMemcpyDeviceToHost));
+        CK(pcie::copy(h.data(), static_cast<uint8_t *>(a.ptr) + a.bytes, GUARD_BYTES, hipMemcpyDeviceToHost));
         size_t first = GUARD_BYTES;
         for (size_t i = 0; i < GUARD_BYTES; ++i)
             if (h[i] != GUARD_BYTE) {

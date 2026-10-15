@@ -74,6 +74,9 @@ class FakeEngine:
     def moe_use(self):
         return [(0, 0)] * 4
 
+    def pcie_bytes(self):
+        return [(0, 0, 0, 0, 0)] * 4
+
     def failure(self):
         return self.failed_with
 

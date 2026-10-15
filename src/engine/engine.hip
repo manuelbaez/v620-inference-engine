@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -42,6 +43,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     // the largest payloads: half a chunk's HC down outputs, a score batch's indexer candidates
     const size_t slot = std::max({size_t(64 * 1024), size_t(opt_.prefill_chunk / 2) * gpu::D_PAD * 4 + 4096,
                                   size_t(gpu::PREFILL_QB) * IDX_TOPK_BLOCKS * sizeof(gpu::IdxCand) + 4096});
+    pcie::set_devices(opt_.devices);
     comm_ = std::make_unique<Comm>(opt_.devices, slot);
     if (const char *v = std::getenv("QW_PREFILL_MB")) opt_.prefill_mb = std::atoi(v);
     QW_CHECK(opt_.prefill_mb >= 2 && opt_.prefill_mb <= Rank::MAX_MB, "QW_PREFILL_MB must be 2..4");
@@ -443,8 +445,8 @@ void Engine::spill_cache_bump(int slot) {
     ++cache_epoch_[size_t(slot)];
     for (auto &rkp : ranks_) {
         CK(hipSetDevice(rkp->dev));
-        CK(hipMemcpyAsync(rkp->cache_epoch, cache_epoch_.data(), cache_epoch_.size() * 4, hipMemcpyHostToDevice,
-                          rkp->s));
+        CK(pcie::copy_async(rkp->cache_epoch, cache_epoch_.data(), cache_epoch_.size() * 4, hipMemcpyHostToDevice,
+                            rkp->s));
     }
 }
 
@@ -491,6 +493,14 @@ void Engine::moe_balance(double out[3]) const {
     out[0] = moe_total_max_;
     out[1] = moe_total_mean_;
     out[2] = moe_total_max_by_number_;
+}
+
+std::array<pcie::Bytes, RANKS> Engine::pcie_bytes() const {
+    auto out = pcie::totals();
+    for (size_t r = 0; r < ranks_.size(); ++r)
+        if (const unsigned long long *rows = ranks_[r]->host_rows_host)
+            out[r][pcie::SpillRead] += rows[0] * SpillPool::token_bytes();
+    return out;
 }
 
 void Engine::moe_use(unsigned long long out[RANKS][2]) const {

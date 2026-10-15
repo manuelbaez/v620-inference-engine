@@ -305,6 +305,9 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spi
         c.miss = zeros<uint2>(SPILL_MISS_CAP);
         c.miss_n = zeros<uint32_t>(1);
         if (std::getenv("QW_SPILL_CACHE_STATS")) c.stats = zeros<unsigned long long>(2);
+        c.host_rows = zeros<unsigned long long>(1);
+        rk.host_rows_host = pinned<unsigned long long>(1);
+        rk.host_rows_host[0] = 0;
     }
     if (const size_t n = spill_stage_tokens(opt)) {
         rk.stage_tokens = n;

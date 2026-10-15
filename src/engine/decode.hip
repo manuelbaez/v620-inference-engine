@@ -10,6 +10,7 @@
 #include <functional>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/engine.hpp"
@@ -163,8 +164,10 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
     return k;
 }
 
-// Captures (first use) and launches the graph of `kind` for M rows.
-static void launch_graph(hipStream_t s, hipGraphExec_t &g, uint32_t &n_coll, const std::function<uint32_t()> &record) {
+// Captures (first use) and launches the graph of `kind` for M rows on rank r. pcie: the graph's PCIe bytes, counted
+// while it is captured and added on every launch.
+static void launch_graph(int r, hipStream_t s, hipGraphExec_t &g, uint32_t &n_coll, pcie::Bytes &pcie,
+                         const std::function<uint32_t()> &record) {
     static const bool no_graph = std::getenv("QW_NOGRAPH") != nullptr;
     if (no_graph) {
         n_coll = record();
@@ -173,12 +176,16 @@ static void launch_graph(hipStream_t s, hipGraphExec_t &g, uint32_t &n_coll, con
     if (!g) {
         hipGraph_t graph;
         CK(hipStreamBeginCapture(s, hipStreamCaptureModeThreadLocal));
-        n_coll = record();
+        {
+            pcie::Capture cap(pcie);
+            n_coll = record();
+        }
         CK(hipStreamEndCapture(s, &graph));
         CK(hipGraphInstantiate(&g, graph, nullptr, nullptr, 0));
         CK(hipGraphDestroy(graph));
     }
     CK(hipGraphLaunch(g, s));
+    pcie::add(r, pcie);
 }
 
 namespace {
@@ -218,16 +225,17 @@ void Engine::run_decode_rank(Rank &rk) {
     std::memcpy(b.h_pos, djob_.pos.data(), MR * 8);
     for (int i = 0; i < M; ++i) std::memcpy(b.h_emb + size_t(i) * SH, demb_.data() + size_t(i) * H + r * SH, SH * 4);
     std::memcpy(b.h_ple, dple_.data(), size_t(M) * H * 2);
-    CK(hipMemcpyAsync(b.row_slot, b.h_i32, 5 * MR * 4, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.ple_e, b.h_ple, size_t(M) * H * 2, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.row_slot, b.h_i32, 5 * MR * 4, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.ple_e, b.h_ple, size_t(M) * H * 2, hipMemcpyHostToDevice, s));
     comm_->set_base(r, rk.seq_base, s);
     const int kind = djob_.save ? 1 : 0;
     auto &g = rk.graphs[size_t(kind)][size_t(M)];
     auto &nc = rk.n_coll[size_t(kind)][size_t(M)];
     const auto t0 = std::chrono::steady_clock::now();
-    launch_graph(s, g, nc, [&] { return record_batch(rk, M, kind); });
+    launch_graph(r, s, g, nc, rk.graph_pcie[size_t(kind)][size_t(M)],
+                 [&] { return record_batch(rk, M, kind); });
     rk.seq_base += nc;
     if (g_dtrace.on && r == 0) {
         CK(hipStreamSynchronize(s));
@@ -236,16 +244,19 @@ void Engine::run_decode_rank(Rank &rk) {
     const auto t1 = std::chrono::steady_clock::now();
     if (djob_.sample) {
         std::memcpy(b.h_srows, djob_.srows.data(), size_t(M) * sizeof(gpu::SampleRow));
-        CK(hipMemcpyAsync(b.srows, b.h_srows, size_t(M) * sizeof(gpu::SampleRow), hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.srows, b.h_srows, size_t(M) * sizeof(gpu::SampleRow), hipMemcpyHostToDevice, s));
         gpu::sample_penalize(b.logits, b.Lpen, b.srows, rk.pen_tab, VOCAB_L, r * VOCAB_L, M, s);
         gpu::sample_select(b.Lpen, b.logits, b.srows, VOCAB_L, r * VOCAB_L, M, b.sout, s);
-        CK(hipMemcpyAsync(b.h_sout, b.sout, size_t(M) * sizeof(gpu::SampleOut), hipMemcpyDeviceToHost, s));
+        CK(pcie::copy_async(b.h_sout, b.sout, size_t(M) * sizeof(gpu::SampleOut), hipMemcpyDeviceToHost, s));
     }
     if (djob_.copy_logits)
-        CK(hipMemcpyAsync(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
-    CK(hipMemcpyAsync(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
-    if ((rk.moe_use_tick++ & 63) == 0)  // the routed-expert count, for the stats
-        CK(hipMemcpyAsync(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, s));
+        CK(pcie::copy_async(b.h_logits, b.logits, size_t(M) * VOCAB_L * 4, hipMemcpyDeviceToHost, s));
+    CK(pcie::copy_async(b.h_lse, b.lse, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
+    if ((rk.moe_use_tick++ & 63) == 0) {  // the routed-expert count (stats), spilled rows read (PCIe count)
+        CK(pcie::copy_async(rk.moe_use_host, rk.moe_use, 16, hipMemcpyDeviceToHost, s));
+        if (rk.cache.host_rows)
+            CK(pcie::copy_async(rk.host_rows_host, rk.cache.host_rows, 8, hipMemcpyDeviceToHost, s));
+    }
     phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(dlse_parts_.data() + size_t(r) * gpu::MAX_ROWS * 2, b.h_lse, size_t(M) * 2 * 4);
@@ -273,17 +284,17 @@ void Engine::run_mtp_rank(Rank &rk) {
                      : hp >= 0  ? rk.slots[size_t(-1 - src)].hist + size_t(hp % gpu::MTP_HIST) * XW
                                 : rk.slots[size_t(-1 - src)].pend;
     }
-    CK(hipMemcpyAsync(b.row_slot, b.h_i32, 5 * MR * 4, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
-    CK(hipMemcpyAsync(b.src_ptrs, b.h_src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.row_slot, b.h_i32, 5 * MR * 4, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
+    CK(pcie::copy_async(b.src_ptrs, b.h_src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
     gpu::gather_rows(b.src_ptrs, M, XW, b.m_hid, s);
     comm_->set_base(r, rk.seq_base, s);
     auto &g = rk.graphs[2][size_t(M)];
     auto &nc = rk.n_coll[2][size_t(M)];
-    launch_graph(s, g, nc, [&] { return record_batch(rk, M, 2); });
+    launch_graph(r, s, g, nc, rk.graph_pcie[2][size_t(M)], [&] { return record_batch(rk, M, 2); });
     rk.seq_base += nc;
-    CK(hipMemcpyAsync(b.h_amax, b.amax, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
+    CK(pcie::copy_async(b.h_amax, b.amax, size_t(M) * 2 * 4, hipMemcpyDeviceToHost, s));
     phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     std::memcpy(damax_parts_.data() + size_t(r) * MR * 2, b.h_amax, size_t(M) * 2 * 4);
@@ -312,26 +323,26 @@ void Engine::run_draft_rank(Rank &rk) {
             const int src = d.src[size_t(i)];
             h.src[i] = src >= 0 ? b.X + size_t(src) * XW : rk.slots[size_t(-1 - src)].pend;
         }
-        CK(hipMemcpyAsync(b.row_slot, h.i32, sizeof h.i32, hipMemcpyHostToDevice, s));
-        CK(hipMemcpyAsync(b.row_pos, h.pos, sizeof h.pos, hipMemcpyHostToDevice, s));
-        CK(hipMemcpyAsync(b.src_ptrs, h.src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
-        CK(hipMemcpyAsync(b.d_last, h.last, size_t(nreq) * 4, hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.row_slot, h.i32, sizeof h.i32, hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.row_pos, h.pos, sizeof h.pos, hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.src_ptrs, h.src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
+        CK(pcie::copy_async(b.d_last, h.last, size_t(nreq) * 4, hipMemcpyHostToDevice, s));
         if (st == 0) {  // later steps' embeddings come from draft_pick
             for (int i = 0; i < M; ++i)
                 std::memcpy(b.h_emb + size_t(i) * SH, demb_.data() + size_t(i) * H + r * SH, SH * 4);
-            CK(hipMemcpyAsync(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
+            CK(pcie::copy_async(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
         }
         gpu::gather_rows(b.src_ptrs, M, XW, b.m_hid, s);
         auto &g = rk.graphs[2][size_t(M)];
         auto &nc = rk.n_coll[2][size_t(M)];
-        launch_graph(s, g, nc, [&] { return record_batch(rk, M, 2); });
+        launch_graph(r, s, g, nc, rk.graph_pcie[2][size_t(M)], [&] { return record_batch(rk, M, 2); });
         comm_->allgather(r, b.amax, b.amax_all, MR * 2 * 4, nc + 1, s);
         gpu::draft_pick(b.amax_all, MR * 2, b.d_last, nreq, r, b.dtokens + size_t(st) * MR, rk.embed_dev,
                         st + 1 < steps ? b.emb : nullptr, s);
         comm_->bump_base(r, nc + 1, s);
         rk.seq_base += nc + 1;
     }
-    CK(hipMemcpyAsync(b.h_dtokens, b.dtokens, size_t(steps) * MR * 4, hipMemcpyDeviceToHost, s));
+    CK(pcie::copy_async(b.h_dtokens, b.dtokens, size_t(steps) * MR * 4, hipMemcpyDeviceToHost, s));
     phase_[size_t(rk.r)] = 2;
     CK(hipStreamSynchronize(s));
     if (r == 0) dtok_.assign(b.h_dtokens, b.h_dtokens + size_t(steps) * MR);

@@ -59,6 +59,19 @@ function renderCharts(d) {
     {key: "waiting", color: "--accent2", label: "waiting / prefilling / loading", fmt: n}], win, 4, true);
   lineChart($("chart-kv"), h, [
     {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
+  lineChart($("chart-pcie"), h, PCIE_COLORS.map((color, r) =>
+    ({key: "pcie" + r, color, label: "GPU " + r, fmt: fmt.gbps})), win, 1);
+}
+
+const PCIE_COLORS = ["--accent", "--accent2", "--ok", "--warn"];
+
+// Per card over the last sample: in (host copies, peers, spilled KV reads) and out (host copies, peers).
+function pcieLines(pcie) {
+  return (pcie || []).map(([h2d, d2h, fromPeers, toPeers, spill], r) => ui.line(`GPU ${r} PCIe (last 5 s)`,
+    `in ${fmt.gbps(h2d + fromPeers + spill)} (host ${fmt.gbps(h2d)}, peers ${fmt.gbps(fromPeers)}, ` +
+    `spilled KV ${fmt.gbps(spill)}) · ` +
+    `out ${fmt.gbps(d2h + toPeers)} (host ${fmt.gbps(d2h)}, peers ${fmt.gbps(toPeers)})`)
+  ).join("");
 }
 
 function renderSlots(m) {
@@ -70,13 +83,13 @@ function renderSlots(m) {
   $("slots-scale").textContent = `bar width ${fmt.count(scale)} tokens (a slot's capacity); tick: end of the VRAM part`;
 }
 
-function renderMemory(m) {
+function renderMemory(m, pcie) {
   renderSlots(m);
   let gpu = ui.bar("KV of the slots, VRAM + host RAM (in use / capacity)", m.kv_gpu_used, m.kv_gpu_allocated,
                    "slots " + m.slots.map(fmt.count).join(" / "));
   for (const c of m.gpus || [])
     gpu += ui.bar(`${c.card} VRAM`, c.vram_used, c.vram_total, c.power_w != null ? c.power_w.toFixed(1) + " W" : "");
-  $("gpu").innerHTML = gpu;
+  $("gpu").innerHTML = gpu + pcieLines(pcie);
 
   let host = ui.bar("Prefix cache in RAM", m.host_cache_used, m.host_cache_budget,
                     `${fmt.count(m.cache_blocks)} blocks, ${fmt.count(m.cache_snapshots)} snapshots`);
@@ -91,7 +104,7 @@ function render(d) {
   renderHeader(d);
   renderCards(d);
   renderCharts(d);
-  renderMemory(d.memory);
+  renderMemory(d.memory, d.pcie);
   $("requests").innerHTML = d.recent.map(ui.requestRow).join("");
 }
 

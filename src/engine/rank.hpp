@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/safetensors.hpp"
 #include "core/shard.hpp"
 #include "core/threadpool.hpp"
@@ -152,6 +153,8 @@ struct Rank {
     // the routing kernels on the device and copied to the pinned host copy now and then (Engine::moe_use).
     unsigned long long *moe_use = nullptr, *moe_use_host = nullptr;
     unsigned moe_use_tick = 0;
+    // the spill cache's host_rows, copied with moe_use (Engine::pcie_bytes)
+    unsigned long long *host_rows_host = nullptr;
     // export_kv packs a block of up to KV_PACK_TOKENS positions here in the block store's layout, then copies it once
     static constexpr int KV_PACK_TOKENS = 256;
     uint8_t *pack = nullptr;
@@ -227,6 +230,7 @@ struct Rank {
     // captured graphs per row count: [kind][M], kind 0 decode, 1 decode + GDN state save, 2 MTP
     std::array<std::array<hipGraphExec_t, gpu::MAX_ROWS + 1>, 3> graphs{};
     std::array<std::array<uint32_t, gpu::MAX_ROWS + 1>, 3> n_coll{};
+    std::array<std::array<pcie::Bytes, gpu::MAX_ROWS + 1>, 3> graph_pcie{};  // each graph's PCIe bytes per launch
     uint32_t seq_base = 0;
 };
 

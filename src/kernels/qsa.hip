@@ -264,11 +264,13 @@ __global__ __launch_bounds__(256) void qsa_attend_B_kernel(const uint4 *q16, con
 }
 
 // A warp per listed miss: claim the entry (skip it when another warp has it or it already holds the row), copy the
-// position's K and V rows from host memory, then publish the tag.
+// position's K and V rows from host memory, then publish the tag. host_rows: the step's attention read every miss from
+// host memory, and this kernel reads each claimed one again.
 __global__ __launch_bounds__(256) void spill_cache_fill_kernel(const SlotPtrs *tab, SpillCache c) {
     constexpr int RW = HEAD_DIM / 8;
     const uint32_t n = min(*c.miss_n, c.miss_cap);
     const int lane = threadIdx.x % WAVE;
+    if (c.host_rows && blockIdx.x == 0 && threadIdx.x == 0) atomicAdd(c.host_rows, (unsigned long long)*c.miss_n);
     for (uint32_t i = (blockIdx.x * blockDim.x + threadIdx.x) / WAVE; i < n; i += gridDim.x * blockDim.x / WAVE) {
         const uint2 m = c.miss[i];
         const int pos = int(m.y & ((1u << CACHE_POS_BITS) - 1)), slot = int((m.y >> CACHE_POS_BITS) & 15u),
@@ -278,6 +280,7 @@ __global__ __launch_bounds__(256) void spill_cache_fill_kernel(const SlotPtrs *t
         if (lane == 0) {
             const unsigned long long old = c.tags[m.x];
             claimed = old != want && old != CACHE_LOCK && atomicCAS(c.tags + m.x, old, CACHE_LOCK) == old;
+            if (claimed && c.host_rows) atomicAdd(c.host_rows, 1ull);
         }
         if (!__shfl(claimed, 0, WAVE)) continue;
         const SlotPtrs &sp = tab[slot];

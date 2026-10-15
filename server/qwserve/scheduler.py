@@ -197,6 +197,7 @@ class Scheduler:
         self.win = {"t": time.time(), "prefill": 0, "gen": 0, "prompt": 0, "cached": 0, "steps": 0, "step_time": 0.0,
                     "rows": 0}
         self.metrics = Metrics()  # for the dashboard
+        self.metrics.pcie_source = getattr(self.e, "pcie_bytes", None)  # called by sample(), on this thread
         self.thread = threading.Thread(target=self._loop, daemon=True, name="qw-scheduler")
         self.thread.start()
         if self.WATCHDOG_EXIT:

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 
+#include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
 #include "engine/device_mem.hpp"
 #include "kernels/gemm.hpp"
@@ -107,10 +108,10 @@ void VisionEncoder::encode(const float *patches, int h, int w, float *out) {
         h_wts_[size_t(base) + 2] = wy1 * wx0;
         h_wts_[size_t(base) + 3] = wy1 * wx1;
     }
-    CK(hipMemcpyAsync(mlp_, h_patches_.data(), h_patches_.size() * 2, hipMemcpyHostToDevice, s_));
-    CK(hipMemcpyAsync(idx_, h_idx_.data(), h_idx_.size() * 4, hipMemcpyHostToDevice, s_));
-    CK(hipMemcpyAsync(wts_, h_wts_.data(), h_wts_.size() * 4, hipMemcpyHostToDevice, s_));
-    CK(hipMemcpyAsync(pos_, h_pos_.data(), h_pos_.size() * 4, hipMemcpyHostToDevice, s_));
+    CK(pcie::copy_async(mlp_, h_patches_.data(), h_patches_.size() * 2, hipMemcpyHostToDevice, s_));
+    CK(pcie::copy_async(idx_, h_idx_.data(), h_idx_.size() * 4, hipMemcpyHostToDevice, s_));
+    CK(pcie::copy_async(wts_, h_wts_.data(), h_wts_.size() * 4, hipMemcpyHostToDevice, s_));
+    CK(pcie::copy_async(pos_, h_pos_.data(), h_pos_.size() * 4, hipMemcpyHostToDevice, s_));
 
     // patch embedding + positions
     gpu::gemm(blas_, w_.patch_w, D, cfg_.patch_in, mlp_, cfg_.patch_in, L, att_, D, true);
@@ -140,7 +141,7 @@ void VisionEncoder::encode(const float *patches, int h, int w, float *out) {
     gpu::vit_bias_gelu(mlp_, w_.m_fc1_b, T, DM, false, s_);
     gpu::gemm(blas_, w_.m_fc2, cfg_.out_dim, DM, mlp_, DM, T, qkv_, cfg_.out_dim, true);
     gpu::vit_bias_out(qkv_, w_.m_fc2_b, T, cfg_.out_dim, x_, s_);
-    CK(hipMemcpyAsync(out, x_, size_t(T) * cfg_.out_dim * 4, hipMemcpyDeviceToHost, s_));
+    CK(pcie::copy_async(out, x_, size_t(T) * cfg_.out_dim * 4, hipMemcpyDeviceToHost, s_));
     CK(hipStreamSynchronize(s_));
 }
 
