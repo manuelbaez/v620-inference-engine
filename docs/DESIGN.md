@@ -669,7 +669,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          about 7.4 min) showed no stats line and a frozen dashboard from 23:36:53 to 23:42:49, which read as one
          prompt stuck while the others never started; all eight had slots within 1.8 s and shared every 4,096-token
          pass in 512-token pieces. `_prefill` now does both about once a second (`_observe`,
-         `server/tests/test_prefill_observe.py`)
+         `server/tests/test_prefill_observe.py`). In production since 2026-10-15 23:56 UTC (`qw-engine:4b0ddf0`, with
+         the spilled-KV chart; ready in 264 s, smoke test passed)
    - [~] PCIe traffic per card on the dashboard (2026-10-15, section "PCIe traffic per card"): counted by the
          engine, since the cards have no byte counters. In production since 2026-10-15 23:26 UTC (`qw-engine:ae98caa`);
          open: the speed A/B against the build before and the graph / `QW_NOGRAPH=1` byte comparison (two windows
