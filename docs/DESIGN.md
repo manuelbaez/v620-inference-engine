@@ -663,6 +663,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          KV in the GPUs, per-card VRAM and power, host cache, disk tier, PLE table, averages of
          TTFT, request time and decode speed, recent requests. A collector thread builds the
          snapshot every 2 s; the handler only returns it; figures to one decimal
+   - [x] stats line and dashboard during long prefills (2026-10-15): with nothing decoding, `_prefill` runs pass
+         after pass until a prompt is done or a request arrives, and the scheduler printed its stats line and sampled
+         the dashboard only after it returned. Eight 95k-token prompts sent together (763k tokens at ~1,720 tok/s,
+         about 7.4 min) showed no stats line and a frozen dashboard from 23:36:53 to 23:42:49, which read as one
+         prompt stuck while the others never started; all eight had slots within 1.8 s and shared every 4,096-token
+         pass in 512-token pieces. `_prefill` now does both about once a second (`_observe`,
+         `server/tests/test_prefill_observe.py`)
    - [~] PCIe traffic per card on the dashboard (2026-10-15, section "PCIe traffic per card"): counted by the
          engine, since the cards have no byte counters. In production since 2026-10-15 23:26 UTC (`qw-engine:ae98caa`);
          open: the speed A/B against the build before and the graph / `QW_NOGRAPH=1` byte comparison (two windows

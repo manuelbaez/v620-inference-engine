@@ -602,8 +602,11 @@ class Scheduler:
         """Advances the prefills (see _batch): by one piece while others decode, then returns so
         they get steps; chunk by chunk to the end when nothing is decoding, but returning as
         soon as new requests arrive so they are admitted. Returns the seconds spent."""
-        t0 = time.time()
+        t0 = t_obs = time.time()
         while self.prefilling:
+            if time.time() - t_obs >= 1.0:  # a long run of passes: keep the stats line and the dashboard current
+                self._observe(time.time() - t_obs)
+                t_obs = time.time()
             for r in [r for r in self.prefilling if r.cancelled.is_set()]:
                 self.prefilling.remove(r)
                 self._finish(r, "abort")
@@ -645,8 +648,20 @@ class Scheduler:
                 if self._took(r, tid, lp, top):
                     self.active.append(r)
             if self.active or self.queue:
-                return time.time() - t0  # running requests take steps, new ones are admitted
+                break  # running requests take steps, new ones are admitted
+        self._observed_s = t_obs - t0
         return time.time() - t0
+
+    def _observe(self, seconds):
+        """The stats line and a dashboard sample, after `seconds` of the loop's work: the main loop does this after
+        every pass of it, and _prefill between its passes (prefilling with nothing decoding, it runs to the end, which
+        for a few 100k-token prompts is minutes: the log and the dashboard stood still all that time)."""
+        self._stats()
+        self.metrics.tick(seconds, len(self.prefilling), len(self.active))
+        self.metrics.sample(len(self.active), len(self.prefilling),
+                            len(self.waiting) + len(self.queue) + len(self.loading),
+                            sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),
+                            sum(self.e.capacity), slots=self._slot_state())
 
     def _step(self):
         for r in [r for r in self.active if r.cancelled.is_set()]:
@@ -698,6 +713,7 @@ class Scheduler:
                 self.waiting += self.queue  # the queue is shared; waiting is this thread's
                 self.queue = []
             t_pass = time.time()
+            self._observed_s = 0.0  # of this pass, already counted by _prefill's own _observe calls
             try:
                 moved = self._admit()
                 self._poll_loading()
@@ -708,12 +724,7 @@ class Scheduler:
                 self._step()
                 while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
                     self._step()
-                self._stats()
-                self.metrics.tick(time.time() - t_pass, len(self.prefilling), len(self.active))
-                self.metrics.sample(len(self.active), len(self.prefilling),
-                                    len(self.waiting) + len(self.queue) + len(self.loading),
-                                    sum(len(r.prompt) + r.generated for r in self.active + self.prefilling),
-                                    sum(self.e.capacity), slots=self._slot_state())
+                self._observe(time.time() - t_pass - self._observed_s)
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
                 print(f"scheduler error ({len(self.prefilling) + len(self.active)} requests failed): {ex}\n"
                       f"{traceback.format_exc()}", file=sys.stderr, flush=True)
