@@ -27,6 +27,19 @@ void add_rows_bf16(std::vector<uint16_t> &dst, const TensorView &t, int64_t r0, 
 // value is exactly an E4M3 value times a power of two per 32 (an MXFP8 matrix, e.g. the FP4 checkpoint's); false when
 // one is not (the bf16 checkpoints' matrices).
 bool encode_mxfp8(const std::vector<uint16_t> &bf16, std::vector<int8_t> &q, std::vector<float> &scale);
+
+// NVFP4 expert scale words [rows][K32] (two E4M3 codes, the first 16 inputs' in the low byte) packed as
+// kernels/moe.hpp F4Packed describes: per row the base that puts the most codes within base..base+14 (offsets 0-14),
+// the others (offset 15) in a linear-probing table. Lossless.
+struct F4PackedHost {
+    std::vector<uint8_t> base, off, val;
+    std::vector<uint32_t> key;
+    uint32_t shift = 32;
+    size_t escapes = 0;
+};
+F4PackedHost pack_f4_scales(const std::vector<uint16_t> &words, size_t rows, size_t K32);
+// The code of row `row`, scale `idx` (0 .. 2 * K32 - 1) back from the packed form (tests).
+uint8_t f4_packed_code(const F4PackedHost &p, size_t K32, uint32_t row, uint32_t idx);
 std::vector<float> f32_of(const TensorView &t);
 // 1 + w for the rank's columns of a [HC*H] Gemma norm weight, as [HC][SH].
 std::vector<float> shard_w1(const TensorView &t, int r);

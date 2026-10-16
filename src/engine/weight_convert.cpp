@@ -95,6 +95,66 @@ bool encode_mxfp8(const std::vector<uint16_t> &bf16, std::vector<int8_t> &q, std
     return true;
 }
 
+F4PackedHost pack_f4_scales(const std::vector<uint16_t> &words, size_t rows, size_t K32) {
+    QW_CHECK(words.size() == rows * K32 && rows < (1u << 24) && 2 * K32 <= 256, "pack_f4_scales: shape");
+    F4PackedHost p;
+    p.base.resize(rows);
+    p.off.resize(rows * K32);
+    std::vector<std::pair<uint32_t, uint8_t>> esc;  // (key, code)
+    std::vector<uint8_t> codes(2 * K32), sorted(2 * K32);
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t j = 0; j < K32; ++j) {
+            codes[2 * j] = uint8_t(words[r * K32 + j] & 0xff);
+            codes[2 * j + 1] = uint8_t(words[r * K32 + j] >> 8);
+        }
+        sorted = codes;
+        std::sort(sorted.begin(), sorted.end());
+        size_t best = 0, b = 0;
+        for (size_t i = 0, e = 0; i < sorted.size(); ++i) {  // window [sorted[i], sorted[i] + 14]
+            while (e < sorted.size() && sorted[e] <= sorted[i] + 14) ++e;
+            if (e - i > best) best = e - i, b = sorted[i];
+        }
+        b = std::min<size_t>(b, 241);  // base + 14 <= 255 (a window starting higher holds the same codes)
+        p.base[r] = uint8_t(b);
+        for (size_t j = 0; j < K32; ++j) {
+            uint8_t nib[2];
+            for (int h = 0; h < 2; ++h) {
+                const int c = codes[2 * j + size_t(h)];
+                if (c >= int(b) && c <= int(b) + 14) {
+                    nib[h] = uint8_t(c - int(b));
+                } else {
+                    nib[h] = 15;
+                    esc.emplace_back(((uint32_t(r) << 8) | uint32_t(2 * j + size_t(h))) + 1, uint8_t(c));
+                }
+            }
+            p.off[r * K32 + j] = uint8_t(nib[0] | (nib[1] << 4));
+        }
+    }
+    int bits = 10;  // >= 1024 slots, under half full
+    while ((size_t(1) << bits) < 2 * esc.size()) ++bits;
+    p.shift = uint32_t(32 - bits);
+    const uint32_t mask = (1u << bits) - 1;
+    p.key.assign(size_t(1) << bits, 0);
+    p.val.assign(size_t(1) << bits, 0);
+    for (const auto &[k, c] : esc) {
+        uint32_t s = (k * 0x9E3779B1u) >> p.shift;
+        while (p.key[s]) s = (s + 1) & mask;
+        p.key[s] = k;
+        p.val[s] = c;
+    }
+    p.escapes = esc.size();
+    return p;
+}
+
+uint8_t f4_packed_code(const F4PackedHost &p, size_t K32, uint32_t row, uint32_t idx) {
+    const uint32_t o = p.off[row * K32 + idx / 2], nib = (idx & 1) ? o >> 4 : o & 15;
+    if (nib != 15) return uint8_t(p.base[row] + nib);
+    const uint32_t key = ((row << 8) | idx) + 1, mask = (1u << (32 - p.shift)) - 1;
+    uint32_t s = (key * 0x9E3779B1u) >> p.shift;
+    while (p.key[s] != key) s = (s + 1) & mask;
+    return p.val[s];
+}
+
 std::vector<float> f32_of(const TensorView &t) {
     QW_CHECK(t.dtype == DType::BF16, t.name + ": expected bf16");
     std::vector<float> v(size_t(t.numel()));

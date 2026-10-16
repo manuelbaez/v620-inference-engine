@@ -160,7 +160,14 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
                                      double(N_LAYERS - gdn) * (double(QSA_PROJ_L) * H + double(H) * QH_L * HEAD_DIM);
                     dense_fp8 = (w * (2.0 - 1.125) - 2.0 * opt_.prefill_mb * double(GDN_PROJ_L) * H) / gib;
                 }
-                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales - dense_fp8;
+                // QW_F4_PACKED: the NVFP4 scales take 1 byte per 32 weights instead of 2, plus a base per row and the
+                // escape table (~0.8% of the scales, 5 bytes per slot, under half full)
+                double f4_packed = 0.0;
+                if (f4_packed_on() && expert_group_ == QGROUP_F4) {
+                    const double wts = double(N_LAYERS) * EXP_L * 3.0 * FFN * H;
+                    f4_packed = (wts / 32.0 - double(N_LAYERS) * EXP_L * (2.0 * FFN + H) - wts / 16.0 * 0.008 * 2.0 * 5.0) / gib;
+                }
+                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales - dense_fp8 - f4_packed;
                 const double scoring = 6144.0 * double(max_slot_tokens() / IDX_RATIO) / gib;
                 const double est = double(total_b) / gib - base - double(slot_vram_bytes(opt_, mtp_)) / gib - scoring;
                 const double need = opt_.warmup ? 1.6 : 0.6;  // warmup (graphs, rocBLAS kernels) takes ~1.1 GiB; keep 0.5 free

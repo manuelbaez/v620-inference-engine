@@ -28,6 +28,10 @@ bool dense_fp8_on() {
     static const bool on = std::getenv("QW_DENSE_FP8") && std::atoi(std::getenv("QW_DENSE_FP8")) != 0;
     return on;
 }
+bool f4_packed_on() {
+    static const bool on = std::getenv("QW_F4_PACKED") && std::atoi(std::getenv("QW_F4_PACKED")) != 0;
+    return on;
+}
 
 namespace {
 
@@ -391,7 +395,8 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
     const int G = w.egroup;
     std::vector<float> eglob(G == QGROUP_F4 ? 3 * EXP_L : 0);  // NVFP4: each matrix's FP32 scale (x 2^7: kernels)
     // A projection of the rank's experts: the packed int4 words, then their scale words (built together).
-    auto pack_experts = [&](const char *proj, int rows, int K, uint32_t **wd, uint16_t **sd, float *glob) {
+    auto pack_experts = [&](const char *proj, int rows, int K, uint32_t **wd, uint16_t **sd, float *glob,
+                            gpu::F4Packed *pk) {
         const size_t words = size_t(rows) * K / 8, groups = size_t(rows) * K / scale_span(G);
         std::vector<uint16_t> scales;
         *wd = wc.item<uint32_t>([&] {
@@ -429,6 +434,13 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
             });
             return packed;
         });
+        if (G == QGROUP_F4 && f4_packed_on()) {  // QW_F4_PACKED: the scale words packed, 0.25 bit per weight
+            QW_CHECK(!scales.empty(), "QW_F4_PACKED does not work with the converted-weights cache");
+            const F4PackedHost ph = pack_f4_scales(scales, size_t(EXP_L) * size_t(rows), size_t(K / 32));
+            *pk = {upload(ph.base), upload(ph.off), upload(ph.key), upload(ph.val), ph.shift};
+            *sd = nullptr;
+            return;
+        }
         *sd = wc.item<uint16_t>([&] { return std::move(scales); });
     };
     // [E][R][K] bf16 rows [row0, row0 + rows) of each local expert -> int4 g128 (symmetric, scale amax / 7)
@@ -459,10 +471,11 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
         quant_experts(gu, {N_EXPERTS, 2 * FFN, H}, FFN, FFN, H, &w.eu, &w.eus);
         quant_experts(mp + "experts.down_proj", {N_EXPERTS, H, FFN}, 0, H, FFN, &w.ed, &w.eds);
     } else {
-        pack_experts("gate_proj", FFN, H, &w.eg, &w.egs, eglob.data());
-        pack_experts("up_proj", FFN, H, &w.eu, &w.eus, eglob.data() + EXP_L);
-        pack_experts("down_proj", H, FFN, &w.ed, &w.eds, eglob.data() + 2 * EXP_L);
+        pack_experts("gate_proj", FFN, H, &w.eg, &w.egs, eglob.data(), &w.epk[0]);
+        pack_experts("up_proj", FFN, H, &w.eu, &w.eus, eglob.data() + EXP_L, &w.epk[1]);
+        pack_experts("down_proj", H, FFN, &w.ed, &w.eds, eglob.data() + 2 * EXP_L, &w.epk[2]);
         if (G == QGROUP_F4) w.eglob = wc.item<float>([&] { return eglob; });
+        if (G == QGROUP_F4 && f4_packed_on()) w.egroup = QGROUP_F4P;
     }
     w.sh_gu = wc.item<uint16_t>([&] {
         std::vector<uint16_t> gu;

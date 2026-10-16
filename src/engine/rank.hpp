@@ -19,6 +19,7 @@
 #include "core/threadpool.hpp"
 #include "engine/engine.hpp"
 #include "engine/spill.hpp"
+#include "kernels/moe.hpp"
 #include "kernels/sampling_types.hpp"
 #include "kernels/types.hpp"
 #include "vision/vision_encoder.hpp"
@@ -43,6 +44,8 @@ struct Q8 {
 // QW_DENSE_FP8=1 (an experiment, docs/DESIGN.md "The FP4 checkpoint"): GDN and QSA matrices that are MXFP8 exactly
 // (the FP4 checkpoint's) are kept as E4M3 bytes with a scale per 32 in place of their fp16 copies.
 bool dense_fp8_on();
+// QW_F4_PACKED=1 (with NVFP4 experts): their scales packed in VRAM (kernels/moe.hpp F4Packed), ~0.8 GiB less per card.
+bool f4_packed_on();
 
 struct HcW {
     float *w1;            // [HC][SH] 1 + hc_norm
@@ -94,6 +97,7 @@ struct LayerW {
     uint16_t *egs, *eus, *eds;  // fp16 scales per QGROUP inputs, or scale and zero point words per QGROUP_Z (egroup)
     int egroup = cfg::QGROUP;   // ... or QGROUP_F4: two E4M3 scales per word,
     float *eglob = nullptr;     // and each matrix's FP32 scale x 2^7, [3][EXP_L] gate, up, down (moe_experts_T)
+    gpu::F4Packed epk[3]{};     // QGROUP_F4P: the scales packed (gate, up, down), egs / eus / eds unused
     uint16_t *sh_gu;            // [321][H]: gate 160 | up 160 | shared_expert_gate
     uint16_t *sh_down;          // [H][160]
     Q8 qsa_proj8, qsa_o8, gdn_proj8, gdn_out8, sh_gu8, sh_down8;

@@ -83,19 +83,43 @@ __device__ __forceinline__ void dequant32_f4(const uint4 &w, uint32_t word, __ha
             d2[i * 4 + sh] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(h2, fp4_2_to_h2(ws[i] >> (4 * sh))) * sc);
     }
 }
+constexpr bool is_f4(int G) { return G == QGROUP_F4 || G == QGROUP_F4P; }
+
+// QGROUP_F4P: the two E4M3 codes of row `row`'s 32-input group k32 (as a QGROUP_F4 word) from the packed scales.
+__device__ __forceinline__ uint32_t f4_code(const F4Packed &p, uint32_t row, uint32_t idx, uint32_t nib, uint32_t base) {
+    if (nib != 15) return base + nib;
+    const uint32_t key = ((row << 8) | idx) + 1, mask = (1u << (32 - p.shift)) - 1;
+    uint32_t s = (key * 0x9E3779B1u) >> p.shift;
+    while (p.key[s] != key) s = (s + 1) & mask;
+    return p.val[s];
+}
+__device__ __forceinline__ uint32_t f4_word(const F4Packed &p, uint32_t row, uint32_t k32, uint32_t K32) {
+    const uint32_t b = p.base[row], o = p.off[size_t(row) * K32 + k32];
+    return f4_code(p, row, 2 * k32, o & 15, b) | (f4_code(p, row, 2 * k32 + 1, o >> 4, b) << 8);
+}
+// A QGROUP_F4 / QGROUP_F4P scale word of row `row`, 32-input group k32 (K32 groups per row; word: the stored ones).
+template <int G>
+__device__ __forceinline__ uint32_t f4_scale_word(const __half *word, const F4Packed &p, uint32_t row, uint32_t k32,
+                                                  uint32_t K32) {
+    if constexpr (G == QGROUP_F4P) return f4_word(p, row, k32, K32);
+    return *reinterpret_cast<const uint16_t *>(word);
+}
+
 // One uint4 of weights (32 inputs) into LDS halves, with the group's scale word.
 template <int G>
-__device__ __forceinline__ void dequant32_g(const uint4 &w, const __half *word, __half *dst) {
-    if constexpr (G == QGROUP_F4)
-        dequant32_f4(w, *reinterpret_cast<const uint16_t *>(word), dst);
+__device__ __forceinline__ void dequant32_g(const uint4 &w, const __half *word, __half *dst, const F4Packed &p = {},
+                                            uint32_t row = 0, uint32_t k32 = 0, uint32_t K32 = 0) {
+    if constexpr (is_f4(G))
+        dequant32_f4(w, f4_scale_word<G>(word, p, row, k32, K32), dst);
     else
         dequant32(w, group_scale<G>(word), dst);
 }
 // ... and against 32 fp16 activations (the P kernels), scale included.
 template <int G>
-__device__ __forceinline__ float dot32_g(const uint4 &w, const uint4 *x, const __half *word) {
-    if constexpr (G == QGROUP_F4) {
-        const uint32_t b = *reinterpret_cast<const uint16_t *>(word), ws[4] = {w.x, w.y, w.z, w.w};
+__device__ __forceinline__ float dot32_g(const uint4 &w, const uint4 *x, const __half *word, const F4Packed &p = {},
+                                         uint32_t row = 0, uint32_t k32 = 0, uint32_t K32 = 0) {
+    if constexpr (is_f4(G)) {
+        const uint32_t b = f4_scale_word<G>(word, p, row, k32, K32), ws[4] = {w.x, w.y, w.z, w.w};
         float a[2] = {0.f, 0.f};
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -121,7 +145,7 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
                                                             const int32_t *offsets, const int32_t *tile_e,
                                                             const int32_t *tile_m0, const int32_t *ntiles,
                                                             const int32_t *pair_tok, const uint4 *bin, __half *h,
-                                                            const float *glob) {
+                                                            const float *glob, F4Packed pg, F4Packed pu) {
     constexpr int CH = H / 32;  // packed uint4 per weight row
     constexpr int S = scale_span(G);
     __shared__ __align__(16) __half As[MT][A_LD];
@@ -140,14 +164,16 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
     const int lb_row = (tid % 128) / 2, lb_part = tid % 2;
     const size_t wrow = size_t(e) * FFN + row0 + lb_row;
     const uint4 *b_src = (lb_up ? uw : gw) + wrow * CH;
-    const __half *b_sc = (lb_up ? us : gs) + wrow * (H / S);
+    const __half *b_sc = G == QGROUP_F4P ? nullptr : (lb_up ? us : gs) + wrow * (H / S);
+    const F4Packed &b_pk = lb_up ? pu : pg;
     __half *b_dst = (lb_up ? &Bu[lb_row][0] : &Bg[lb_row][0]) + lb_part * 32;
 
     float ag[4][2] = {}, au[4][2] = {};
     for (int k0 = 0; k0 < H; k0 += BK) {
         __syncthreads();
         *reinterpret_cast<uint4 *>(&As[la_tok][la_c * 8]) = a_src ? a_src[k0 / 8 + la_c] : make_uint4(0, 0, 0, 0);
-        dequant32_g<G>(b_src[k0 / 32 + lb_part], b_sc + (k0 + 32 * lb_part) / S, b_dst);
+        dequant32_g<G>(b_src[k0 / 32 + lb_part], b_sc + (k0 + 32 * lb_part) / S, b_dst, b_pk, uint32_t(wrow),
+                       uint32_t((k0 + 32 * lb_part) / 32), H / 32);
         __syncthreads();
 #pragma unroll 8
         for (int kk = 0; kk < BK; kk += 2) {
@@ -167,7 +193,7 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
             }
         }
     }
-    const float fg = G == QGROUP_F4 ? glob[e] : 1.f, fu = G == QGROUP_F4 ? glob[EXP_L + e] : 1.f;
+    const float fg = is_f4(G) ? glob[e] : 1.f, fu = is_f4(G) ? glob[EXP_L + e] : 1.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int tok = ty * 4 + i;
@@ -183,7 +209,7 @@ template <int G>
 __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const __half *ds, const int32_t *counts,
                                                          const int32_t *offsets, const int32_t *tile_e,
                                                          const int32_t *tile_m0, const int32_t *ntiles, const uint4 *h,
-                                                         __half *yp, const float *glob) {
+                                                         __half *yp, const float *glob, F4Packed pd) {
     constexpr int CH = FFN / 32;  // 20
     constexpr int S = scale_span(G);
     __shared__ __align__(16) __half As[MT][A_LD];
@@ -202,8 +228,9 @@ __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const 
     for (int k0 = 0; k0 < FFN; k0 += BK) {
         __syncthreads();
         *reinterpret_cast<uint4 *>(&As[la_tok][la_c * 8]) = a_src ? a_src[k0 / 8 + la_c] : make_uint4(0, 0, 0, 0);
-        dequant32_g<G>(dw[wrow * CH + k0 / 32 + lb_part], ds + wrow * (FFN / S) + (k0 + 32 * lb_part) / S,
-                       &Bs[lb_row][lb_part * 32]);
+        dequant32_g<G>(dw[wrow * CH + k0 / 32 + lb_part],
+                       G == QGROUP_F4P ? nullptr : ds + wrow * (FFN / S) + (k0 + 32 * lb_part) / S,
+                       &Bs[lb_row][lb_part * 32], pd, uint32_t(wrow), uint32_t((k0 + 32 * lb_part) / 32), FFN / 32);
         __syncthreads();
 #pragma unroll 8
         for (int kk = 0; kk < BK; kk += 2) {
@@ -218,7 +245,7 @@ __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const 
                 for (int j = 0; j < 4; ++j) acc[i][j] = dot2(a[i], b[j], acc[i][j]);
         }
     }
-    const float fd = G == QGROUP_F4 ? glob[2 * EXP_L + e] : 1.f;
+    const float fd = is_f4(G) ? glob[2 * EXP_L + e] : 1.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int tok = ty * 4 + i;
@@ -233,22 +260,24 @@ static void experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw
                       const uint32_t *dw, const uint16_t *ds, const int32_t *counts, const int32_t *offsets,
                       const int32_t *pair_tok, const uint16_t *bin, int max_tiles, const int32_t *tile_e,
                       const int32_t *tile_m0, const int32_t *ntiles, uint16_t *h, uint16_t *yp, hipStream_t s,
-                      const float *glob) {
+                      const float *glob, const F4Packed *pk) {
+    const F4Packed none{};
     moe_gate_up_T_kernel<G><<<dim3(max_tiles, FFN / 64), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(gw), reinterpret_cast<const __half *>(gs), reinterpret_cast<const uint4 *>(uw),
         reinterpret_cast<const __half *>(us), counts, offsets, tile_e, tile_m0, ntiles, pair_tok,
-        reinterpret_cast<const uint4 *>(bin), reinterpret_cast<__half *>(h), glob);
+        reinterpret_cast<const uint4 *>(bin), reinterpret_cast<__half *>(h), glob, pk ? pk[0] : none, pk ? pk[1] : none);
     moe_down_T_kernel<G><<<dim3(max_tiles, H / 128), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(dw), reinterpret_cast<const __half *>(ds), counts, offsets, tile_e, tile_m0,
-        ntiles, reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob);
+        ntiles, reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob, pk ? pk[2] : none);
 }
 
 void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *counts, const int32_t *offsets, const int32_t *pair_tok,
                    const uint16_t *bin, int T, int32_t *tiles, uint16_t *h, uint16_t *yp, hipStream_t s, int8_t *q8,
-                   float *q8s, int group, const float *glob) {
-    QW_CHECK(group == QGROUP || ((group == QGROUP_Z || group == QGROUP_F4) && !q8), "moe_experts_T: unsupported expert format");
-    QW_CHECK(group != QGROUP_F4 || glob, "moe_experts_T: NVFP4 experts need their scales per matrix");
+                   float *q8s, int group, const float *glob, const F4Packed *packed) {
+    QW_CHECK(group == QGROUP || ((group == QGROUP_Z || is_f4(group)) && !q8), "moe_experts_T: unsupported expert format");
+    QW_CHECK(!is_f4(group) || glob, "moe_experts_T: NVFP4 experts need their scales per matrix");
+    QW_CHECK(group != QGROUP_F4P || packed, "moe_experts_T: packed NVFP4 scales missing");
     const int max_tiles = T * TOP_K / MT + EXP_L;
     int32_t *tile_e = tiles, *tile_m0 = tiles + max_tiles, *ntiles = tiles + 2 * max_tiles;
     moe_tiles_kernel<<<1, 64, 0, s>>>(counts, tile_e, tile_m0, ntiles);
@@ -259,13 +288,16 @@ void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, c
     }
     if (group == QGROUP)
         experts_T<QGROUP>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles, h,
-                          yp, s, glob);
+                          yp, s, glob, packed);
     else if (group == QGROUP_Z)
         experts_T<QGROUP_Z>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles,
-                            h, yp, s, glob);
-    else
+                            h, yp, s, glob, packed);
+    else if (group == QGROUP_F4)
         experts_T<QGROUP_F4>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles,
-                             h, yp, s, glob);
+                             h, yp, s, glob, packed);
+    else
+        experts_T<QGROUP_F4P>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles,
+                              h, yp, s, glob, packed);
 }
 
 // Small batches (decode): one wave per (pair, output row), like the
@@ -290,7 +322,7 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
                                                             const int32_t *__restrict__ offsets,
                                                             const int32_t *__restrict__ pair_tok,
                                                             const uint4 *__restrict__ bin, __half *__restrict__ h,
-                                                            const float *__restrict__ glob) {
+                                                            const float *__restrict__ glob, F4Packed pg, F4Packed pu) {
     constexpr int CH = H / 32;
     constexpr int S = scale_span(G);
     const int p = blockIdx.y;
@@ -300,7 +332,8 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
     QW_DCHECK(offsets[EXP_L] <= 32 * TOP_K && e >= 0 && e < EXP_L && offsets[e] <= p && p < offsets[e + 1]);
     const size_t rbase = size_t(e) * FFN + row;
     const uint4 *g = gw + rbase * CH, *u = uw + rbase * CH;
-    const __half *gsc = gs + rbase * (H / S), *usc = us + rbase * (H / S);
+    const __half *gsc = G == QGROUP_F4P ? nullptr : gs + rbase * (H / S),
+                 *usc = G == QGROUP_F4P ? nullptr : us + rbase * (H / S);
     QW_DCHECK(pair_tok[p] >= 0 && pair_tok[p] < 32);
     const uint4 *x = bin + size_t(pair_tok[p]) * (H / 8);
     float ag = 0.f, au = 0.f;
@@ -308,12 +341,12 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
         const uint4 g0 = g[c], u0 = u[c];
         const uint4 *xc = x + c * 4;
         const int grp = c / (S / 32);
-        ag += dot32_g<G>(g0, xc, gsc + grp);
-        au += dot32_g<G>(u0, xc, usc + grp);
+        ag += dot32_g<G>(g0, xc, gsc + grp, pg, uint32_t(rbase), uint32_t(grp), H / 32);
+        au += dot32_g<G>(u0, xc, usc + grp, pu, uint32_t(rbase), uint32_t(grp), H / 32);
     }
     ag = wave_sum(ag);
     au = wave_sum(au);
-    if (G == QGROUP_F4) {
+    if (is_f4(G)) {
         ag *= glob[e];
         au *= glob[EXP_L + e];
     }
@@ -324,7 +357,7 @@ template <int G>
 __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict__ dw, const __half *__restrict__ ds,
                                                          const int32_t *__restrict__ offsets,
                                                          const uint4 *__restrict__ h, __half *__restrict__ yp,
-                                                         const float *__restrict__ glob) {
+                                                         const float *__restrict__ glob, F4Packed pd) {
     constexpr int CH = FFN / 32;  // 20 uint4 per row
     constexpr int S = scale_span(G);
     const int p = blockIdx.y;
@@ -335,35 +368,42 @@ __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict
     const size_t rbase = size_t(e) * H + row;
     float acc = 0.f;
     if (lane < CH)
-        acc = dot32_g<G>(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4, ds + rbase * (FFN / S) + lane / (S / 32));
+        acc = dot32_g<G>(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4,
+                         G == QGROUP_F4P ? nullptr : ds + rbase * (FFN / S) + lane / (S / 32), pd, uint32_t(rbase),
+                         uint32_t(lane), FFN / 32);
     acc = wave_sum(acc);
-    if (G == QGROUP_F4) acc *= glob[2 * EXP_L + e];
+    if (is_f4(G)) acc *= glob[2 * EXP_L + e];
     if (lane == 0) yp[size_t(p) * H + row] = __float2half(acc);
 }
 
 template <int G>
 static void experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us,
                       const uint32_t *dw, const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok,
-                      const uint16_t *bin, int T, uint16_t *h, uint16_t *yp, hipStream_t s, const float *glob) {
+                      const uint16_t *bin, int T, uint16_t *h, uint16_t *yp, hipStream_t s, const float *glob,
+                      const F4Packed *pk) {
+    const F4Packed none{};
     moe_gate_up_P_kernel<G><<<dim3(FFN / 8, T * TOP_K), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(gw), reinterpret_cast<const __half *>(gs), reinterpret_cast<const uint4 *>(uw),
         reinterpret_cast<const __half *>(us), offsets, pair_tok, reinterpret_cast<const uint4 *>(bin),
-        reinterpret_cast<__half *>(h), glob);
+        reinterpret_cast<__half *>(h), glob, pk ? pk[0] : none, pk ? pk[1] : none);
     moe_down_P_kernel<G><<<dim3(H / 8, T * TOP_K), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(dw), reinterpret_cast<const __half *>(ds), offsets,
-        reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob);
+        reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob, pk ? pk[2] : none);
 }
 
 void moe_experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok, const uint16_t *bin, int T,
-                   uint16_t *h, uint16_t *yp, hipStream_t s, int group, const float *glob) {
-    QW_CHECK(group == QGROUP || group == QGROUP_Z || (group == QGROUP_F4 && glob), "moe_experts_P: unsupported expert format");
+                   uint16_t *h, uint16_t *yp, hipStream_t s, int group, const float *glob, const F4Packed *packed) {
+    QW_CHECK(group == QGROUP || group == QGROUP_Z || (is_f4(group) && glob), "moe_experts_P: unsupported expert format");
+    QW_CHECK(group != QGROUP_F4P || packed, "moe_experts_P: packed NVFP4 scales missing");
     if (group == QGROUP)
-        experts_P<QGROUP>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
+        experts_P<QGROUP>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob, packed);
     else if (group == QGROUP_Z)
-        experts_P<QGROUP_Z>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
+        experts_P<QGROUP_Z>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob, packed);
+    else if (group == QGROUP_F4)
+        experts_P<QGROUP_F4>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob, packed);
     else
-        experts_P<QGROUP_F4>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
+        experts_P<QGROUP_F4P>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob, packed);
 }
 
 }  // namespace qw::gpu

@@ -38,6 +38,15 @@ void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t
                  unsigned long long *use = nullptr);
 
 // ---- routed experts (moe_experts.hip, moe_w4a8.hip)
+// NVFP4 experts' E4M3 scales packed (QGROUP_F4P): per row a base code and a 4-bit offset per scale, offset 15 meaning
+// "in the escape table" (0.25 bit per weight instead of 0.5; ~0.5-0.8% of the scales escape). One per projection.
+struct F4Packed {
+    const uint8_t *base = nullptr;  // [rows]: the E4M3 code of offset 0
+    const uint8_t *off = nullptr;   // [rows][K / 32]: two offsets, the first 16 inputs' in the low nibble
+    const uint32_t *key = nullptr;  // escape table, linear probing from (key * 0x9E3779B1) >> shift:
+    const uint8_t *val = nullptr;   //   key (row << 8 | scale index) + 1 (0: empty), val the E4M3 code
+    uint32_t shift = 32;
+};
 // For every (token, expert) pair: h[slot] = silu(gate x) * up x,
 // yp[slot] = down h (fp16). tiles: scratch of 2*(T*10/32 + 128) + 1 ints.
 // With q8 (int8 scratch >= T*10*640 bytes) and q8s (>= T*10*5 floats), runs
@@ -48,12 +57,14 @@ void moe_route_B(const float *logits, int M, int first, int32_t *counts, int32_t
 void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *counts, const int32_t *offsets, const int32_t *pair_tok,
                    const uint16_t *bin, int T, int32_t *tiles, uint16_t *h, uint16_t *yp, hipStream_t s,
-                   int8_t *q8 = nullptr, float *q8s = nullptr, int group = cfg::QGROUP, const float *glob = nullptr);
+                   int8_t *q8 = nullptr, float *q8s = nullptr, int group = cfg::QGROUP, const float *glob = nullptr,
+                   const F4Packed *packed = nullptr);  // QGROUP_F4P: [3] gate, up, down (gs, us, ds unused)
 // Same outputs as moe_experts_T (fp16 only) with GEMV-shaped kernels, one
 // wave per (pair, row): faster for small T (decode batches).
 void moe_experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok, const uint16_t *bin, int T,
-                   uint16_t *h, uint16_t *yp, hipStream_t s, int group = cfg::QGROUP, const float *glob = nullptr);
+                   uint16_t *h, uint16_t *yp, hipStream_t s, int group = cfg::QGROUP, const float *glob = nullptr,
+                   const F4Packed *packed = nullptr);
 
 // ---- shared expert and combine (moe_route.hip)
 // h[t][i] = fp16(silu(v[t][i]) * v[t][n+i] * sigmoid(v[t][2n])), v rows of ldv

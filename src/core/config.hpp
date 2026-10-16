@@ -90,7 +90,9 @@ inline int qz_nibble(uint16_t word) { return ((word >> 12) & 8) | (word & 7); }
 // scales of 32 inputs in one 16-bit word (the first 16 inputs' in the low byte), so its scale words are 32 inputs
 // apart, like QGROUP_Z's.
 constexpr int QGROUP_F4 = 16;
-constexpr int scale_span(int group) { return group == QGROUP_F4 ? 32 : group; }  // inputs per scale word
+// ... with the scales packed in VRAM (QW_F4_PACKED, the engine's own form, kernels/moe.hpp F4Packed): the same values.
+constexpr int QGROUP_F4P = 17;
+constexpr int scale_span(int group) { return group == QGROUP_F4 || group == QGROUP_F4P ? 32 : group; }  // inputs per word
 
 // PLE
 constexpr int PLE_LAYER = 1;  // 0-based
