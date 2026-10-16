@@ -8,15 +8,16 @@ the AWQ checkpoint's tensor names and types, with that model's (QAD-trained) val
     in the low nibble), weight_scale U8 [out][in / 16] (E4M3; the checkpoint's compressed "csf" scales expanded),
     weight_global F32 [1] (its weight_scale_2), weight_shape I64 [2]
   - the n-gram table -> a PLE sidecar, layout group16_nvfp4_e4m3scale: weight_f4 U8 [rows][80], weight_scale U8
-    [rows][10] (E4M3), weight_global F32 [1] per shard
+    [rows][10] (E4M3), weight_global F32 [1] per shard (the table has one FP32 scale: the same in every shard)
   - config.json: the AWQ one with quantization_config {"quant_method": "qw-nvfp4", ... "group_size": 16}
 
-  python3 tools/fp4_convert.py FP4_DIR AWQ_DIR OUT_DIR PLE_OUT_DIR
+  python3 tools/fp4_convert.py FP4_DIR AWQ_DIR OUT_DIR PLE_OUT_DIR [--ple-only]
 """
 import json, os, shutil, struct, sys
 import numpy as np
 
 FP4, AWQ, OUT, PLE_OUT = sys.argv[1:5]
+PLE_ONLY = "--ple-only" in sys.argv  # the checkpoint is converted already: only the PLE sidecar
 SHARD_BYTES = 4 << 30
 os.makedirs(OUT, exist_ok=True)
 os.makedirs(PLE_OUT, exist_ok=True)
@@ -137,7 +138,7 @@ def take(*names):
 
 EXPERT_PARTS = ("weight_packed", "weight_scale", "weight_shape")
 done_experts = set()
-for name in sorted(awq.idx):
+for name in [] if PLE_ONLY else sorted(awq.idx):
     _, am, _ = awq.meta(name)
     if ".mlp.experts." in name and name.startswith("model.language_model."):  # the routed experts: stay NVFP4
         p = name.rsplit(".", 1)[0] + "."
@@ -187,15 +188,17 @@ for name in sorted(awq.idx):
     put(name, am["dtype"], am["shape"], np.ascontiguousarray(v).tobytes())
 flush()
 
-# --- the n-gram table: a PLE sidecar
+# --- the n-gram table: a PLE sidecar (one FP32 scale for the whole table, ngram_embedding.weight_scale_2)
 ng = sorted((k for k in fp4.idx if ".ngram_embedding.shard_" in k and k.endswith(".weight")),
             key=lambda k: int(k.split(".shard_")[1].split(".")[0]))
+g_name = ng[0].split(".shard_")[0] + ".weight_scale_2"
+g = np.asarray(fp4.raw(g_name)[0]).astype(np.float32).reshape(1)
+take(g_name)
 rows = 0
 for k in ng:
     i, b = int(k.split(".shard_")[1].split(".")[0]), k[: -len(".weight")]
     w, wm = fp4.raw(k)
     s, _ = fp4.raw(b + ".weight_scale")
-    g = np.asarray(fp4.raw(b + ".weight_scale_2")[0]).astype(np.float32)
     rows += wm["shape"][0]
     tensors = [("weight_f4", "U8", wm["shape"], np.asarray(w).tobytes()),
                ("weight_scale", "U8", s.shape, np.asarray(s).tobytes()), ("weight_global", "F32", (1,), g.tobytes())]
@@ -210,10 +213,14 @@ for k in ng:
         for *_, by in tensors:
             f.write(by)
     os.replace(f"{PLE_OUT}/shard_{i}.safetensors.tmp", f"{PLE_OUT}/shard_{i}.safetensors")
-    take(k, b + ".weight_scale", b + ".weight_scale_2")
+    take(k, b + ".weight_scale")
 json.dump({"layout": "group16_nvfp4_e4m3scale", "shards": len(ng), "rows": rows, "width": 160},
           open(PLE_OUT + "/META.json", "w"))
 print(f"PLE: {len(ng)} shards, {rows} rows", flush=True)
+
+if PLE_ONLY:
+    print("done", flush=True)
+    sys.exit(0)
 
 # --- what was not used must be nothing but the activation scales
 left = sorted(k for k in fp4.idx if k not in used and not k.endswith(".input_scale"))
