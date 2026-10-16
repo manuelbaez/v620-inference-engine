@@ -64,10 +64,9 @@ __device__ __forceinline__ void e4m3x4_to_h2x2(uint32_t w, uint32_t &lo, uint32_
     hi = ((w >> 9) & 0x3F80u) | ((w >> 8) & 0x8000u) | ((w >> 1) & 0x3F800000u) | (w & 0x80000000u);
 }
 
-// 16 int8 (or E4M3) weights against 16 fp16 activations (two uint4).
+// 16 int8 (or E4M3) weights as 8 fp16 pairs.
 template <bool F8 = false>
-__device__ __forceinline__ float dot16_i8(const uint4 &w, const uint4 &x0, const uint4 &x1, float acc) {
-    uint32_t h[8];
+__device__ __forceinline__ void unpack16_i8(const uint4 &w, uint32_t h[8]) {
     if constexpr (F8) {
         e4m3x4_to_h2x2(w.x, h[0], h[1]);
         e4m3x4_to_h2x2(w.y, h[2], h[3]);
@@ -79,6 +78,10 @@ __device__ __forceinline__ float dot16_i8(const uint4 &w, const uint4 &x0, const
         i8x4_to_h2x2(w.z, h[4], h[5]);
         i8x4_to_h2x2(w.w, h[6], h[7]);
     }
+}
+
+// ... against 16 fp16 activations (two uint4).
+__device__ __forceinline__ float dot16_h(const uint32_t h[8], const uint4 &x0, const uint4 &x1, float acc) {
     acc = dot2(h[0], x0.x, acc);
     acc = dot2(h[1], x0.y, acc);
     acc = dot2(h[2], x0.z, acc);
@@ -106,22 +109,25 @@ __global__ __launch_bounds__(256) void gemv_rows_i8_kernel(const uint4 *__restri
     constexpr int CPG = I8_GROUP / 16;  // chunks per scale group
     int c = lane;
     for (; c + WAVE < chunks; c += 2 * WAVE) {
-        const uint4 w0 = w[c], w1 = w[c + WAVE];
+        uint32_t h0[8], h1[8];  // unpacked once for all M rows
+        unpack16_i8<F8>(w[c], h0);
+        unpack16_i8<F8>(w[c + WAVE], h1);
         const float s0 = sc[c / CPG], s1 = sc[(c + WAVE) / CPG];
 #pragma unroll
         for (int m = 0; m < M; ++m) {
             const uint4 *xm = x + size_t(m) * xs16;
-            acc[m] += s0 * dot16_i8<F8>(w0, xm[2 * c], xm[2 * c + 1], 0.f);
-            acc[m] += s1 * dot16_i8<F8>(w1, xm[2 * (c + WAVE)], xm[2 * (c + WAVE) + 1], 0.f);
+            acc[m] += s0 * dot16_h(h0, xm[2 * c], xm[2 * c + 1], 0.f);
+            acc[m] += s1 * dot16_h(h1, xm[2 * (c + WAVE)], xm[2 * (c + WAVE) + 1], 0.f);
         }
     }
     if (c < chunks) {
-        const uint4 w0 = w[c];
+        uint32_t h0[8];
+        unpack16_i8<F8>(w[c], h0);
         const float s0 = sc[c / CPG];
 #pragma unroll
         for (int m = 0; m < M; ++m) {
             const uint4 *xm = x + size_t(m) * xs16;
-            acc[m] += s0 * dot16_i8<F8>(w0, xm[2 * c], xm[2 * c + 1], 0.f);
+            acc[m] += s0 * dot16_h(h0, xm[2 * c], xm[2 * c + 1], 0.f);
         }
     }
 #pragma unroll
