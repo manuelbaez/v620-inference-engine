@@ -3148,3 +3148,45 @@ The two models differ a lot more than any precision change measured so far (int8
 better if anything, but not significantly on 4,000 tokens. Open: the engine against this reference (exactness), the
 options' speed, then the task benchmarks (GPQA Diamond, LiveCodeBench v6) against the AWQ runs.
 
+**On the GPUs (2026-10-16 window, production stopped; `~/fp4-win` on the dev box).**
+
+- *Exactness.* The AWQ path is bit-identical to the build before the FP4 work (`logits_dump`). The FP4 engine
+  against its fp32 reference: 0.038 mean |dlogprob|, 98.1% top-1 on 4,000 tokens (the AWQ engine against its own:
+  0.044): the NVFP4 expert path adds nothing beyond fp16. `QW_F4_PACKED=1` gives byte-identical log-probs in prefill
+  and in decode; `QW_DENSE_FP8=1` byte-identical prefill (the expanded matrices are the fp16 copies). Determinism:
+  6 repeats of speculative decoding, same tokens, and equal to plain greedy. `test_fp8_dense --gpu`: the expansion
+  bit for bit, the 8-bit GEMV within float rounding of the fp16 one. The branch-free E4M3 scale (45c0699) and the
+  GEMV unpacking once per block (5beea1c) are byte-identical too.
+- *8-bit dense decode accuracy.* Token-by-token decode against the reference: plain 0.0914, 8-bit dense 0.1048 on
+  tokens 1-1,000 (+0.013), but -0.004 on tokens 2,001-3,000: the two paths round differently and the recurrent
+  state carries any difference forward, so each span is one draw; no systematic loss (the token-level CI is too
+  narrow for a recurrent model).
+- *VRAM.* Per card after loading (one test slot): plain 9.82 GiB free, packed scales 10.54, both 11.06: the two
+  options save 1.24 GiB. Loading takes 144 s plain, +30 s with packing (pack_f4_scales sorts each row on one
+  thread), +15 s more with 8-bit dense (decoding the MXFP8 tensors).
+- *Prefill* (16,384 tokens, alternating): AWQ 2,408 / 2,400 tok/s, FP4 plain 2,293, FP4 with both options
+  2,257 / 2,275 (-6%), 281 against 263 mJ/token. Kernel trace (rocprofv3, 4 cards): the expert down kernel
+  takes 5.8 s against 4.2 (+39%) with a much wider spread per call (std 2.36 ms against 0.91), gate/up is faster
+  (7.8 s against 8.7), and the collective waits grow 2.6 s (the cards wait for the slowest): the gap is the down
+  kernel. Open: whether it is the kernel or its overlap with the other micro-batch (time it alone, single stream);
+  if fp16 subnormals (E2M1 x 2^-14), a 2^8 more in the per-matrix scale avoids them. Occupancy is not it (down
+  kernel 97 VGPRs, 9 waves per SIMD, against 89 / 10 with AWQ; gate/up 97 / 9 for both).
+- *Decode* (slots_decode_bench, ms per step at 16 x 1 / 8 x 2 / 4 x 4): AWQ 41.3 / 39.2 / 37.5, FP4 plain
+  41.3 / 39.4 / 38.4, 8-bit dense 43.8 / 41.5 / 40.4, packed 42.4 / 40.9 / 39.9, both 44.2 / 42.5 / 41.5. (Two
+  earlier runs with both gave 55.8 and 78.6 ms at 4 x 4; not reproduced twice with the same build: a disturbance.)
+  Single stream token by token, 8-bit dense is 9% faster (58.0 against 53.3 tok/s with log-probs). Decode trace:
+  FP4's per-row expert kernels take 13-19% longer than AWQ's (two scales per 32 weights, used once per step) but
+  the step is 60% collective waits; the 8-bit dense GEMV (`gemv_rows_i8`, the old int8 design) takes 8.5 s where
+  the fp16 `gemv_rows` took 6.9 s for the same matrices, despite half the bytes: its loop structure, not the format
+  (unpacking once per block changed nothing: the compiler did it already).
+- *MTP* (test_speculative, 4 prompts of DESIGN.md text, greedy, 256 tokens; FP4 with 8-bit dense and its own n-gram
+  table): tokens per verification step with 3 / 4 / 5 drafts, FP4's own head 2.28 / 2.38 / 2.47 (mean of the four
+  prompts), the original bf16 head (`QW_MTP_FROM`, the AWQ checkpoint's) 2.27 / 2.35 / 2.42, AWQ 2.39 / 2.53 /
+  2.63; the four together 218-221 tok/s in every case. The original head brings nothing; acceptance is a little
+  lower than AWQ's on average, by prompt either way. In this harness 3 drafts is the fastest single stream for both
+  models (production measured 5 faster with real sampling: not changed from this).
+
+Next: the E4M3 variant of `gemv_rows` itself (8 bytes per lane instead of 16, the same structure: should beat fp16
+at every row count); the down kernel timed alone; one scale conversion per lane and two running sums in the per-row
+expert kernels; then FP4 in production for the task benchmarks.
+
