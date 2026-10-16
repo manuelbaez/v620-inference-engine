@@ -4,7 +4,8 @@
 // In prefill the kernel trace showed the NVFP4 down kernel 39% slower than AWQ's, its calls spread much wider; this
 // tells a cost of the format from the overlap with the other micro-batch's kernels. Run under rocprofv3 --kernel-trace
 // --stats for gate/up and down separately.
-//   moe_format_bench [--tokens 2048] [--reps 50]
+// --contend: a second stream copies 512 MB back and forth meanwhile (memory traffic like the other micro-batch's).
+//   moe_format_bench [--tokens 2048] [--reps 50] [--contend]
 #include <hip/hip_runtime.h>
 
 #include <chrono>
@@ -37,10 +38,12 @@ T *dev(const std::vector<T> &v) {
 int main(int argc, char **argv) {
     try {
         int T = 2048, reps = 50;
-        for (int i = 1; i + 1 < argc; ++i) {
+        bool contend = false;
+        for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
-            if (a == "--tokens") T = std::atoi(argv[++i]);
-            if (a == "--reps") reps = std::atoi(argv[++i]);
+            if (a == "--tokens" && i + 1 < argc) T = std::atoi(argv[++i]);
+            if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
+            if (a == "--contend") contend = true;
         }
         CK(hipSetDevice(0));
         std::mt19937 rng(3);
@@ -108,6 +111,15 @@ int main(int argc, char **argv) {
             };
             for (int i = 0; i < 5; ++i) run();
             CK(hipDeviceSynchronize());
+            hipStream_t s2 = nullptr;
+            void *ca = nullptr, *cb = nullptr;
+            const size_t cbytes = size_t(512) << 20;
+            if (contend) {  // enough copies queued on another stream to outlast the timed calls
+                CK(hipStreamCreateWithFlags(&s2, hipStreamNonBlocking));
+                CK(hipMalloc(&ca, cbytes));
+                CK(hipMalloc(&cb, cbytes));
+                for (int i = 0; i < 4 * reps; ++i) CK(hipMemcpyAsync(i % 2 ? ca : cb, i % 2 ? cb : ca, cbytes, hipMemcpyDeviceToDevice, s2));
+            }
             hipEvent_t a, b;
             CK(hipEventCreate(&a));
             CK(hipEventCreate(&b));
@@ -117,7 +129,14 @@ int main(int argc, char **argv) {
             CK(hipEventSynchronize(b));
             float ms = 0;
             CK(hipEventElapsedTime(&ms, a, b));
-            std::printf("%-36s %d tokens: %.3f ms per call (tiles + gate/up + down)\n", f.name, T, ms / reps);
+            std::printf("%-36s %d tokens: %.3f ms per call (tiles + gate/up + down)%s\n", f.name, T, ms / reps,
+                        contend ? ", with copies on another stream" : "");
+            if (contend) {
+                CK(hipStreamSynchronize(s2));
+                CK(hipStreamDestroy(s2));
+                CK(hipFree(ca));
+                CK(hipFree(cb));
+            }
             for (void *p : {(void *)gw, (void *)uw, (void *)dw, (void *)gs, (void *)us, (void *)ds, (void *)glob})
                 CK(hipFree(p));
         }

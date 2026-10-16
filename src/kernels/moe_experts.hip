@@ -205,8 +205,10 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
 }
 
 // down: grid (max tiles, H / 128). tx owns rows tx, +32, +64, +96.
+// (10 waves per SIMD: the NVFP4 instance needed 97 VGPRs, one more than 10 waves allow; it then ran 50% slower next to
+// the other micro-batch's kernels in prefill. docs/DESIGN.md "The FP4 checkpoint")
 template <int G>
-__global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const __half *ds, const int32_t *counts,
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(10))) void moe_down_T_kernel(const uint4 *dw, const __half *ds, const int32_t *counts,
                                                          const int32_t *offsets, const int32_t *tile_e,
                                                          const int32_t *tile_m0, const int32_t *ntiles, const uint4 *h,
                                                          __half *yp, const float *glob, F4Packed pd) {
