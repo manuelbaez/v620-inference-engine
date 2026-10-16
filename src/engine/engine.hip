@@ -34,6 +34,10 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
     setenv("HSA_ENABLE_SDMA", "0", 0);
     expert_group_ = check_config(opt_.model_dir);
     st_.add_index(opt_.model_dir);
+    if (const char *mf = std::getenv("QW_MTP_FROM")) {  // (an experiment) another checkpoint's MTP head, e.g. the
+        st_.overlay(mf, "mtp.");                        // original bf16 one with the FP4 checkpoint's trunk
+        log("MTP head from %s", mf);
+    }
     ple_ = std::make_unique<PleTable>(opt_.ple_dir);
     // The n-gram table is reserved in RAM up front (mlock); QW_PLE_PIN=0 leaves it in page cache.
     {

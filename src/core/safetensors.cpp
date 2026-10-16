@@ -118,7 +118,7 @@ void MappedFile::prefetch() const {
     ::madvise(data_, size_, MADV_WILLNEED);
 }
 
-void SafeTensors::add_file(const std::string &path, bool replace) {
+void SafeTensors::add_file(const std::string &path, bool replace, const std::string &only) {
     files_.push_back(std::make_unique<MappedFile>(path));
     const MappedFile &f = *files_.back();
     QW_CHECK(f.size() >= 8, "safetensors too small: " + path);
@@ -129,7 +129,7 @@ void SafeTensors::add_file(const std::string &path, bool replace) {
     const uint8_t *base = f.data() + 8 + hlen;
     size_t body = f.size() - 8 - hlen;
     for (auto &kv : h.obj) {
-        if (kv.first == "__metadata__") continue;
+        if (kv.first == "__metadata__" || kv.first.rfind(only, 0) != 0) continue;
         TensorView t;
         t.name = kv.first;
         t.dtype = parse_dtype(kv.second["dtype"].as_str());
@@ -225,6 +225,17 @@ void SafeTensors::decode(const std::string &name, Decoded &d) const {
         for (size_t i = 0; i < m.size(); ++i) d.data[i] = f32_to_bf16(m[i]);
     }
     d.view = {name, DType::BF16, {rows, cols}, d.data.data(), d.data.size() * 2};
+}
+
+void SafeTensors::overlay(const std::string &dir, const std::string &prefix) {
+    for (auto it = tensors_.begin(); it != tensors_.end();)
+        it = it->first.rfind(prefix, 0) == 0 ? tensors_.erase(it) : std::next(it);
+    Json idx = Json::parse(read_file(dir + "/model.safetensors.index.json"));
+    std::set<std::string> files;
+    for (auto &kv : idx["weight_map"].obj)
+        if (kv.first.rfind(prefix, 0) == 0) files.insert(kv.second.as_str());
+    QW_CHECK(!files.empty(), dir + ": no tensors named " + prefix + "...");
+    for (auto &f : files) add_file(dir + "/" + f, false, prefix);
 }
 
 const TensorView &SafeTensors::get(const std::string &name) const {

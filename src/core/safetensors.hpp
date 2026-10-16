@@ -58,10 +58,14 @@ class SafeTensors {
 public:
     // Opens one file and indexes its tensors. With `replace`, its tensors take the place of those already indexed
     // under the same name (an overlay for experiments); otherwise a repeated name is an error.
-    void add_file(const std::string &path, bool replace = false);
+    // With `only`, just the tensors whose names start with it.
+    void add_file(const std::string &path, bool replace = false, const std::string &only = "");
     // Opens every *.safetensors file named in <dir>/model.safetensors.index.json,
     // plus any extra files given.
     void add_index(const std::string &dir, const std::vector<std::string> &extra = {});
+    // Every tensor whose name starts with `prefix` from the checkpoint in `dir` instead of this one's (whose tensors of
+    // that prefix are dropped first): e.g. another checkpoint's MTP head (QW_MTP_FROM).
+    void overlay(const std::string &dir, const std::string &prefix);
 
     const std::vector<std::unique_ptr<MappedFile>> &files() const { return files_; }
     bool has(const std::string &name) const { return tensors_.count(name) != 0 || synthesized(name); }

@@ -128,6 +128,7 @@ int main(int argc, char **argv) {
     bool session_only = false;
     EngineOptions opt;
     opt.slot_tokens = {32768, 32768, 32768, 32768};
+    if (const char *d = std::getenv("QW_PLE_DIR")) opt.ple_dir = d;  // like the benchmarks
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&] { return std::string(argv[++i]); };
