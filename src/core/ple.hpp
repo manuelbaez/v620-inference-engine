@@ -66,8 +66,12 @@ private:
     // low nibble first, stored + 8), group16_int8_fp16scale (weight_i8 i8 [rows][160]),
     // both with weight_scale f16 [rows][10]; bf16 (weight bf16 [rows][160]); or
     // f8e4m3_tensorscale (weight_f8 u8 [rows][160] of fp8 e4m3, times META.json "scale":
-    // the official FP8 checkpoint's table, one scale for all of it).
-    enum class Layout { Int4, Int8, Bf16, F8 } layout_ = Layout::Int4;
+    // the official FP8 checkpoint's table, one scale for all of it); or group16_nvfp4_e4m3scale (weight_f4 u8
+    // [rows][80] of E2M1, the even value in the low nibble, weight_scale u8 [rows][10] of E4M3, weight_global f32 [1]
+    // per shard: the table of nvidia/Qwen3.8-Flash-Next-FP4-Local, tools/fp4_convert.py).
+    enum class Layout { Int4, Int8, Bf16, F8, F4 } layout_ = Layout::Int4;
+    std::vector<const uint8_t *> scale8_;  // per shard: F4's E4M3 scales
+    std::vector<float> global_;            // per shard: F4's scale
     std::array<float, 256> f8_{};  // F8: each e4m3 byte's value times the scale
     int64_t rows_ = 0, rows_per_shard_ = 0;
     std::vector<std::unique_ptr<SafeTensors>> shards_;

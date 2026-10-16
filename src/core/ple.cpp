@@ -135,11 +135,13 @@ PleTable::PleTable(const std::string &dir) {
         layout_ = Layout::Bf16;
     else if (layout == "f8e4m3_tensorscale")
         layout_ = Layout::F8;
+    else if (layout == "group16_nvfp4_e4m3scale")
+        layout_ = Layout::F4;
     else
         fail("PLE sidecar: unsupported layout " + layout);
     QW_CHECK(meta["width"].as_int() == cfg::NGRAM_DIM, "PLE sidecar: width");
-    if (layout_ == Layout::F8) {
-        const float scale = float(meta["scale"].as_double());
+    if (layout_ == Layout::F8 || layout_ == Layout::F4) {  // F4: the E4M3 scales' values
+        const float scale = layout_ == Layout::F8 ? float(meta["scale"].as_double()) : 1.f;
         for (int b = 0; b < 256; ++b) f8_[size_t(b)] = f8e4m3_to_f32(uint8_t(b)) * scale;
     }
     rows_ = meta["rows"].as_int();
@@ -151,12 +153,13 @@ PleTable::PleTable(const std::string &dir) {
         const char *name = layout_ == Layout::Int4 ? "weight_i4"
                            : layout_ == Layout::Int8 ? "weight_i8"
                            : layout_ == Layout::F8   ? "weight_f8"
+                           : layout_ == Layout::F4   ? "weight_f4"
                                                      : "weight";
         const TensorView &q = st->get(name);
-        const DType want = layout_ == Layout::Int4 || layout_ == Layout::F8 ? DType::U8
-                           : layout_ == Layout::Int8                        ? DType::I8
-                                                                            : DType::BF16;
-        const int64_t width = layout_ == Layout::Int4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
+        const DType want = layout_ == Layout::Int4 || layout_ == Layout::F8 || layout_ == Layout::F4 ? DType::U8
+                           : layout_ == Layout::Int8                                                ? DType::I8
+                                                                                                    : DType::BF16;
+        const int64_t width = layout_ == Layout::Int4 || layout_ == Layout::F4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
         QW_CHECK(q.dtype == want && q.dim(1) == width, "PLE shard layout");
         QW_CHECK(q.dim(0) == rows_per_shard_ || s == n_shards - 1, "PLE shard row count");
         q_.push_back(q.u8());
@@ -164,6 +167,15 @@ PleTable::PleTable(const std::string &dir) {
             const TensorView &sc = st->get("weight_scale");
             QW_CHECK(sc.dtype == DType::F16 && sc.dim(1) == cfg::NGRAM_DIM / 16, "PLE scale layout");
             scale_.push_back(sc.u16());
+        }
+        if (layout_ == Layout::F4) {
+            const TensorView &sc = st->get("weight_scale");
+            QW_CHECK(sc.dtype == DType::U8 && sc.dim(1) == cfg::NGRAM_DIM / 16 && sc.dim(0) == q.dim(0),
+                     "PLE scale layout");
+            const TensorView &g = st->get("weight_global");
+            QW_CHECK(g.dtype == DType::F32 && g.numel() == 1, "PLE global scale");
+            scale8_.push_back(sc.u8());
+            global_.push_back(g.f32()[0]);
         }
         shards_.push_back(std::move(st));
     }
@@ -184,6 +196,19 @@ void PleTable::row(int64_t id, float *out) const {
     if (layout_ == Layout::F8) {
         const uint8_t *v = q_[size_t(s)] + r * cfg::NGRAM_DIM;
         for (int j = 0; j < cfg::NGRAM_DIM; ++j) out[j] = f8_[v[j]];
+        return;
+    }
+    if (layout_ == Layout::F4) {
+        static constexpr float E2M1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+        const uint8_t *q = q_[size_t(s)] + r * (cfg::NGRAM_DIM / 2), *sc = scale8_[size_t(s)] + r * (cfg::NGRAM_DIM / 16);
+        for (int g = 0; g < cfg::NGRAM_DIM / 16; ++g) {
+            const float scale = f8_[sc[g]] * global_[size_t(s)];
+            for (int j = 0; j < 8; ++j) {
+                const uint8_t b = q[g * 8 + j];
+                out[g * 16 + 2 * j] = E2M1[b & 0xf] * scale;
+                out[g * 16 + 2 * j + 1] = E2M1[b >> 4] * scale;
+            }
+        }
         return;
     }
     const uint16_t *sc = scale_[size_t(s)] + r * (cfg::NGRAM_DIM / 16);

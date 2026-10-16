@@ -1,6 +1,7 @@
 """Downloads the routed experts of some layers from another 4-bit quantization of the model on Hugging Face
-(compressed-tensors `pack-quantized`, with or without zero points, any group size), dequantizes them to bf16 as a
-loader of that checkpoint would, and writes them in tools/expert_download.py's layout, so that the fp32 reference runs
+(compressed-tensors `pack-quantized`, with or without zero points, any group size; or ModelOpt NVFP4, E2M1 values with
+an E4M3 scale per 16 inputs, plain or compressed "csf", and an FP32 scale per matrix, e.g.
+nvidia/Qwen3.8-Flash-Next-FP4-Local), dequantizes them to bf16 as a loader of that checkpoint would, and writes them in tools/expert_download.py's layout, so that the fp32 reference runs
 with them through QW_REF_EXPERTS_DIR (docs/DESIGN.md "Another 4-bit quantization of the experts"). With ORIG (the
 original experts, tools/expert_download.py) it also prints the relative error of the weights against them.
 
@@ -71,7 +72,41 @@ def to_bf16(x):  # float32 -> uint16 bf16, round to nearest even
     u = x.view(np.uint32)
     return ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
 
+E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
+
+def e4m3(b):  # uint8 E4M3 (fn: no infinities) -> float32
+    b = b.astype(np.int32)
+    s, ex, m = np.where(b & 0x80, -1.0, 1.0), (b >> 3) & 15, b & 7
+    v = np.where(ex == 0, m / 8.0 * 2.0 ** -6, (1 + m / 8.0) * 2.0 ** (ex - 7))
+    return (s * v).astype(np.float32)
+
+def csf_scales(t, p, rows, cols):  # NVFP4 "csf" block scales -> uint8 E4M3 [rows][cols]: per slab of 16 rows, a base
+    # byte per row and a 4-bit offset per scale (two per byte, the even column in the low nibble), then exceptions:
+    # uint32 words, the flat position in the low 24 bits and the byte in the high 8 (local-inference-lab/b12x, codec 0)
+    f = np.frombuffer(t[p + "weight_scale.nvfp4_csf_fixed"][0], dtype=np.uint8).reshape(rows // 16, 16 + 8 * cols)
+    base, packed = f[:, :16].reshape(rows, 1), f[:, 16:].reshape(rows, cols // 2)
+    diff = np.empty((rows, cols), dtype=np.uint8)
+    diff[:, 0::2], diff[:, 1::2] = packed & 15, packed >> 4
+    s = (base.astype(np.int32) + diff).astype(np.uint8)
+    x = np.frombuffer(t[p + "weight_scale.nvfp4_csf_exceptions"][0], dtype="<u4")
+    s.ravel()[x & 0xFFFFFF] = (x >> 24).astype(np.uint8)
+    return s
+
+def nvfp4(t, p):  # dequantized [out][in] fp32: E2M1 (the even input in the low nibble) x E4M3 per 16 x FP32 per matrix
+    q = np.frombuffer(t[p + "weight"][0], dtype=np.uint8).reshape(t[p + "weight"][1]["shape"])
+    rows, n = q.shape[0], 2 * q.shape[1]
+    v = np.empty((rows, n), dtype=np.float32)
+    v[:, 0::2], v[:, 1::2] = E2M1[q & 15], E2M1[q >> 4]
+    if p + "weight_scale.nvfp4_csf_fixed" in t:
+        sb = csf_scales(t, p, rows, n // 16)
+    else:
+        sb = np.frombuffer(t[p + "weight_scale"][0], dtype=np.uint8).reshape(rows, n // 16)
+    g = float(np.frombuffer(t[p + "weight_scale_2"][0], dtype=np.float32)[0])
+    return v * np.repeat(e4m3(sb), 16, axis=1) * g
+
 def matrix(t, p):  # dequantized [out][in] fp32
+    if p + "weight_scale_2" in t:
+        return nvfp4(t, p)
     out, n = (int(v) for v in np.frombuffer(t[p + "weight_shape"][0], dtype=np.int64))
     q = nibbles(*t[p + "weight_packed"], n)
     sbuf, smeta = t[p + "weight_scale"]

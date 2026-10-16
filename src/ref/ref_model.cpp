@@ -133,9 +133,29 @@ void Model::linear(const TensorView &w, const float *x, int T, int ldx, float *y
 }
 
 // Same for a compressed-tensors int4 expert matrix `proj`weight_packed: (nibble - 8 - zero point) * scale, a bf16
-// scale per group of inputs (128, or 32 in the checkpoints with zero points, whose nibbles are packed along the rows).
+// scale per group of inputs (128, or 32 in the checkpoints with zero points, whose nibbles are packed along the rows);
+// or NVFP4 (tools/fp4_convert.py): E2M1 nibble * its E4M3 scale per 16 inputs * the matrix's FP32 weight_global.
 void Model::expert_linear(const std::string &proj, int out, int in, const float *x, int T, int ldx, float *y, int ldy) {
     const TensorView &scale = st_.get(proj + "weight_scale");
+    if (scale.dtype == DType::U8) {
+        static constexpr float E2M1[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+        QW_CHECK(scale.dim(0) == out && scale.dim(1) == in / 16, scale.name + ": NVFP4 scale shape");
+        const uint8_t *P = reinterpret_cast<const uint8_t *>(st_.get(proj + "weight_packed", DType::I32, {out, in / 8}).i32());
+        const float glob = st_.get(proj + "weight_global", DType::F32, {1}).f32()[0];
+        pool_.parallel_for(out, 16, [&](int64_t b, int64_t e) {
+            std::vector<float> row(static_cast<size_t>(in));
+            for (int64_t o = b; o < e; ++o) {
+                const uint8_t *p = P + o * (in / 2), *s = scale.u8() + o * (in / 16);
+                for (int i = 0; i < in / 2; ++i) {
+                    const float sc = f8e4m3_to_f32(s[i / 8]) * glob;
+                    row[size_t(2 * i)] = E2M1[p[i] & 0xf] * sc;
+                    row[size_t(2 * i + 1)] = E2M1[p[i] >> 4] * sc;
+                }
+                for (int t = 0; t < T; ++t) y[size_t(t) * ldy + o] = dot(row.data(), x + size_t(t) * ldx, in);
+            }
+        });
+        return;
+    }
     QW_CHECK(scale.dtype == DType::BF16 && scale.dim(0) == out && in % scale.dim(1) == 0, scale.name + ": scale shape");
     const int groups = int(scale.dim(1)), group = in / groups;
     QW_CHECK(group % 8 == 0, scale.name + ": group size");

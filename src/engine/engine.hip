@@ -149,7 +149,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
                 const double gib = double(1ull << 30);
                 // experts with a scale word per 32 inputs: 2 bytes per 32 weights of a card's 128 experts, not per 128
                 const double expert_scales = expert_group_ == QGROUP ? 0.0 :
-                    double(N_LAYERS) * EXP_L * 3.0 * FFN * H * 2.0 * (1.0 / expert_group_ - 1.0 / QGROUP) / gib;
+                    double(N_LAYERS) * EXP_L * 3.0 * FFN * H * 2.0 * (1.0 / scale_span(expert_group_) - 1.0 / QGROUP) / gib;
                 const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales;
                 const double scoring = 6144.0 * double(max_slot_tokens() / IDX_RATIO) / gib;
                 const double est = double(total_b) / gib - base - double(slot_vram_bytes(opt_, mtp_)) / gib - scoring;

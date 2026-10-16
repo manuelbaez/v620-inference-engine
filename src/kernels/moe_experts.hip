@@ -57,6 +57,62 @@ __device__ __forceinline__ void dequant32(const uint4 &w, const GroupScale gs, _
         }
 }
 
+// NVFP4 (QGROUP_F4). E2M1 pairs in the low nibbles of each 16-bit half (bits 0-3, 16-19, as nib2_to_h2) -> fp16 of
+// value x 2^-14, exactly: the sign to bit 15, exponent and mantissa bit to bits 9-11 (exponent 0 reads as subnormal).
+__device__ __forceinline__ uint32_t fp4_2_to_h2(uint32_t w) {
+    return ((w & 0x00070007u) << 9) | ((w & 0x00080008u) << 12);
+}
+// An E4M3 scale byte -> fp16 of value x 2^7 (exact: 3 mantissa bits, 448 x 128 < 65504). Times an E2M1 value x 2^-14
+// that gives value x scale x 2^-7, exact in fp16 too (at most 5 significant bits, >= 2^-17); the 2^7 is in the FP32
+// scale per matrix (Rank weights `eglob`).
+__device__ __forceinline__ _Float16 e4m3_x128(uint32_t b) {
+    const uint32_t e = (b >> 3) & 15, m = b & 7;
+    const _Float16 v = e ? __builtin_bit_cast(_Float16, uint16_t(((e + 15) << 10) | (m << 7))) : (_Float16)(0.25f * float(m));
+    return (b & 0x80) ? -v : v;
+}
+__device__ __forceinline__ void dequant32_f4(const uint4 &w, uint32_t word, __half *dst) {
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const _Float16 s0 = e4m3_x128(word & 0xff), s1 = e4m3_x128((word >> 8) & 0xff);
+    const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+    uint32_t *d2 = reinterpret_cast<uint32_t *>(dst);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const h2 sc = i < 2 ? h2{s0, s0} : h2{s1, s1};  // words 0-1: inputs 0-15, words 2-3: 16-31
+#pragma unroll
+        for (int sh = 0; sh < 4; ++sh)
+            d2[i * 4 + sh] = __builtin_bit_cast(uint32_t, __builtin_bit_cast(h2, fp4_2_to_h2(ws[i] >> (4 * sh))) * sc);
+    }
+}
+// One uint4 of weights (32 inputs) into LDS halves, with the group's scale word.
+template <int G>
+__device__ __forceinline__ void dequant32_g(const uint4 &w, const __half *word, __half *dst) {
+    if constexpr (G == QGROUP_F4)
+        dequant32_f4(w, *reinterpret_cast<const uint16_t *>(word), dst);
+    else
+        dequant32(w, group_scale<G>(word), dst);
+}
+// ... and against 32 fp16 activations (the P kernels), scale included.
+template <int G>
+__device__ __forceinline__ float dot32_g(const uint4 &w, const uint4 *x, const __half *word) {
+    if constexpr (G == QGROUP_F4) {
+        const uint32_t b = *reinterpret_cast<const uint16_t *>(word), ws[4] = {w.x, w.y, w.z, w.w};
+        float a[2] = {0.f, 0.f};
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint4 xv = x[i];
+            float &acc = a[i / 2];
+            acc = dot2(fp4_2_to_h2(ws[i]), xv.x, acc);
+            acc = dot2(fp4_2_to_h2(ws[i] >> 4), xv.y, acc);
+            acc = dot2(fp4_2_to_h2(ws[i] >> 8), xv.z, acc);
+            acc = dot2(fp4_2_to_h2(ws[i] >> 12), xv.w, acc);
+        }
+        return a[0] * float(e4m3_x128(b & 0xff)) + a[1] * float(e4m3_x128(b >> 8));
+    } else {
+        const GroupScale gs = group_scale<G>(word);
+        return float(gs.scale) * dot_int4x32(w, x, 0.f, gs.off);
+    }
+}
+
 // gate/up: grid (max tiles, FFN / 64). 256 threads: ty = tid/32 owns tokens
 // ty*4..+3, tx = tid%32 owns rows tx and tx+32 (of gate and of up).
 template <int G>
@@ -64,8 +120,10 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
                                                             const __half *us, const int32_t *counts,
                                                             const int32_t *offsets, const int32_t *tile_e,
                                                             const int32_t *tile_m0, const int32_t *ntiles,
-                                                            const int32_t *pair_tok, const uint4 *bin, __half *h) {
+                                                            const int32_t *pair_tok, const uint4 *bin, __half *h,
+                                                            const float *glob) {
     constexpr int CH = H / 32;  // packed uint4 per weight row
+    constexpr int S = scale_span(G);
     __shared__ __align__(16) __half As[MT][A_LD];
     __shared__ __half Bg[64][B_LD], Bu[64][B_LD];
     const int tile = blockIdx.x;
@@ -82,14 +140,14 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
     const int lb_row = (tid % 128) / 2, lb_part = tid % 2;
     const size_t wrow = size_t(e) * FFN + row0 + lb_row;
     const uint4 *b_src = (lb_up ? uw : gw) + wrow * CH;
-    const __half *b_sc = (lb_up ? us : gs) + wrow * (H / G);
+    const __half *b_sc = (lb_up ? us : gs) + wrow * (H / S);
     __half *b_dst = (lb_up ? &Bu[lb_row][0] : &Bg[lb_row][0]) + lb_part * 32;
 
     float ag[4][2] = {}, au[4][2] = {};
     for (int k0 = 0; k0 < H; k0 += BK) {
         __syncthreads();
         *reinterpret_cast<uint4 *>(&As[la_tok][la_c * 8]) = a_src ? a_src[k0 / 8 + la_c] : make_uint4(0, 0, 0, 0);
-        dequant32(b_src[k0 / 32 + lb_part], group_scale<G>(b_sc + (k0 + 32 * lb_part) / G), b_dst);
+        dequant32_g<G>(b_src[k0 / 32 + lb_part], b_sc + (k0 + 32 * lb_part) / S, b_dst);
         __syncthreads();
 #pragma unroll 8
         for (int kk = 0; kk < BK; kk += 2) {
@@ -109,13 +167,14 @@ __global__ __launch_bounds__(256) void moe_gate_up_T_kernel(const uint4 *gw, con
             }
         }
     }
+    const float fg = G == QGROUP_F4 ? glob[e] : 1.f, fu = G == QGROUP_F4 ? glob[EXP_L + e] : 1.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int tok = ty * 4 + i;
         if (tok >= mt) continue;
 #pragma unroll
         for (int j = 0; j < 2; ++j)
-            h[size_t(base + tok) * FFN + row0 + tx + 32 * j] = __float2half(silu(ag[i][j]) * au[i][j]);
+            h[size_t(base + tok) * FFN + row0 + tx + 32 * j] = __float2half(silu(ag[i][j] * fg) * (au[i][j] * fu));
     }
 }
 
@@ -124,8 +183,9 @@ template <int G>
 __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const __half *ds, const int32_t *counts,
                                                          const int32_t *offsets, const int32_t *tile_e,
                                                          const int32_t *tile_m0, const int32_t *ntiles, const uint4 *h,
-                                                         __half *yp) {
+                                                         __half *yp, const float *glob) {
     constexpr int CH = FFN / 32;  // 20
+    constexpr int S = scale_span(G);
     __shared__ __align__(16) __half As[MT][A_LD];
     __shared__ __half Bs[128][B_LD];
     const int tile = blockIdx.x;
@@ -142,8 +202,8 @@ __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const 
     for (int k0 = 0; k0 < FFN; k0 += BK) {
         __syncthreads();
         *reinterpret_cast<uint4 *>(&As[la_tok][la_c * 8]) = a_src ? a_src[k0 / 8 + la_c] : make_uint4(0, 0, 0, 0);
-        dequant32(dw[wrow * CH + k0 / 32 + lb_part], group_scale<G>(ds + wrow * (FFN / G) + (k0 + 32 * lb_part) / G),
-                  &Bs[lb_row][lb_part * 32]);
+        dequant32_g<G>(dw[wrow * CH + k0 / 32 + lb_part], ds + wrow * (FFN / S) + (k0 + 32 * lb_part) / S,
+                       &Bs[lb_row][lb_part * 32]);
         __syncthreads();
 #pragma unroll 8
         for (int kk = 0; kk < BK; kk += 2) {
@@ -158,12 +218,13 @@ __global__ __launch_bounds__(256) void moe_down_T_kernel(const uint4 *dw, const 
                 for (int j = 0; j < 4; ++j) acc[i][j] = dot2(a[i], b[j], acc[i][j]);
         }
     }
+    const float fd = G == QGROUP_F4 ? glob[2 * EXP_L + e] : 1.f;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int tok = ty * 4 + i;
         if (tok >= mt) continue;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) yp[size_t(base + tok) * H + row0 + tx + 32 * j] = __float2half(acc[i][j]);
+        for (int j = 0; j < 4; ++j) yp[size_t(base + tok) * H + row0 + tx + 32 * j] = __float2half(acc[i][j] * fd);
     }
 }
 
@@ -171,21 +232,23 @@ template <int G>
 static void experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us,
                       const uint32_t *dw, const uint16_t *ds, const int32_t *counts, const int32_t *offsets,
                       const int32_t *pair_tok, const uint16_t *bin, int max_tiles, const int32_t *tile_e,
-                      const int32_t *tile_m0, const int32_t *ntiles, uint16_t *h, uint16_t *yp, hipStream_t s) {
+                      const int32_t *tile_m0, const int32_t *ntiles, uint16_t *h, uint16_t *yp, hipStream_t s,
+                      const float *glob) {
     moe_gate_up_T_kernel<G><<<dim3(max_tiles, FFN / 64), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(gw), reinterpret_cast<const __half *>(gs), reinterpret_cast<const uint4 *>(uw),
         reinterpret_cast<const __half *>(us), counts, offsets, tile_e, tile_m0, ntiles, pair_tok,
-        reinterpret_cast<const uint4 *>(bin), reinterpret_cast<__half *>(h));
+        reinterpret_cast<const uint4 *>(bin), reinterpret_cast<__half *>(h), glob);
     moe_down_T_kernel<G><<<dim3(max_tiles, H / 128), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(dw), reinterpret_cast<const __half *>(ds), counts, offsets, tile_e, tile_m0,
-        ntiles, reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp));
+        ntiles, reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob);
 }
 
 void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *counts, const int32_t *offsets, const int32_t *pair_tok,
                    const uint16_t *bin, int T, int32_t *tiles, uint16_t *h, uint16_t *yp, hipStream_t s, int8_t *q8,
-                   float *q8s, int group) {
-    QW_CHECK(group == QGROUP || (group == QGROUP_Z && !q8), "moe_experts_T: unsupported expert format");
+                   float *q8s, int group, const float *glob) {
+    QW_CHECK(group == QGROUP || ((group == QGROUP_Z || group == QGROUP_F4) && !q8), "moe_experts_T: unsupported expert format");
+    QW_CHECK(group != QGROUP_F4 || glob, "moe_experts_T: NVFP4 experts need their scales per matrix");
     const int max_tiles = T * TOP_K / MT + EXP_L;
     int32_t *tile_e = tiles, *tile_m0 = tiles + max_tiles, *ntiles = tiles + 2 * max_tiles;
     moe_tiles_kernel<<<1, 64, 0, s>>>(counts, tile_e, tile_m0, ntiles);
@@ -196,10 +259,13 @@ void moe_experts_T(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, c
     }
     if (group == QGROUP)
         experts_T<QGROUP>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles, h,
-                          yp, s);
-    else
+                          yp, s, glob);
+    else if (group == QGROUP_Z)
         experts_T<QGROUP_Z>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles,
-                            h, yp, s);
+                            h, yp, s, glob);
+    else
+        experts_T<QGROUP_F4>(gw, gs, uw, us, dw, ds, counts, offsets, pair_tok, bin, max_tiles, tile_e, tile_m0, ntiles,
+                             h, yp, s, glob);
 }
 
 // Small batches (decode): one wave per (pair, output row), like the
@@ -223,8 +289,10 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
                                                             const uint4 *__restrict__ uw, const __half *__restrict__ us,
                                                             const int32_t *__restrict__ offsets,
                                                             const int32_t *__restrict__ pair_tok,
-                                                            const uint4 *__restrict__ bin, __half *__restrict__ h) {
+                                                            const uint4 *__restrict__ bin, __half *__restrict__ h,
+                                                            const float *__restrict__ glob) {
     constexpr int CH = H / 32;
+    constexpr int S = scale_span(G);
     const int p = blockIdx.y;
     if (p >= offsets[EXP_L]) return;
     const int lane = threadIdx.x % WAVE, row = blockIdx.x * 8 + threadIdx.x / WAVE;
@@ -232,28 +300,33 @@ __global__ __launch_bounds__(256) void moe_gate_up_P_kernel(const uint4 *__restr
     QW_DCHECK(offsets[EXP_L] <= 32 * TOP_K && e >= 0 && e < EXP_L && offsets[e] <= p && p < offsets[e + 1]);
     const size_t rbase = size_t(e) * FFN + row;
     const uint4 *g = gw + rbase * CH, *u = uw + rbase * CH;
-    const __half *gsc = gs + rbase * (H / G), *usc = us + rbase * (H / G);
+    const __half *gsc = gs + rbase * (H / S), *usc = us + rbase * (H / S);
     QW_DCHECK(pair_tok[p] >= 0 && pair_tok[p] < 32);
     const uint4 *x = bin + size_t(pair_tok[p]) * (H / 8);
     float ag = 0.f, au = 0.f;
     for (int c = lane; c < CH; c += WAVE) {
         const uint4 g0 = g[c], u0 = u[c];
         const uint4 *xc = x + c * 4;
-        const int grp = c / (G / 32);
-        const GroupScale sg = group_scale<G>(gsc + grp), su = group_scale<G>(usc + grp);
-        ag += float(sg.scale) * dot_int4x32(g0, xc, 0.f, sg.off);
-        au += float(su.scale) * dot_int4x32(u0, xc, 0.f, su.off);
+        const int grp = c / (S / 32);
+        ag += dot32_g<G>(g0, xc, gsc + grp);
+        au += dot32_g<G>(u0, xc, usc + grp);
     }
     ag = wave_sum(ag);
     au = wave_sum(au);
+    if (G == QGROUP_F4) {
+        ag *= glob[e];
+        au *= glob[EXP_L + e];
+    }
     if (lane == 0) h[size_t(p) * FFN + row] = __float2half(silu(ag) * au);
 }
 
 template <int G>
 __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict__ dw, const __half *__restrict__ ds,
                                                          const int32_t *__restrict__ offsets,
-                                                         const uint4 *__restrict__ h, __half *__restrict__ yp) {
+                                                         const uint4 *__restrict__ h, __half *__restrict__ yp,
+                                                         const float *__restrict__ glob) {
     constexpr int CH = FFN / 32;  // 20 uint4 per row
+    constexpr int S = scale_span(G);
     const int p = blockIdx.y;
     if (p >= offsets[EXP_L]) return;
     const int lane = threadIdx.x % WAVE, row = blockIdx.x * 8 + threadIdx.x / WAVE;
@@ -261,35 +334,36 @@ __global__ __launch_bounds__(256) void moe_down_P_kernel(const uint4 *__restrict
     QW_DCHECK(offsets[EXP_L] <= 32 * TOP_K && e >= 0 && e < EXP_L && offsets[e] <= p && p < offsets[e + 1]);
     const size_t rbase = size_t(e) * H + row;
     float acc = 0.f;
-    if (lane < CH) {
-        const GroupScale sd = group_scale<G>(ds + rbase * (FFN / G) + lane / (G / 32));
-        acc = float(sd.scale) * dot_int4x32(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4, 0.f, sd.off);
-    }
+    if (lane < CH)
+        acc = dot32_g<G>(dw[rbase * CH + lane], h + size_t(p) * (FFN / 8) + lane * 4, ds + rbase * (FFN / S) + lane / (S / 32));
     acc = wave_sum(acc);
+    if (G == QGROUP_F4) acc *= glob[2 * EXP_L + e];
     if (lane == 0) yp[size_t(p) * H + row] = __float2half(acc);
 }
 
 template <int G>
 static void experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us,
                       const uint32_t *dw, const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok,
-                      const uint16_t *bin, int T, uint16_t *h, uint16_t *yp, hipStream_t s) {
+                      const uint16_t *bin, int T, uint16_t *h, uint16_t *yp, hipStream_t s, const float *glob) {
     moe_gate_up_P_kernel<G><<<dim3(FFN / 8, T * TOP_K), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(gw), reinterpret_cast<const __half *>(gs), reinterpret_cast<const uint4 *>(uw),
         reinterpret_cast<const __half *>(us), offsets, pair_tok, reinterpret_cast<const uint4 *>(bin),
-        reinterpret_cast<__half *>(h));
+        reinterpret_cast<__half *>(h), glob);
     moe_down_P_kernel<G><<<dim3(H / 8, T * TOP_K), 256, 0, s>>>(
         reinterpret_cast<const uint4 *>(dw), reinterpret_cast<const __half *>(ds), offsets,
-        reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp));
+        reinterpret_cast<const uint4 *>(h), reinterpret_cast<__half *>(yp), glob);
 }
 
 void moe_experts_P(const uint32_t *gw, const uint16_t *gs, const uint32_t *uw, const uint16_t *us, const uint32_t *dw,
                    const uint16_t *ds, const int32_t *offsets, const int32_t *pair_tok, const uint16_t *bin, int T,
-                   uint16_t *h, uint16_t *yp, hipStream_t s, int group) {
-    QW_CHECK(group == QGROUP || group == QGROUP_Z, "moe_experts_P: unsupported expert format");
+                   uint16_t *h, uint16_t *yp, hipStream_t s, int group, const float *glob) {
+    QW_CHECK(group == QGROUP || group == QGROUP_Z || (group == QGROUP_F4 && glob), "moe_experts_P: unsupported expert format");
     if (group == QGROUP)
-        experts_P<QGROUP>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s);
+        experts_P<QGROUP>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
+    else if (group == QGROUP_Z)
+        experts_P<QGROUP_Z>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
     else
-        experts_P<QGROUP_Z>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s);
+        experts_P<QGROUP_F4>(gw, gs, uw, us, dw, ds, offsets, pair_tok, bin, T, h, yp, s, glob);
 }
 
 }  // namespace qw::gpu

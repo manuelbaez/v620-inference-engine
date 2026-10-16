@@ -358,13 +358,18 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
     if (!bf16_experts) {
         const std::string e0 = mp + "experts." + std::to_string(expert(r * EXP_L)) + ".gate_proj.weight_";
         w.egroup = int(H / st.get(e0 + "scale").dim(1));
-        QW_CHECK(w.egroup == QGROUP || w.egroup == QGROUP_Z, e0 + "scale: unsupported group size");
+        if (st.get(e0 + "scale").dtype == DType::U8) {  // NVFP4 (tools/fp4_convert.py): E4M3 scales per 16, a global
+            QW_CHECK(w.egroup == QGROUP_F4 && st.has(e0 + "global"), e0 + "scale: NVFP4 needs groups of 16 and a global");
+        } else {
+            QW_CHECK(w.egroup == QGROUP || w.egroup == QGROUP_Z, e0 + "scale: unsupported group size");
+        }
         QW_CHECK(w.egroup == QGROUP_Z || !st.has(e0 + "zero_point"), e0 + "zero_point: zero points need groups of 32");
     }
     const int G = w.egroup;
+    std::vector<float> eglob(G == QGROUP_F4 ? 3 * EXP_L : 0);  // NVFP4: each matrix's FP32 scale (x 2^7: kernels)
     // A projection of the rank's experts: the packed int4 words, then their scale words (built together).
-    auto pack_experts = [&](const char *proj, int rows, int K, uint32_t **wd, uint16_t **sd) {
-        const size_t words = size_t(rows) * K / 8, groups = size_t(rows) * K / G;
+    auto pack_experts = [&](const char *proj, int rows, int K, uint32_t **wd, uint16_t **sd, float *glob) {
+        const size_t words = size_t(rows) * K / 8, groups = size_t(rows) * K / scale_span(G);
         std::vector<uint16_t> scales;
         *wd = wc.item<uint32_t>([&] {
             std::vector<uint32_t> packed(size_t(EXP_L) * words);
@@ -373,9 +378,15 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
                 for (int64_t i = b; i < e; ++i) {
                     const std::string ep = mp + "experts." + std::to_string(expert(r * EXP_L + i)) + "." + proj;
                     const TensorView &pw = st.get(ep + ".weight_packed", DType::I32, {rows, K / 8});
-                    const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / G});
                     pack_int4_words(pw.i32(), packed.data() + size_t(i) * words, words);
                     uint16_t *sc = scales.data() + size_t(i) * groups;
+                    if (G == QGROUP_F4) {  // two E4M3 bytes per word, the first 16 inputs' low (core/config.hpp)
+                        const uint8_t *b = st.get(ep + ".weight_scale", DType::U8, {rows, K / 16}).u8();
+                        for (size_t g = 0; g < groups; ++g) sc[g] = uint16_t(b[2 * g] | (b[2 * g + 1] << 8));
+                        glob[i] = st.get(ep + ".weight_global", DType::F32, {1}).f32()[0] * 128.f;  // exact
+                        continue;
+                    }
+                    const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / G});
                     for (size_t g = 0; g < groups; ++g) sc[g] = bf16_to_f16(sw.u16()[g]);
                     if (G == QGROUP) continue;
                     // zero points: nibbles packed along the rows, [rows / 8][K / G] words
@@ -425,9 +436,10 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
         quant_experts(gu, {N_EXPERTS, 2 * FFN, H}, FFN, FFN, H, &w.eu, &w.eus);
         quant_experts(mp + "experts.down_proj", {N_EXPERTS, H, FFN}, 0, H, FFN, &w.ed, &w.eds);
     } else {
-        pack_experts("gate_proj", FFN, H, &w.eg, &w.egs);
-        pack_experts("up_proj", FFN, H, &w.eu, &w.eus);
-        pack_experts("down_proj", H, FFN, &w.ed, &w.eds);
+        pack_experts("gate_proj", FFN, H, &w.eg, &w.egs, eglob.data());
+        pack_experts("up_proj", FFN, H, &w.eu, &w.eus, eglob.data() + EXP_L);
+        pack_experts("down_proj", H, FFN, &w.ed, &w.eds, eglob.data() + 2 * EXP_L);
+        if (G == QGROUP_F4) w.eglob = wc.item<float>([&] { return eglob; });
     }
     w.sh_gu = wc.item<uint16_t>([&] {
         std::vector<uint16_t> gu;

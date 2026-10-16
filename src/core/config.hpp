@@ -85,6 +85,12 @@ inline uint16_t qz_word(uint16_t f16_scale, int zp_nibble) {
     return uint16_t(f16_scale | ((zp_nibble & 8) << 12) | (zp_nibble & 7));
 }
 inline int qz_nibble(uint16_t word) { return ((word >> 12) & 8) | (word & 7); }
+// Or NVFP4 (an experiment: nvidia/Qwen3.8-Flash-Next-FP4-Local through tools/fp4_convert.py, docs/DESIGN.md "The FP4
+// checkpoint"): E2M1 values, an E4M3 scale per 16 inputs and an FP32 scale per matrix. The engine keeps the two E4M3
+// scales of 32 inputs in one 16-bit word (the first 16 inputs' in the low byte), so its scale words are 32 inputs
+// apart, like QGROUP_Z's.
+constexpr int QGROUP_F4 = 16;
+constexpr int scale_span(int group) { return group == QGROUP_F4 ? 32 : group; }  // inputs per scale word
 
 // PLE
 constexpr int PLE_LAYER = 1;  // 0-based
@@ -98,7 +104,7 @@ constexpr int64_t NGRAM_VOCAB_BASE = 20000000;
 constexpr uint64_t PLE_SEED = 1234;
 
 // Throws if config.json does not describe the model these constants encode.
-// Returns the group size of the routed experts' scales (QGROUP or QGROUP_Z).
+// Returns the routed experts' format: QGROUP, QGROUP_Z or QGROUP_F4.
 int check_config(const std::string &model_dir);
 
 }  // namespace qw::cfg

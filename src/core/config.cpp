@@ -62,6 +62,10 @@ int check_config(const std::string &model_dir) {
     }
     const Json &q = root["quantization_config"]["config_groups"]["group_0"]["weights"];
     const int64_t group = q["group_size"].as_int();
+    if (root["quantization_config"]["quant_method"].as_str() == "qw-nvfp4") {
+        QW_CHECK(q["num_bits"].as_int() == 4 && group == QGROUP_F4, "config.json: qw-nvfp4 needs 4 bits, groups of 16");
+        return QGROUP_F4;
+    }
     QW_CHECK(q["num_bits"].as_int() == 4 && ((group == QGROUP && q["symmetric"].as_bool()) || group == QGROUP_Z),
              "config.json: experts are neither symmetric int4 g128 nor int4 g32");
     return int(group);

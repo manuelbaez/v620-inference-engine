@@ -26,6 +26,7 @@ struct TensorView {
     const uint16_t *u16() const { return static_cast<const uint16_t *>(data); }
     const int32_t *i32() const { return static_cast<const int32_t *>(data); }
     const uint8_t *u8() const { return static_cast<const uint8_t *>(data); }
+    const float *f32() const { return static_cast<const float *>(data); }
 };
 
 class MappedFile {
