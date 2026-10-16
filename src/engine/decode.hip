@@ -62,10 +62,10 @@ uint32_t Engine::record_batch(Rank &rk, int M, int kind) {
         gpu::hc_up_mix_B(b.hc_red, w.up, b.y, b.bin_local, inj_out, M, s);
         allgather(b.bin_local, b.bin, SH * 2);
     };
-    // fp16 weights, or their int8 copy when loaded (QW_INT8_DENSE=1)
+    // fp16 weights, or their int8 copy when loaded (QW_INT8_DENSE=1), or their E4M3 form (QW_DENSE_FP8=1)
     auto gemv = [&](const uint16_t *W, const Q8 &W8, int N, int K, const uint16_t *x, float *y) {
         if (W8.w)
-            gpu::gemv_rows_i8(W8.w, W8.s, x, K, y, N, N, K, M, 0, false, s);
+            gpu::gemv_rows_i8(W8.w, W8.s, x, K, y, N, N, K, M, 0, false, s, W8.e4m3);
         else
             gpu::gemv_rows(W, x, K, y, N, N, K, M, 0, false, s);
     };

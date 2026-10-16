@@ -17,6 +17,9 @@ namespace {
 // Prefill scratch for one micro-batch of up to C tokens.
 void alloc_prefill(PrefillBuf &b, int C, int max_slot_tokens, bool mtp) {
     b.C = C;
+    if (dense_fp8_on())  // the largest GDN / QSA matrix of a card, expanded for a GEMM (prefill.hip `dense`)
+        b.wtmp = zeros<uint16_t>(std::max({size_t(GDN_PROJ_L) * H, size_t(QSA_PROJ_L) * H, size_t(H) * QH_L * HEAD_DIM,
+                                           size_t(H) * GDN_VL * GDN_DIM}));
     b.nb_pad = (max_slot_tokens / IDX_RATIO + 7) / 8 * 8;
     b.X = zeros<float>(size_t(C) * HC * SH);
     b.ssq = zeros<float>(size_t(C) * HC);

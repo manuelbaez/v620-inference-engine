@@ -150,7 +150,17 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
                 // experts with a scale word per 32 inputs: 2 bytes per 32 weights of a card's 128 experts, not per 128
                 const double expert_scales = expert_group_ == QGROUP ? 0.0 :
                     double(N_LAYERS) * EXP_L * 3.0 * FFN * H * 2.0 * (1.0 / scale_span(expert_group_) - 1.0 / QGROUP) / gib;
-                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales;
+                // QW_DENSE_FP8 with the FP4 checkpoint (the bf16 ones keep fp16): its GDN and QSA matrices take 1 byte per
+                // weight and 4 per 32 instead of 2, plus a scratch per micro-batch
+                double dense_fp8 = 0.0;
+                if (dense_fp8_on() && expert_group_ == QGROUP_F4) {
+                    int gdn = 0;
+                    for (int l = 0; l < N_LAYERS; ++l) gdn += !is_qsa(l);
+                    const double w = double(gdn) * (double(GDN_PROJ_L) * H + double(H) * GDN_VL * GDN_DIM) +
+                                     double(N_LAYERS - gdn) * (double(QSA_PROJ_L) * H + double(H) * QH_L * HEAD_DIM);
+                    dense_fp8 = (w * (2.0 - 1.125) - 2.0 * opt_.prefill_mb * double(GDN_PROJ_L) * H) / gib;
+                }
+                const double base = 19.67 + double(opt_.prefill_chunk - 4096) * 0.0003 + expert_scales - dense_fp8;
                 const double scoring = 6144.0 * double(max_slot_tokens() / IDX_RATIO) / gib;
                 const double est = double(total_b) / gib - base - double(slot_vram_bytes(opt_, mtp_)) / gib - scoring;
                 const double need = opt_.warmup ? 1.6 : 0.6;  // warmup (graphs, rocBLAS kernels) takes ~1.1 GiB; keep 0.5 free

@@ -203,6 +203,13 @@ void Engine::run_prefill_rank(Rank &rk) {
 
     auto gemm = [&](MB &m, const uint16_t *W, int N, int K, const uint16_t *X, int ldx, int rows, void *Y, int ldy,
                     bool f16) { gpu::gemm(m.blas, W, N, K, X, ldx, rows, Y, ldy, f16); };
+    // A GDN or QSA matrix: its fp16 copy, or (QW_DENSE_FP8) its E4M3 form expanded into the micro-batch's scratch
+    // (on its stream: the previous GEMM that read the scratch is done by then)
+    auto dense = [&](MB &m, const uint16_t *W, const Q8 &W8, int N, int K) -> const uint16_t * {
+        if (W) return W;
+        gpu::e4m3_to_f16(W8.w, W8.s, N, K, m.b->wtmp, m.s);
+        return m.b->wtmp;
+    };
     auto allreduce = [&](MB &m, const void *src, float *dst, int n, int rows, bool f16 = false) {
         m.comm->allreduce(r, src, dst, n, ++m.k, m.s, rows, f16);
     };
@@ -267,7 +274,7 @@ void Engine::run_prefill_rank(Rank &rk) {
         if (qsa) {
             const size_t qi = size_t(idx);
             constexpr size_t QW = size_t(QH_L) * HEAD_DIM, IW = size_t(IDX_HEADS) * IDX_DIM;
-            gemm(m, w.qsa_proj, QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
+            gemm(m, dense(m, w.qsa_proj, w.qsa_proj8, QSA_PROJ_L, H), QSA_PROJ_L, H, b.bin, H, T, b.P, QSA_PROJ_L, true);
             if (staging) CK(hipStreamWaitEvent(s, rk.stage_ready, 0));
             for (const Sub &sb : subs) {
                 const int32_t *r3 = rope3 && l < N_LAYERS ? rope3 + size_t(sb.start - start0) * 3 : nullptr;
@@ -311,11 +318,12 @@ void Engine::run_prefill_rank(Rank &rk) {
                 }
             if (staging) CK(hipEventRecord(rk.stage_done[mb_index(m)], s));
             if (calib) cal(m, ln + ".qsa_o", b.act, QH_L * HEAD_DIM, T, QH_L * HEAD_DIM);
-            gemm(m, w.qsa_o, H, QH_L * HEAD_DIM, b.act, QH_L * HEAD_DIM, T, b.part16, H, true);
+            gemm(m, dense(m, w.qsa_o, w.qsa_o8, H, QH_L * HEAD_DIM), H, QH_L * HEAD_DIM, b.act, QH_L * HEAD_DIM, T,
+                 b.part16, H, true);
         } else {
             const size_t gi = size_t(idx);
             constexpr size_t OW = size_t(GDN_VL) * GDN_DIM, GW = size_t(GDN_VL) * 2;
-            gemm(m, w.gdn_proj, GDN_PROJ_L, H, b.bin, H, T, b.P, GDN_PROJ_L, true);
+            gemm(m, dense(m, w.gdn_proj, w.gdn_proj8, GDN_PROJ_L, H), GDN_PROJ_L, H, b.bin, H, T, b.P, GDN_PROJ_L, true);
             wait(m, l, 0);
             for (const Sub &sb : subs) {
                 float *ring = sb.sl->ring + gi * GDN_RING * GDN_QKV_L;
@@ -339,7 +347,8 @@ void Engine::run_prefill_rank(Rank &rk) {
             record(m, l, 1);
             gpu::gdn_norm_T(b.o_raw, b.P, w.gdn_norm, T, b.act, s);
             if (calib) cal(m, ln + ".gdn_out", b.act, GDN_VL * GDN_DIM, T, GDN_VL * GDN_DIM);
-            gemm(m, w.gdn_out, H, GDN_VL * GDN_DIM, b.act, GDN_VL * GDN_DIM, T, b.part16, H, true);
+            gemm(m, dense(m, w.gdn_out, w.gdn_out8, H, GDN_VL * GDN_DIM), H, GDN_VL * GDN_DIM, b.act, GDN_VL * GDN_DIM, T,
+                 b.part16, H, true);
         }
         reduce_scatter16(m, b.part16, b.out_attn, T);
 

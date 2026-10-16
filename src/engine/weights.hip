@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,11 @@
 #include "kernels/gemv.hpp"
 
 namespace qw {
+
+bool dense_fp8_on() {
+    static const bool on = std::getenv("QW_DENSE_FP8") && std::atoi(std::getenv("QW_DENSE_FP8")) != 0;
+    return on;
+}
 
 namespace {
 
@@ -269,6 +275,29 @@ HcW load_hc(WeightCache &wc, const SafeTensors &st, int r, const std::string &p,
 // perm: if not null, the layer's expert placement: the engine's expert i (rank i / EXP_L) is the checkpoint's perm[i].
 void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &pool, int r, const std::string &p,
                 bool qsa, bool bf16_experts, const int32_t *perm = nullptr) {
+    // A GDN or QSA matrix [N][K] from rows(dst, fn) (fn: add_rows or add_rows_bf16): with QW_DENSE_FP8 its E4M3 form
+    // when it is MXFP8 exactly (no fp16 copy then), else the fp16 copy (and its int8 copy with QW_INT8_DENSE).
+    using Rows = std::function<void(std::vector<uint16_t> &, decltype(&add_rows))>;
+    auto dense = [&](const Rows &rows, int64_t N, int64_t K, const char *group, const std::string &name, Q8 &w8) {
+        if (dense_fp8_on()) {
+            std::vector<uint16_t> raw;
+            rows(raw, &add_rows_bf16);
+            std::vector<int8_t> q;
+            std::vector<float> sc;
+            if (encode_mxfp8(raw, q, sc)) {
+                w8 = {upload(q), upload(sc), true};
+                return static_cast<uint16_t *>(nullptr);
+            }
+            log("QW_DENSE_FP8: %s is not MXFP8, kept fp16", name.c_str());
+        }
+        return wc.item<uint16_t>([&] {
+            std::vector<uint16_t> m;
+            rows(m, &add_rows);
+            QW_CHECK(int64_t(m.size()) == N * K, name + ": size");
+            w8 = q8(m, N, K, group, r, name);
+            return m;
+        });
+    };
     const auto expert = [&](int64_t i) { return perm ? int64_t(perm[i]) : i; };
     const std::string ln = layer_name(p);
     w.attn_hc = load_hc(wc, st, r, p + "attn_hyper_connection.", true, ln + ".attn_hc");
@@ -278,44 +307,39 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
     };
     if (qsa) {
         const std::string a = p + "self_attn.";
-        w.qsa_proj = wc.item<uint16_t>([&] {
-            std::vector<uint16_t> m;
-            const TensorView &q = st.get(a + "q_proj.weight", DType::BF16, {Q_HEADS * 2 * HEAD_DIM, H});
-            add_rows(m, q, int64_t(r) * QH_L * 2 * HEAD_DIM, QH_L * 2 * HEAD_DIM);
-            const int kvh = r / (RANKS / KV_HEADS);
-            add_rows(m, st.get(a + "k_proj.weight"), kvh * HEAD_DIM, HEAD_DIM);
-            add_rows(m, st.get(a + "v_proj.weight"), kvh * HEAD_DIM, HEAD_DIM);
-            add_rows(m, st.get(a + "indexer.index_qk_proj.weight"), 0, (IDX_HEADS + 1) * IDX_DIM);
-            QW_CHECK(m.size() == size_t(QSA_PROJ_L) * H, "qsa proj size");
-            w.qsa_proj8 = q8(m, QSA_PROJ_L, H, "qsa", r, ln + ".qsa_proj");
-            return m;
-        });
+        w.qsa_proj = dense(
+            [&](std::vector<uint16_t> &m, decltype(&add_rows) add) {
+                const TensorView &q = st.get(a + "q_proj.weight", DType::BF16, {Q_HEADS * 2 * HEAD_DIM, H});
+                add(m, q, int64_t(r) * QH_L * 2 * HEAD_DIM, QH_L * 2 * HEAD_DIM, 0, -1);
+                const int kvh = r / (RANKS / KV_HEADS);
+                add(m, st.get(a + "k_proj.weight"), kvh * HEAD_DIM, HEAD_DIM, 0, -1);
+                add(m, st.get(a + "v_proj.weight"), kvh * HEAD_DIM, HEAD_DIM, 0, -1);
+                add(m, st.get(a + "indexer.index_qk_proj.weight"), 0, (IDX_HEADS + 1) * IDX_DIM, 0, -1);
+            },
+            QSA_PROJ_L, H, "qsa", ln + ".qsa_proj", w.qsa_proj8);
         w.qn = norm1(a + "q_norm.weight");
         w.kn = norm1(a + "k_norm.weight");
         w.iqn = norm1(a + "indexer.q_layernorm.weight");
         w.ikn = norm1(a + "indexer.k_layernorm.weight");
-        w.qsa_o = wc.item<uint16_t>([&] {
-            std::vector<uint16_t> o;
-            add_rows(o, st.get(a + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), 0, H,
-                     int64_t(r) * QH_L * HEAD_DIM, QH_L * HEAD_DIM);
-            w.qsa_o8 = q8(o, H, int64_t(QH_L) * HEAD_DIM, "qsa", r, ln + ".qsa_o");
-            return o;
-        });
+        w.qsa_o = dense(
+            [&](std::vector<uint16_t> &o, decltype(&add_rows) add) {
+                add(o, st.get(a + "o_proj.weight", DType::BF16, {H, Q_HEADS * HEAD_DIM}), 0, H,
+                    int64_t(r) * QH_L * HEAD_DIM, QH_L * HEAD_DIM);
+            },
+            H, int64_t(QH_L) * HEAD_DIM, "qsa", ln + ".qsa_o", w.qsa_o8);
     } else {
         const std::string a = p + "linear_attn.";
-        w.gdn_proj = wc.item<uint16_t>([&] {
-            const TensorView &qkv = st.get(a + "in_proj_qkv.weight", DType::BF16, {GDN_QKV, H});
-            std::vector<uint16_t> m;
-            add_rows(m, qkv, int64_t(r) * GDN_KL * GDN_DIM, GDN_KL * GDN_DIM);
-            add_rows(m, qkv, GDN_KEY + int64_t(r) * GDN_KL * GDN_DIM, GDN_KL * GDN_DIM);
-            add_rows(m, qkv, 2 * GDN_KEY + int64_t(r) * GDN_VL * GDN_DIM, GDN_VL * GDN_DIM);
-            add_rows(m, st.get(a + "in_proj_z.weight"), int64_t(r) * GDN_VL * GDN_DIM, GDN_VL * GDN_DIM);
-            add_rows(m, st.get(a + "in_proj_b.weight"), int64_t(r) * GDN_VL, GDN_VL);
-            add_rows(m, st.get(a + "in_proj_a.weight"), int64_t(r) * GDN_VL, GDN_VL);
-            QW_CHECK(m.size() == size_t(GDN_PROJ_L) * H, "gdn proj size");
-            w.gdn_proj8 = q8(m, GDN_PROJ_L, H, "gdn", r, ln + ".gdn_proj");
-            return m;
-        });
+        w.gdn_proj = dense(
+            [&](std::vector<uint16_t> &m, decltype(&add_rows) add) {
+                const TensorView &qkv = st.get(a + "in_proj_qkv.weight", DType::BF16, {GDN_QKV, H});
+                add(m, qkv, int64_t(r) * GDN_KL * GDN_DIM, GDN_KL * GDN_DIM, 0, -1);
+                add(m, qkv, GDN_KEY + int64_t(r) * GDN_KL * GDN_DIM, GDN_KL * GDN_DIM, 0, -1);
+                add(m, qkv, 2 * GDN_KEY + int64_t(r) * GDN_VL * GDN_DIM, GDN_VL * GDN_DIM, 0, -1);
+                add(m, st.get(a + "in_proj_z.weight"), int64_t(r) * GDN_VL * GDN_DIM, GDN_VL * GDN_DIM, 0, -1);
+                add(m, st.get(a + "in_proj_b.weight"), int64_t(r) * GDN_VL, GDN_VL, 0, -1);
+                add(m, st.get(a + "in_proj_a.weight"), int64_t(r) * GDN_VL, GDN_VL, 0, -1);
+            },
+            GDN_PROJ_L, H, "gdn", ln + ".gdn_proj", w.gdn_proj8);
         w.gdn_conv = wc.item<float>([&] {
             auto cw = f32_of(st.get(a + "conv1d.weight", DType::BF16, {GDN_QKV, 1, GDN_CONV}));
             std::vector<float> lc;
@@ -336,13 +360,12 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
             return std::vector<float>(dt.begin() + r * GDN_VL, dt.begin() + (r + 1) * GDN_VL);
         });
         w.gdn_norm = wc.item<float>([&] { return f32_of(st.get(a + "norm.weight")); });
-        w.gdn_out = wc.item<uint16_t>([&] {
-            std::vector<uint16_t> o;
-            add_rows(o, st.get(a + "out_proj.weight", DType::BF16, {H, GDN_VAL}), 0, H, int64_t(r) * GDN_VL * GDN_DIM,
-                     GDN_VL * GDN_DIM);
-            w.gdn_out8 = q8(o, H, int64_t(GDN_VL) * GDN_DIM, "gdn", r, ln + ".gdn_out");
-            return o;
-        });
+        w.gdn_out = dense(
+            [&](std::vector<uint16_t> &o, decltype(&add_rows) add) {
+                add(o, st.get(a + "out_proj.weight", DType::BF16, {H, GDN_VAL}), 0, H, int64_t(r) * GDN_VL * GDN_DIM,
+                    GDN_VL * GDN_DIM);
+            },
+            H, int64_t(GDN_VL) * GDN_DIM, "gdn", ln + ".gdn_out", w.gdn_out8);
     }
     // MoE
     const std::string mp = p + "mlp.";

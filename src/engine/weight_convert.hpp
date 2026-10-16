@@ -20,6 +20,13 @@ uint16_t bf16_to_f16(uint16_t b);
 
 // Appends rows [r0, r0+n) x cols [c0, c0+nc) of a bf16 matrix as fp16.
 void add_rows(std::vector<uint16_t> &dst, const TensorView &t, int64_t r0, int64_t n, int64_t c0 = 0, int64_t nc = -1);
+// The same rows as bf16, unconverted.
+void add_rows_bf16(std::vector<uint16_t> &dst, const TensorView &t, int64_t r0, int64_t n, int64_t c0 = 0,
+                   int64_t nc = -1);
+// bf16 values [N][K] -> E4M3 bytes and an fp32 scale (x 2^8: gemv_rows_i8's e4m3 mode) per 32 along K, if every
+// value is exactly an E4M3 value times a power of two per 32 (an MXFP8 matrix, e.g. the FP4 checkpoint's); false when
+// one is not (the bf16 checkpoints' matrices).
+bool encode_mxfp8(const std::vector<uint16_t> &bf16, std::vector<int8_t> &q, std::vector<float> &scale);
 std::vector<float> f32_of(const TensorView &t);
 // 1 + w for the rank's columns of a [HC*H] Gemma norm weight, as [HC][SH].
 std::vector<float> shard_w1(const TensorView &t, int r);

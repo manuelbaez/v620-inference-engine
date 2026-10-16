@@ -38,6 +38,63 @@ void add_rows(std::vector<uint16_t> &dst, const TensorView &t, int64_t r0, int64
     }
 }
 
+void add_rows_bf16(std::vector<uint16_t> &dst, const TensorView &t, int64_t r0, int64_t n, int64_t c0, int64_t nc) {
+    QW_CHECK(t.dtype == DType::BF16 && t.shape.size() >= 2, t.name + ": expected bf16 matrix");
+    const int64_t cols = t.numel() / t.dim(0);
+    if (nc < 0) nc = cols - c0;
+    QW_CHECK(r0 + n <= t.dim(0) && c0 + nc <= cols, t.name + ": slice out of range");
+    for (int64_t r = 0; r < n; ++r) {
+        const uint16_t *src = t.u16() + (r0 + r) * cols + c0;
+        dst.insert(dst.end(), src, src + nc);
+    }
+}
+
+namespace {
+// x as an E4M3 byte, if it is exactly one (no rounding): |x| <= 448, 3 mantissa bits, subnormals down to 2^-9.
+bool e4m3_exact(float x, uint8_t &b) {
+    const uint8_t s = std::signbit(x) ? 0x80 : 0;
+    const float a = std::fabs(x);
+    if (a == 0.f) {
+        b = s;
+        return true;
+    }
+    if (!(a <= 448.f)) return false;
+    const int e = std::ilogb(a);
+    if (e < -6) {  // subnormal: m * 2^-9
+        const float m = std::ldexp(a, 9);
+        if (m != std::floor(m)) return false;
+        b = uint8_t(s | uint8_t(m));
+        return true;
+    }
+    const float f = std::ldexp(a, -e) * 8.f - 8.f;
+    if (f != std::floor(f)) return false;
+    b = uint8_t(s | uint8_t((e + 7) << 3) | uint8_t(f));
+    return true;
+}
+}  // namespace
+
+bool encode_mxfp8(const std::vector<uint16_t> &bf16, std::vector<int8_t> &q, std::vector<float> &scale) {
+    QW_CHECK(bf16.size() % 32 == 0, "encode_mxfp8: whole groups of 32");
+    q.resize(bf16.size());
+    scale.resize(bf16.size() / 32);
+    for (size_t g = 0; g < scale.size(); ++g) {
+        const uint16_t *v = bf16.data() + g * 32;
+        float amax = 0.f;
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(bf16_to_f32(v[j])));
+        // the finest power of two that keeps the group within 448: values exact at the encoder's (coarser or equal)
+        // power stay exact at it
+        int k = amax > 0.f ? std::ilogb(amax) - 8 : 0;
+        if (amax > 0.f && std::ldexp(amax, -k) > 448.f) ++k;
+        for (int j = 0; j < 32; ++j) {
+            uint8_t b;
+            if (!e4m3_exact(std::ldexp(bf16_to_f32(v[j]), -k), b)) return false;
+            q[g * 32 + size_t(j)] = int8_t(b);
+        }
+        scale[g] = std::ldexp(1.f, k + 8);  // the kernels read E4M3 as value x 2^-8
+    }
+    return true;
+}
+
 std::vector<float> f32_of(const TensorView &t) {
     QW_CHECK(t.dtype == DType::BF16, t.name + ": expected bf16");
     std::vector<float> v(size_t(t.numel()));

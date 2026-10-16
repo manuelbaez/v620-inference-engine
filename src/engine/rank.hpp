@@ -38,7 +38,11 @@ constexpr size_t SLOT_PLE = size_t(PLE_RING) * HC * SH;
 struct Q8 {
     int8_t *w = nullptr;
     float *s = nullptr;
+    bool e4m3 = false;  // E4M3 bytes (QW_DENSE_FP8: the matrix has no fp16 copy then), not int8
 };
+// QW_DENSE_FP8=1 (an experiment, docs/DESIGN.md "The FP4 checkpoint"): GDN and QSA matrices that are MXFP8 exactly
+// (the FP4 checkpoint's) are kept as E4M3 bytes with a scale per 32 in place of their fp16 copies.
+bool dense_fp8_on();
 
 struct HcW {
     float *w1;            // [HC][SH] 1 + hc_norm
@@ -68,6 +72,7 @@ struct PrefillBuf {
     float *m_emb = nullptr;  // [C][SH]: the MTP rows' next-token embeddings, gathered (batched prefill)
     float *xg = nullptr;     // [MAX_SEGMENTS][XW]: segments' last rows, gathered for lm_head
     uint16_t *m_xn = nullptr;
+    uint16_t *wtmp = nullptr;   // QW_DENSE_FP8: an E4M3 matrix expanded to fp16 for this micro-batch's GEMM
     float *h_emb = nullptr;     // pinned [C][SH]
     uint16_t *h_ple = nullptr;  // pinned [C][H]
 };
