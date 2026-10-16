@@ -74,7 +74,7 @@ public:
     }
     // A ModelOpt checkpoint's tensors the loaders read as bf16 come back decoded (core/fp_decode.hpp), on first use,
     // kept until clear(): MXFP8 and NVFP4 matrices other than the routed experts (whose loaders read NVFP4 as it is),
-    // F32 norms (rounded to bf16), and the MTP head's fused experts (mtp.layers.0.mlp.experts.gate_up_proj and
+    // F32 weights (norms; rounded to bf16), and the MTP head's fused experts (mtp.layers.0.mlp.experts.gate_up_proj and
     // down_proj, from its NVFP4 experts). Other checkpoints have none of these: their tensors are returned as stored.
     const TensorView &get(const std::string &name) const;
     // get() plus a dtype and shape check.

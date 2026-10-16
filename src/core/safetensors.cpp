@@ -172,7 +172,7 @@ bool SafeTensors::needs_decoding(const TensorView &t) const {
     if (t.dtype == DType::U8)  // NVFP4, but not the routed experts
         return tensors_.count(base + ".weight_scale_2") &&
                !(t.name.rfind("model.language_model.", 0) == 0 && t.name.find(".mlp.experts.") != std::string::npos);
-    return t.dtype == DType::F32 && ends_with(t.name, "norm.weight");
+    return t.dtype == DType::F32;  // the norms (hyper-connection, PLE): the scales are named weight_scale_2
 }
 
 void SafeTensors::decode(const std::string &name, Decoded &d) const {
