@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -692,14 +693,39 @@ void Model::forward(State &st, const std::vector<int32_t> &tokens, std::vector<f
         pend_inj(size_t(T) * HC);
     bool pending = false;
     if (dump_layers) dump_layers->clear();
-    for (int L = 0; L < N_LAYERS; ++L) {
+    // QW_REF_REPEAT=A-B:N (experiment, docs/DESIGN.md "Looping layers"): after layer B, layers A..B run N more times
+    // ("looped" depth on weights trained for one pass). Each repeated pass has states of its own (fresh GDN states and
+    // QSA caches: the whole prompt goes through a layer at once here), the PLE step only on the first.
+    std::vector<int> order;
+    std::vector<char> again;  // a repeated occurrence; 2 = the first layer of a repeated pass
+    {
+        int a = -1, b = -1, n = 0;
+        if (const char *r = std::getenv("QW_REF_REPEAT"))
+            QW_CHECK(std::sscanf(r, "%d-%d:%d", &a, &b, &n) == 3 && 0 <= a && a <= b && b < N_LAYERS && n >= 0,
+                     "QW_REF_REPEAT: A-B:N with 0 <= A <= B < 48");
+        for (int L = 0; L < N_LAYERS; ++L) {
+            order.push_back(L);
+            again.push_back(0);
+            if (L == b)
+                for (int k = 0; k < n; ++k)
+                    for (int R = a; R <= b; ++R) {
+                        order.push_back(R);
+                        again.push_back(R == a ? 2 : 1);
+                    }
+        }
+    }
+    State rep;  // the repeated passes' states, reset at each pass
+    for (size_t i = 0; i < order.size(); ++i) {
+        const int L = order[i];
+        if (again[i] == 2) rep.reset();
+        State &ls = again[i] ? rep : st;
         if (pending) combine(X.data(), pend_out.data(), pend_inj.data(), T);
-        if (L == PLE_LAYER) ple(st, X.data(), tokens);
+        if (L == PLE_LAYER && !again[i]) ple(st, X.data(), tokens);
         hc_mix(lp(L) + "attn_hyper_connection.", true, X.data(), T, bin.data(), inj.data());
         if (is_qsa(L))
-            qsa(st, L, bin.data(), T, bout.data());
+            qsa(ls, L, bin.data(), T, bout.data());
         else
-            gdn(st, L, bin.data(), T, bout.data());
+            gdn(ls, L, bin.data(), T, bout.data());
         combine(X.data(), bout.data(), inj.data(), T);
         hc_mix(lp(L) + "mlp_hyper_connection.", true, X.data(), T, bin.data(), pend_inj.data());
         moe(L, bin.data(), T, pend_out.data());

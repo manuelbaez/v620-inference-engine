@@ -3187,7 +3187,25 @@ options' speed, then the task benchmarks (GPQA Diamond, LiveCodeBench v6) agains
   lower than AWQ's on average, by prompt either way. In this harness 3 drafts is the fastest single stream for both
   models (production measured 5 faster with real sampling: not changed from this).
 
-Next: the E4M3 variant of `gemv_rows` itself (8 bytes per lane instead of 16, the same structure: should beat fp16
-at every row count); the down kernel timed alone; one scale conversion per lane and two running sums in the per-row
-expert kernels; then FP4 in production for the task benchmarks.
+**Second window (2026-10-16 evening, production still stopped).**
+
+- *8-bit dense GEMV in `gemv_rows`' structure* (bec656d: 8 bytes per lane and chunk, the chunk expanded exactly and
+  its dot product times the scale of its 32 weights): within float rounding of the fp16 GEMV (`test_fp8_dense
+  --gpu`), and now as fast or faster at every row count: decode step 16 x 1 41.0-41.1 against plain FP4's
+  41.8-42.5 ms, 8 x 2 39.3-39.4 against 39.6-40.4, 4 x 4 38.4 against 38.6-38.7, 12 x 1 35.9-36.2 against
+  36.3-36.6 (two alternating rounds); it was 43.8 / 41.5 / 40.4 / 37.2 with the old int8 kernel.
+- *The prefill gap was the down kernel's occupancy next to the other micro-batch.* Alone (`bench/moe_format_bench`,
+  2,048 tokens, one stream) the NVFP4 expert kernels are faster than AWQ's (4.77-4.80 against 4.87-4.88 ms; down
+  1.46 against 1.43, gate/up 2.90 against 2.93), also with another stream copying memory (`--contend`: 7.38-7.46
+  against 7.97-8.02); values without subnormal intermediates change nothing (so no 2^8 change of the scale); the
+  MoE balance per pass is the same for both models (busiest card 1.140 x the mean); FP4 with the int8 n-gram table
+  is no faster (host inputs ~80 ms either way). Per call in the prefill trace, FP4's down kernel took 2.8-3.0 ms on
+  one of each card's two streams and 1.9-2.1 on the other (AWQ 1.6-1.9 on both). Its NVFP4 instance needed 97 VGPRs,
+  one over what 10 waves per SIMD allow; `__attribute__((amdgpu_waves_per_eu(10)))` on `moe_down_T_kernel` (3e4969b)
+  gives 86-91 VGPRs for every format without spills: FP4 prefill 2,311 / 2,284 -> 2,426 / 2,415 tok/s (+5.3%),
+  275 -> 262 mJ/token, log-probs byte-identical; AWQ bit-identical (`logits_dump`) and 2,421 / 2,412 tok/s (noise).
+  FP4 prefill now equals AWQ's.
+
+Next: one scale conversion per lane and two running sums in the per-row expert kernels (decode, small); then FP4 in
+production for the task benchmarks, with self-consistency voting on GPQA as the next accuracy lever.
 
