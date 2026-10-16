@@ -542,7 +542,7 @@ class Scheduler:
         """The prefills to advance in one engine pass, as [(request, tokens)]. A pass has `room` tokens
         (QW_PREFILL_PIECE while others decode, else one prefill chunk) and at most MAX_SEGMENTS prompts.
         Long prompts (more than SHORT_PASSES passes hold) share a pass in equal pieces, in arrival order, as many
-        as fit: they prefill in parallel. Short prompts go first (whole, or with SHORT_PASSES > 1 a piece when
+        as fit, and with KV spill only as many as the engine can stage the spilled KV of: they prefill in parallel. Short prompts go first (whole, or with SHORT_PASSES > 1 a piece when
         they do not fit the pass), and when long ones are under way they get a
         pass of their own (a short request's first token then waits for a short pass, not for the long
         prompts' pieces), but only every other pass: in the pass after it the long ones go, and short
@@ -593,10 +593,22 @@ class Scheduler:
         n = min(len(longs), self.MAX_SEGMENTS - len(whole))
         while n > 1 and room // n < self.PIECE_ALIGN:
             n -= 1
+        share = lambda n: room if n == 1 else room // n // self.PIECE_ALIGN * self.PIECE_ALIGN  # noqa: E731
+        # as many long prompts as their spilled KV fits the staging buffer (the others' attention would read host
+        # RAM: half the speed; eight 95k prompts fell from 2,100 to 1,050 tok/s once they no longer fitted)
+        stage = getattr(self.e, "stage_tokens", 0)
+        if stage:
+            staged = sum(self._spilled(r, take) for r, take in whole)
+            while n > 1 and staged + sum(self._spilled(r, min(r.left, share(n))) for r in longs[:n]) > stage:
+                n -= 1
         if n and room > 0:
-            share = room if n == 1 else room // n // self.PIECE_ALIGN * self.PIECE_ALIGN
-            whole += [(r, min(r.left, share)) for r in longs[:n]]
+            whole += [(r, min(r.left, share(n))) for r in longs[:n]]
         return whole
+
+    def _spilled(self, r, take):
+        """The spilled positions r's slot holds once a pass computed `take` more of its prompt: what a prefill pass
+        stages of it in VRAM (Engine::spill_stage_tokens)."""
+        return max(0, len(r.prompt) - r.left + take - self.e.vram_tokens[r.slot])
 
     def _prefill(self):
         """Advances the prefills (see _batch): by one piece while others decode, then returns so

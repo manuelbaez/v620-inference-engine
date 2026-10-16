@@ -663,6 +663,15 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          KV in the GPUs, per-card VRAM and power, host cache, disk tier, PLE table, averages of
          TTFT, request time and decode speed, recent requests. A collector thread builds the
          snapshot every 2 s; the handler only returns it; figures to one decimal
+   - [~] long prompts in parallel with KV spill (2026-10-16): the prefill staging buffer holds one slot's whole spill
+         (243,712 positions per card in production, 238 MiB), and a pass stages its segments' spilled KV only while
+         it fits; the others' attention reads host RAM at ~45% of the speed (section "KV spill", prefill staging).
+         Eight 95k-token prompts sent together (production, 2026-10-16 00:19-00:27) ran at 2,050-2,200 tok/s in
+         aggregate until each slot passed ~49k tokens (8 x 31k spilled = the buffer), then fell to ~1,050 tok/s. The
+         scheduler now puts only as many long prompts in a pass as their spilled KV fits (`_batch`, `_spilled`;
+         `qw_spill_stage_tokens`): eight in parallel up to ~49k tokens each, five at 60k, three at 90k, never fewer
+         than one; `server/tests/test_prefill_parallel.py`. Not measured yet: the same eight prompts with it (expected
+         ~2,000 tok/s throughout, the first prompts done sooner, the last at about the same time or earlier)
    - [x] stats line and dashboard during long prefills (2026-10-15): with nothing decoding, `_prefill` runs pass
          after pass until a prompt is done or a request arrives, and the scheduler printed its stats line and sampled
          the dashboard only after it returned. Eight 95k-token prompts sent together (763k tokens at ~1,720 tok/s,

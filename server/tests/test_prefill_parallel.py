@@ -116,6 +116,30 @@ def main():
     check("the first passes take all five", [len(c) for c in e.calls[:3]], [5, 5, 5])
     s.shutdown(1)
 
+    # KV spill (production: 18,432 tokens of each slot in VRAM, a staging buffer of 243,712 spilled positions): long
+    # prompts share a pass only as far as their spilled KV fits the buffer (the rest would read host RAM, half speed)
+    def spill_sched(done):
+        s, e = sched([(f"L{i}", 95000) for i in range(8)])
+        e.vram_tokens, e.stage_tokens = [18432] * 16, 243712
+        for r in s.prefilling:
+            r.left = 95000 - done
+        return s
+    for done, n in ((0, 8), (40000, 8), (60000, 5), (90000, 3)):
+        s = spill_sched(done)
+        b = s._batch()
+        check(f"spill: 8 prompts {done} tokens in: {n} share the pass", len(b), n)
+        check(f"... and their spilled KV fits the buffer", sum(s._spilled(r, k) for r, k in b) <= 243712, True)
+        s.shutdown(1)
+    # a short continuation of a 200k conversation (cached but the last 1,000 tokens) fills most of the buffer: the
+    # long prompts still get one place in the pass, never none
+    s, e = sched([("c", 200000)] + [(f"L{i}", 95000) for i in range(8)])
+    e.vram_tokens, e.stage_tokens = [18432] * 16, 243712
+    for r in s.prefilling:
+        r.left = 1000 if r.name == "c" else 95000 - 60000
+    s._short_pass = True  # (the pass after the short ones' own)
+    check("spill: a deep short continuation and 8 long prompts", [r.name for r, _ in s._batch()], ["c", "L0"])
+    s.shutdown(1)
+
     # QW_SHORT_PASSES=4: a prompt of up to four passes is a short one
     Scheduler.SHORT_PASSES = 4
     s, _ = sched([(f"L{i}", 30000) for i in range(3)] + [("m0", 10000), ("m1", 3000)])

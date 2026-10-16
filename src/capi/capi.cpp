@@ -108,6 +108,10 @@ int64_t qw_slot_vram_tokens(qw_handle *h, int slot) {
     return guarded(h, [&] { return h->engine->slot_vram_tokens(slot); }, int64_t(-1));
 }
 
+int64_t qw_spill_stage_tokens(qw_handle *h) {
+    return guarded(h, [&] { return h->engine->spill_stage_tokens(); }, int64_t(0));
+}
+
 int64_t qw_slot_len(qw_handle *h, int slot) {
     return guarded(h, [&] { return h->engine->slot_len(slot); }, int64_t(-1));
 }

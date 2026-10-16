@@ -76,6 +76,9 @@ int64_t qw_slot_capacity(qw_handle *h, int slot);
 // Tokens of the slot's capacity that are in VRAM (the rest is KV spill in host RAM), and tokens the slot holds now.
 int64_t qw_slot_vram_tokens(qw_handle *h, int slot);
 int64_t qw_slot_len(qw_handle *h, int slot);
+// Spilled positions a prefill pass can stage in VRAM, summed over its prompts (0: no staging). A prompt of the pass
+// whose spilled part up to its piece's end does not fit after the earlier ones reads it from host RAM, ~2x slower.
+int64_t qw_spill_stage_tokens(qw_handle *h);
 
 /* Picks and reserves a free slot that can hold n + max_new tokens, preferring
  * the one that can reuse the most of `tokens`. Returns the slot, or -1 when

@@ -93,6 +93,9 @@ public:
     int num_slots() const { return int(slots_.size()); }
     int64_t slot_capacity(int slot) const;      // tokens the slot can hold: VRAM plus spill
     int64_t slot_vram_tokens(int slot) const;   // ... of which in VRAM
+    // Spilled positions one prefill pass can stage in VRAM, summed over its segments (EngineOptions::spill_stage): a
+    // segment whose region does not fit after the earlier ones reads its spilled KV from host RAM, ~2x slower. 0: none.
+    int64_t spill_stage_tokens() const;
     int64_t slot_len(int slot) const;
     int max_slot_tokens() const;
     int prefill_chunk() const { return opt_.prefill_chunk; }

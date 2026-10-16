@@ -94,6 +94,7 @@ class Engine:
             "qw_num_slots": (ctypes.c_int, [P]),
             "qw_slot_capacity": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_slot_vram_tokens": (ctypes.c_int64, [P, ctypes.c_int]),
+            "qw_spill_stage_tokens": (ctypes.c_int64, [P]),
             "qw_slot_len": (ctypes.c_int64, [P, ctypes.c_int]),
             "qw_acquire": (ctypes.c_int, [P, I32P, ctypes.c_int64, ctypes.c_int64]),
             "qw_release": (ctypes.c_int, [P, ctypes.c_int]),
@@ -138,6 +139,7 @@ class Engine:
         self.lib = lib
         self.capacity = [lib.qw_slot_capacity(self.h, i) for i in range(lib.qw_num_slots(self.h))]
         self.vram_tokens = [min(c, lib.qw_slot_vram_tokens(self.h, i)) for i, c in enumerate(self.capacity)]
+        self.stage_tokens = lib.qw_spill_stage_tokens(self.h)  # spilled positions a prefill pass stages in VRAM
         self.max_tokens = max(self.capacity)
         self.prefill_chunk = int(options.get("prefill_chunk", 8192))  # most tokens of one prefill_batch
         self.has_mtp = bool(lib.qw_has_mtp(self.h))

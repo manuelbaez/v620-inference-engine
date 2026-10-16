@@ -467,6 +467,9 @@ int64_t Engine::slot_capacity(int slot) const {
 int64_t Engine::slot_vram_tokens(int slot) const {
     return opt_.slot_tokens[size_t(slot)];
 }
+int64_t Engine::spill_stage_tokens() const {
+    return ranks_.empty() ? 0 : int64_t(ranks_[0]->stage_tokens);
+}
 int64_t Engine::slot_len(int slot) const {
     return slots_[size_t(slot)].len;
 }
