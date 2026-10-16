@@ -776,6 +776,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          FP8 scales. So no VRAM saving. Its PLE table is plain NVFP4 (E2M1, an E4M3 scale per 16, one FP32 scale):
          28.8 GB against int8's 57.6, host RAM rather than VRAM; unmeasured. Model card: GPQA Diamond 91.5% against
          92.2% for BF16 (one run each)
+   - [~] the FP4 checkpoint as a whole (2026-10-16, branch fp4-compressed, section "The FP4 checkpoint"): read as
+         published; its fp32 reference against ours on the 4,000-token set done; engine and task runs open
    - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
          all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
          a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop
@@ -3093,4 +3095,56 @@ production during the smoke test: 2.03 GB/s from and to the peers per card, 0.07
 GPU -> host, the four cards equal. Open: the speed A/B against `c439991` (the cost is one call and an atomic add per
 copy and collective, and one atomic per spill miss) and the comparison of decode bytes with graphs against
 `QW_NOGRAPH=1`, which must be equal.
+
+## The FP4 checkpoint (2026-10-16, branch fp4-compressed)
+
+`nvidia/Qwen3.8-Flash-Next-FP4-Local` (96 GiB, Hugging Face) is the model after quantization-aware distillation
+(QAD): NVIDIA trained the whole network with its quantization in place, so it is a different set of weights, not a
+rounding of the original. Its formats, from the headers:
+
+| part | format | |
+|---|---|---|
+| routed experts | NVFP4: E2M1 values, an E4M3 scale per 16 inputs (stored compressed, "csf"), FP32 per matrix | 121 B weights |
+| GDN and QSA projections, shared experts, vision attention | MXFP8: E4M3 values, a power-of-two scale per 32 inputs | 3.08 B |
+| embeddings, lm_head, router, hyper-connections, small GDN parameters | BF16 | 2.1 B |
+| norms | F32 | |
+| vision MLP, the MTP head's experts | NVFP4 with plain E4M3 scales | |
+| n-gram table | NVFP4, one FP32 scale for the table | 28.8 GB |
+
+Outside the experts the weights moved too: in layer 2 the router and the hyper-connection weights are 1.3% off the
+original (bf16 against bf16), the MXFP8 matrices 2.7-3.0%; the FP4 experts are 9.5% off the original bf16 experts
+there (ours, AWQ int4: 11-13%). So taking only its experts (or only its n-gram table) into our model measures a mix
+that was never trained: the whole checkpoint is the experiment.
+
+**Reading it.** The engine reads it as published (no converted copy): `SafeTensors` decodes on first use what the
+loaders read as bf16 (MXFP8 exactly, the vision NVFP4, the F32 norms, the MTP head's experts fused as the loader
+expects them; `core/fp_decode.{hpp,cpp}`), freed after loading (~11 GB of host RAM while loading); the routed experts
+are read natively (expert format `QGROUP_F4`: two E4M3 codes per 16-bit scale word, E2M1 decoded exactly to fp16 as
+value x 2^-14 and multiplied by the scale x 2^7, exact in fp16; the FP32 scale x 2^7 in the fp32 epilogue); the n-gram
+table is read from the checkpoint's shards and only its bytes pinned. The csf decoder follows
+`local-inference-lab/b12x` (Apache-2.0) and reproduces its encoder exactly. A first version converted the checkpoint
+with a Python tool (106 GB of output): the fp32 reference reading the published checkpoint gives the same log-probs,
+byte for byte, as reading that conversion, and the converter was removed.
+
+**VRAM** (per card, against the AWQ engine): experts at 4.5 bits per weight +1.4 GB. Two options, both lossless:
+`QW_DENSE_FP8=1` keeps the GDN and QSA matrices that are exactly MXFP8 as E4M3 bytes (checked at load; the bf16
+checkpoints' matrices are not, and stay fp16): -0.6 GB, decode reads 8-bit weights (`gemv_rows_i8` in an e4m3 mode),
+prefill expands each into a scratch per micro-batch before its GEMM. `QW_F4_PACKED=1` packs the expert scales: per
+row a base code and a 4-bit offset, offset 15 meaning "in the escape table" (0.5-0.8% of the real scales escape with
+the best base per row; 1.2% with median - 7): -0.8 GB. Both together: about -0.2 GB against today. Not yet run on
+the GPUs.
+
+**Against our model** (fp32 references of both, the 4,000-token set; AWQ with the bf16 n-gram table):
+
+| | |
+|---|---|
+| mean \|dlogprob\| FP4 against AWQ | 0.156 |
+| top-1 agreement | 93.2% |
+| log-likelihood of the text per token | AWQ -0.8731, FP4 -0.8660 |
+| FP4 - AWQ (paired bootstrap, 95% CI) | +0.0071 (-0.0074, +0.0216) |
+
+The two models differ a lot more than any precision change measured so far (int8 dense weights moved the outputs
+~0.03, other 4-bit experts 0.06-0.07): QAD made a different model. On predicting real text it is no worse, a little
+better if anything, but not significantly on 4,000 tokens. Open: the engine against this reference (exactness), the
+options' speed, then the task benchmarks (GPQA Diamond, LiveCodeBench v6) against the AWQ runs.
 
