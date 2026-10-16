@@ -3209,3 +3209,23 @@ options' speed, then the task benchmarks (GPQA Diamond, LiveCodeBench v6) agains
 Next: one scale conversion per lane and two running sums in the per-row expert kernels (decode, small); then FP4 in
 production for the task benchmarks, with self-consistency voting on GPQA as the next accuracy lever.
 
+**In production since 2026-10-16 23:18 UTC** (`qw-engine:bcf74a1`, branch fp4-compressed; ready in 291.5 s, smoke
+test passed). llama-swap: `--model-dir` and `--ple-dir /mnt/llms/qwen3.8-flash-next-fp4`, `--disk-cache-dir
+/cache/prefix-fp4 --disk-cache-gb 100` (the AWQ model's cached KV is wrong for it), `--slots` 16 x 16,384 (18,432 left
+1,626 MiB free per card after loading, 12 short of the check; 16,384 leaves 2.40 GiB), `healthCheckTimeout` 1800
+(was 900); compose: `QW_DENSE_FP8=1`, `QW_F4_PACKED=1`, `QW_MOE_COUNTS_FILE=/cache/moe_counts_fp4.txt`, the FP4
+directory mounted, `QW_EXPERT_PERM` off (AWQ's placement). The prefix cache stays 48 GB: at 72 its pools pinned in
+933 s at start (the host's page cache full of the day's checkpoint files), past the old 900 s timeout, and llama-swap
+restarted the engine in a loop for ~1 h. Back to AWQ: `config.yaml.bak-before-fp4-1016`,
+`docker-compose.yaml.bak-before-fp4-1016`, image `qw-engine:278fa01`.
+
+## Looping layers (2026-10-16)
+
+Could running some layers twice (a "looped" transformer) help on weights trained for one pass? The fp32 reference
+(`QW_REF_REPEAT=A-B:N`: after layer B, layers A..B N more times, each repeated pass with fresh GDN states and QSA
+caches) on the AWQ checkpoint, the 4,000-token set, against the unchanged model (byte-identical to the earlier
+reference): layers 8-15 once more +0.008 log-likelihood per token (CI -0.009, +0.024: no gain), 20-27 -0.027
+(-0.047, -0.007), 22-23 -0.013 (-0.028, -0.000), 36-43 -0.131 (-0.155, -0.107); top-1 the same as the unchanged model
+for 90-93% of the tokens. Not garbage, but no placement predicts the text better and later layers clearly worse:
+dropped. (Models trained to loop are another matter.)
+
