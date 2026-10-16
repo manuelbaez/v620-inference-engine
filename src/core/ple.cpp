@@ -1,6 +1,11 @@
 #include "core/ple.hpp"
 
+#include <sys/mman.h>
+
 #include <chrono>
+#include <fstream>
+#include <map>
+#include <set>
 
 #include "core/common.hpp"
 #include "core/json.hpp"
@@ -124,7 +129,54 @@ std::vector<NgramIds> NgramHasher::ids_for(const std::vector<int32_t> &history,
     return out;
 }
 
+void PleTable::open_checkpoint(const std::string &dir) {
+    const Json idx = Json::parse(read_file(dir + "/model.safetensors.index.json"));
+    std::map<int64_t, std::string> weights;  // shard -> its weight tensor
+    std::string global;
+    std::set<std::string> files;
+    for (const auto &kv : idx["weight_map"].obj) {
+        const std::string &n = kv.first;
+        const size_t at = n.find("ngram_embedding.");
+        if (at == std::string::npos) continue;
+        files.insert(kv.second.as_str());
+        if (n.compare(at, 22, "ngram_embedding.shard_") == 0 && n.size() > 7 && n.compare(n.size() - 7, 7, ".weight") == 0)
+            weights[std::stoll(n.substr(at + 22))] = n;
+        else if (n.size() > 15 && n.compare(n.size() - 15, 15, ".weight_scale_2") == 0)
+            global = n;
+    }
+    QW_CHECK(!weights.empty() && !global.empty(), dir + ": no n-gram table in the checkpoint (and no META.json)");
+    auto st = std::make_unique<SafeTensors>();
+    for (const auto &f : files) st->add_file(dir + "/" + f);
+    const TensorView &g = st->get(global);
+    QW_CHECK(g.dtype == DType::F32 && g.numel() == 1, global + ": one FP32 scale");
+    layout_ = Layout::F4;
+    for (int b = 0; b < 256; ++b) f8_[size_t(b)] = f8e4m3_to_f32(uint8_t(b));
+    rows_per_shard_ = st->get(weights.begin()->second).dim(0);
+    rows_ = 0;
+    for (const auto &[s, name] : weights) {
+        QW_CHECK(s == int64_t(q_.size()), dir + ": n-gram shards not numbered 0, 1, ...");
+        const TensorView &q = st->get(name, DType::U8, {st->get(name).dim(0), cfg::NGRAM_DIM / 2});
+        const TensorView &sc = st->get(name + "_scale", DType::F8E4M3, {q.dim(0), cfg::NGRAM_DIM / 16});
+        QW_CHECK(q.dim(0) == rows_per_shard_ || s == int64_t(weights.size()) - 1, "PLE shard row count");
+        q_.push_back(q.u8());
+        scale8_.push_back(sc.u8());
+        global_.push_back(g.f32()[0]);
+        ranges_.emplace_back(q.u8(), q.nbytes);
+        ranges_.emplace_back(sc.u8(), sc.nbytes);
+        rows_ += q.dim(0);
+    }
+    shards_.push_back(std::move(st));
+}
+
 PleTable::PleTable(const std::string &dir) {
+    if (!std::ifstream(dir + "/META.json") && std::ifstream(dir + "/model.safetensors.index.json")) {
+        open_checkpoint(dir);
+        NgramHasher h;
+        int64_t total = h.sizes().back();
+        for (int i = 0; i + 1 < cfg::NGRAM_HEADS; ++i) total += h.sizes()[size_t(i)];
+        QW_CHECK(total <= rows_, "PLE table has fewer rows than the n-gram vocabulary");
+        return;
+    }
     Json meta = Json::parse(read_file(dir + "/META.json"));
     const std::string layout = meta["layout"].as_str();
     if (layout == "group16_int4_fp16scale_lownibblefirst")
@@ -135,13 +187,11 @@ PleTable::PleTable(const std::string &dir) {
         layout_ = Layout::Bf16;
     else if (layout == "f8e4m3_tensorscale")
         layout_ = Layout::F8;
-    else if (layout == "group16_nvfp4_e4m3scale")
-        layout_ = Layout::F4;
     else
         fail("PLE sidecar: unsupported layout " + layout);
     QW_CHECK(meta["width"].as_int() == cfg::NGRAM_DIM, "PLE sidecar: width");
-    if (layout_ == Layout::F8 || layout_ == Layout::F4) {  // F4: the E4M3 scales' values
-        const float scale = layout_ == Layout::F8 ? float(meta["scale"].as_double()) : 1.f;
+    if (layout_ == Layout::F8) {
+        const float scale = float(meta["scale"].as_double());
         for (int b = 0; b < 256; ++b) f8_[size_t(b)] = f8e4m3_to_f32(uint8_t(b)) * scale;
     }
     rows_ = meta["rows"].as_int();
@@ -153,13 +203,12 @@ PleTable::PleTable(const std::string &dir) {
         const char *name = layout_ == Layout::Int4 ? "weight_i4"
                            : layout_ == Layout::Int8 ? "weight_i8"
                            : layout_ == Layout::F8   ? "weight_f8"
-                           : layout_ == Layout::F4   ? "weight_f4"
                                                      : "weight";
         const TensorView &q = st->get(name);
-        const DType want = layout_ == Layout::Int4 || layout_ == Layout::F8 || layout_ == Layout::F4 ? DType::U8
-                           : layout_ == Layout::Int8                                                ? DType::I8
-                                                                                                    : DType::BF16;
-        const int64_t width = layout_ == Layout::Int4 || layout_ == Layout::F4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
+        const DType want = layout_ == Layout::Int4 || layout_ == Layout::F8 ? DType::U8
+                           : layout_ == Layout::Int8                        ? DType::I8
+                                                                            : DType::BF16;
+        const int64_t width = layout_ == Layout::Int4 ? cfg::NGRAM_DIM / 2 : cfg::NGRAM_DIM;
         QW_CHECK(q.dtype == want && q.dim(1) == width, "PLE shard layout");
         QW_CHECK(q.dim(0) == rows_per_shard_ || s == n_shards - 1, "PLE shard row count");
         q_.push_back(q.u8());
@@ -167,15 +216,6 @@ PleTable::PleTable(const std::string &dir) {
             const TensorView &sc = st->get("weight_scale");
             QW_CHECK(sc.dtype == DType::F16 && sc.dim(1) == cfg::NGRAM_DIM / 16, "PLE scale layout");
             scale_.push_back(sc.u16());
-        }
-        if (layout_ == Layout::F4) {
-            const TensorView &sc = st->get("weight_scale");
-            QW_CHECK(sc.dtype == DType::U8 && sc.dim(1) == cfg::NGRAM_DIM / 16 && sc.dim(0) == q.dim(0),
-                     "PLE scale layout");
-            const TensorView &g = st->get("weight_global");
-            QW_CHECK(g.dtype == DType::F32 && g.numel() == 1, "PLE global scale");
-            scale8_.push_back(sc.u8());
-            global_.push_back(g.f32()[0]);
         }
         shards_.push_back(std::move(st));
     }
@@ -236,6 +276,11 @@ void PleTable::gather(const NgramIds &ids, float *out) const {
 }
 
 void PleTable::prefetch() const {
+    for (const auto &[p, n] : ranges_) {  // checkpoint mode: the table's bytes only, not the files around them
+        const uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(4095);
+        ::madvise(reinterpret_cast<void *>(a), n + (reinterpret_cast<uintptr_t>(p) - a), MADV_WILLNEED);
+    }
+    if (!ranges_.empty()) return;
     for (auto &s : shards_)
         for (auto &f : s->files()) f->prefetch();
 }
@@ -245,7 +290,21 @@ void PleTable::pin_in_background(bool lock) {
         const auto t0 = std::chrono::steady_clock::now();
         size_t bytes = 0;
         bool pinned = lock;
-        for (const auto &st : shards_)
+        for (const auto &[p, n] : ranges_) {  // checkpoint mode: the table's bytes only, not the files around them
+            if (stop_pin_) return;
+            const uintptr_t a = reinterpret_cast<uintptr_t>(p) & ~uintptr_t(4095);
+            void *at = reinterpret_cast<void *>(a);
+            const size_t len = n + (reinterpret_cast<uintptr_t>(p) - a);
+            if (!pinned || ::mlock(at, len) != 0) {
+                pinned = false;
+                volatile uint8_t sink = 0;
+                for (size_t i = 0; i < n; i += 4096) sink = sink + p[i];
+                (void)sink;
+            }
+            bytes += n;
+        }
+        for (const auto &st : shards_) {
+            if (!ranges_.empty()) break;
             for (const auto &f : st->files()) {
                 if (stop_pin_) return;
                 if (!pinned || !f->lock()) {
@@ -254,6 +313,7 @@ void PleTable::pin_in_background(bool lock) {
                 }
                 bytes += f->size();
             }
+        }
         log("PLE table: %.1f GB %s in RAM in %.0f s", double(bytes) / 1e9,
             pinned ? "pinned"
             : lock ? "read (mlock refused)"

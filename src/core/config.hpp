@@ -85,7 +85,7 @@ inline uint16_t qz_word(uint16_t f16_scale, int zp_nibble) {
     return uint16_t(f16_scale | ((zp_nibble & 8) << 12) | (zp_nibble & 7));
 }
 inline int qz_nibble(uint16_t word) { return ((word >> 12) & 8) | (word & 7); }
-// Or NVFP4 (an experiment: nvidia/Qwen3.8-Flash-Next-FP4-Local through tools/fp4_convert.py, docs/DESIGN.md "The FP4
+// Or NVFP4 (an experiment: nvidia/Qwen3.8-Flash-Next-FP4-Local read as published, docs/DESIGN.md "The FP4
 // checkpoint"): E2M1 values, an E4M3 scale per 16 inputs and an FP32 scale per matrix. The engine keeps the two E4M3
 // scales of 32 inputs in one 16-bit word (the first 16 inputs' in the low byte), so its scale words are 32 inputs
 // apart, like QGROUP_Z's.

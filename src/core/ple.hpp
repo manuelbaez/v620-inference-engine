@@ -42,7 +42,8 @@ private:
 
 class PleTable {
 public:
-    // Opens <dir>/META.json and the shard_*.safetensors files.
+    // Opens <dir>/META.json and the shard_*.safetensors files; or, without META.json, the n-gram table inside the
+    // checkpoint in <dir> (a ModelOpt one, NVFP4: model.safetensors.index.json names its shards).
     explicit PleTable(const std::string &dir);
 
     int64_t rows() const { return rows_; }
@@ -66,12 +67,14 @@ private:
     // low nibble first, stored + 8), group16_int8_fp16scale (weight_i8 i8 [rows][160]),
     // both with weight_scale f16 [rows][10]; bf16 (weight bf16 [rows][160]); or
     // f8e4m3_tensorscale (weight_f8 u8 [rows][160] of fp8 e4m3, times META.json "scale":
-    // the official FP8 checkpoint's table, one scale for all of it); or group16_nvfp4_e4m3scale (weight_f4 u8
-    // [rows][80] of E2M1, the even value in the low nibble, weight_scale u8 [rows][10] of E4M3, weight_global f32 [1]
-    // per shard: the table of nvidia/Qwen3.8-Flash-Next-FP4-Local, tools/fp4_convert.py).
+    // the official FP8 checkpoint's table, one scale for all of it); or F4, read from a ModelOpt checkpoint
+    // (nvidia/Qwen3.8-Flash-Next-FP4-Local: ngram_embedding.shard_<i>.weight u8 [rows][80] of E2M1, the even value in
+    // the low nibble, .weight_scale [rows][10] of E4M3, one FP32 ngram_embedding.weight_scale_2 for the table).
+    void open_checkpoint(const std::string &dir);
     enum class Layout { Int4, Int8, Bf16, F8, F4 } layout_ = Layout::Int4;
     std::vector<const uint8_t *> scale8_;  // per shard: F4's E4M3 scales
     std::vector<float> global_;            // per shard: F4's scale
+    std::vector<std::pair<const uint8_t *, size_t>> ranges_;  // F4: the table's bytes in the checkpoint's files
     std::array<float, 256> f8_{};  // F8: each e4m3 byte's value times the scale
     int64_t rows_ = 0, rows_per_shard_ = 0;
     std::vector<std::unique_ptr<SafeTensors>> shards_;

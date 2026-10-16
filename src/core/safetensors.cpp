@@ -10,6 +10,7 @@
 #include <sstream>
 
 #include "core/common.hpp"
+#include "core/fp_decode.hpp"
 #include "core/json.hpp"
 
 namespace qw {
@@ -26,7 +27,10 @@ size_t dtype_size(DType t) {
             return 8;
         case DType::U8:
         case DType::I8:
+        case DType::F8E4M3:
             return 1;
+        case DType::U32:
+            return 4;
     }
     return 0;
 }
@@ -47,6 +51,10 @@ const char *dtype_name(DType t) {
             return "U8";
         case DType::I8:
             return "I8";
+        case DType::F8E4M3:
+            return "F8_E4M3";
+        case DType::U32:
+            return "U32";
     }
     return "?";
 }
@@ -59,6 +67,8 @@ static DType parse_dtype(const std::string &s) {
     if (s == "I64") return DType::I64;
     if (s == "U8") return DType::U8;
     if (s == "I8") return DType::I8;
+    if (s == "F8_E4M3") return DType::F8E4M3;
+    if (s == "U32") return DType::U32;
     fail("safetensors: unsupported dtype " + s);
 }
 
@@ -143,10 +153,91 @@ void SafeTensors::add_index(const std::string &dir, const std::vector<std::strin
     for (auto &n : names) add_file(dir + "/" + n);
 }
 
+namespace {
+bool ends_with(const std::string &s, const std::string &e) {
+    return s.size() >= e.size() && s.compare(s.size() - e.size(), e.size(), e) == 0;
+}
+const char *MTP_GU = "mtp.layers.0.mlp.experts.gate_up_proj", *MTP_DOWN = "mtp.layers.0.mlp.experts.down_proj";
+}  // namespace
+
+bool SafeTensors::synthesized(const std::string &name) const {
+    return (name == MTP_GU || name == MTP_DOWN) && !tensors_.count(name) &&
+           tensors_.count("mtp.layers.0.mlp.experts.0.gate_proj.weight_scale_2");
+}
+
+bool SafeTensors::needs_decoding(const TensorView &t) const {
+    if (!ends_with(t.name, ".weight")) return false;
+    const std::string base = t.name.substr(0, t.name.size() - 7);
+    if (t.dtype == DType::F8E4M3) return tensors_.count(base + ".weight_scale") != 0;  // MXFP8
+    if (t.dtype == DType::U8)  // NVFP4, but not the routed experts
+        return tensors_.count(base + ".weight_scale_2") &&
+               !(t.name.rfind("model.language_model.", 0) == 0 && t.name.find(".mlp.experts.") != std::string::npos);
+    return t.dtype == DType::F32 && ends_with(t.name, "norm.weight");
+}
+
+void SafeTensors::decode(const std::string &name, Decoded &d) const {
+    auto nvfp4_rows = [&](const std::string &base, float *out) {  // [rows][cols] fp32
+        const TensorView &w = tensors_.at(base + ".weight"), &s = tensors_.at(base + ".weight_scale");
+        const TensorView &g = tensors_.at(base + ".weight_scale_2");
+        QW_CHECK(w.dtype == DType::U8 && s.dtype == DType::F8E4M3 && g.dtype == DType::F32 && g.numel() == 1 &&
+                     s.dim(0) == w.dim(0) && s.dim(1) * 8 == w.dim(1),
+                 base + ": unexpected NVFP4 layout");
+        nvfp4_to_f32(w.u8(), s.u8(), *static_cast<const float *>(g.data), size_t(w.dim(0)), size_t(2 * w.dim(1)), out);
+    };
+    if (name == MTP_GU || name == MTP_DOWN) {
+        const bool gu = name == MTP_GU;
+        int64_t E = 0;
+        while (tensors_.count("mtp.layers.0.mlp.experts." + std::to_string(E) + ".down_proj.weight")) ++E;
+        const TensorView &w0 = tensors_.at(std::string("mtp.layers.0.mlp.experts.0.") + (gu ? "gate" : "down") + "_proj.weight");
+        const int64_t R = w0.dim(0), K = 2 * w0.dim(1), rows = gu ? 2 * R : R;
+        d.data.resize(size_t(E * rows * K));
+        std::vector<float> m(size_t(R * K));
+        for (int64_t e = 0; e < E; ++e)
+            for (int part = 0; part < (gu ? 2 : 1); ++part) {
+                nvfp4_rows("mtp.layers.0.mlp.experts." + std::to_string(e) + "." +
+                               (gu ? (part ? "up_proj" : "gate_proj") : "down_proj"),
+                           m.data());
+                uint16_t *dst = d.data.data() + size_t((e * rows + part * R) * K);
+                for (size_t i = 0; i < m.size(); ++i) dst[i] = f32_to_bf16(m[i]);
+            }
+        d.view = {name, DType::BF16, {E, rows, K}, d.data.data(), d.data.size() * 2};
+        return;
+    }
+    const TensorView &t = tensors_.at(name);
+    const std::string base = name.substr(0, name.size() - 7);
+    if (t.dtype == DType::F32) {
+        d.data.resize(size_t(t.numel()));
+        const float *f = static_cast<const float *>(t.data);
+        for (size_t i = 0; i < d.data.size(); ++i) d.data[i] = f32_to_bf16(f[i]);
+        d.view = {name, DType::BF16, t.shape, d.data.data(), d.data.size() * 2};
+        return;
+    }
+    QW_CHECK(t.shape.size() == 2, name + ": a quantized tensor that is not a matrix");
+    const int64_t rows = t.dim(0), cols = t.dtype == DType::U8 ? 2 * t.dim(1) : t.dim(1);
+    d.data.resize(size_t(rows * cols));
+    if (t.dtype == DType::F8E4M3) {
+        const TensorView &s = tensors_.at(base + ".weight_scale");
+        QW_CHECK(s.dtype == DType::U8 && s.dim(0) == rows && s.dim(1) * 32 == cols, name + ": unexpected MXFP8 scale");
+        mxfp8_to_bf16(t.u8(), s.u8(), size_t(rows), size_t(cols), d.data.data());
+    } else {
+        std::vector<float> m(size_t(rows * cols));
+        nvfp4_rows(base, m.data());
+        for (size_t i = 0; i < m.size(); ++i) d.data[i] = f32_to_bf16(m[i]);
+    }
+    d.view = {name, DType::BF16, {rows, cols}, d.data.data(), d.data.size() * 2};
+}
+
 const TensorView &SafeTensors::get(const std::string &name) const {
     auto it = tensors_.find(name);
-    if (it == tensors_.end()) fail("missing tensor " + name);
-    return it->second;
+    if (it != tensors_.end() && !needs_decoding(it->second)) return it->second;
+    if (it == tensors_.end() && !synthesized(name)) fail("missing tensor " + name);
+    std::lock_guard<std::mutex> lk(mu_);
+    auto &d = decoded_[name];
+    if (!d) {
+        d = std::make_unique<Decoded>();
+        decode(name, *d);
+    }
+    return d->view;
 }
 
 const TensorView &SafeTensors::get(const std::string &name, DType dt, std::vector<int64_t> shape) const {

@@ -60,12 +60,15 @@ int check_config(const std::string &model_dir) {
         bool full = layer_types[size_t(i)].as_str() == "full_attention";
         QW_CHECK(full == is_qsa(i), "config.json: layer_types pattern differs");
     }
-    const Json &q = root["quantization_config"]["config_groups"]["group_0"]["weights"];
-    const int64_t group = q["group_size"].as_int();
-    if (root["quantization_config"]["quant_method"].as_str() == "qw-nvfp4") {
-        QW_CHECK(q["num_bits"].as_int() == 4 && group == QGROUP_F4, "config.json: qw-nvfp4 needs 4 bits, groups of 16");
+    const Json &qc = root["quantization_config"];
+    if (qc["quant_method"].as_str() == "modelopt") {  // nvidia/Qwen3.8-Flash-Next-FP4-Local: NVFP4 routed experts
+        const Json &e = qc["quantized_layers"]["model.language_model.layers.0.mlp.experts"];
+        QW_CHECK(e["quant_algo"].as_str() == "NVFP4" && e["group_size"].as_int() == QGROUP_F4,
+                 "config.json: a ModelOpt checkpoint whose routed experts are not NVFP4 with groups of 16");
         return QGROUP_F4;
     }
+    const Json &q = qc["config_groups"]["group_0"]["weights"];
+    const int64_t group = q["group_size"].as_int();
     QW_CHECK(q["num_bits"].as_int() == 4 && ((group == QGROUP && q["symmetric"].as_bool()) || group == QGROUP_Z),
              "config.json: experts are neither symmetric int4 g128 nor int4 g32");
     return int(group);

@@ -17,6 +17,7 @@
 
 #include "comm/pcie_traffic.hpp"
 #include "core/common.hpp"
+#include "core/fp_decode.hpp"
 #include "engine/device_mem.hpp"
 #include "engine/rank.hpp"
 #include "engine/weight_convert.hpp"
@@ -384,10 +385,10 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
     // (then one word per group holds both, core/config.hpp).
     if (!bf16_experts) {
         const std::string e0 = mp + "experts." + std::to_string(expert(r * EXP_L)) + ".gate_proj.weight_";
-        w.egroup = int(H / st.get(e0 + "scale").dim(1));
-        if (st.get(e0 + "scale").dtype == DType::U8) {  // NVFP4 (tools/fp4_convert.py): E4M3 scales per 16, a global
-            QW_CHECK(w.egroup == QGROUP_F4 && st.has(e0 + "global"), e0 + "scale: NVFP4 needs groups of 16 and a global");
+        if (st.has(e0 + "scale_2")) {  // NVFP4 (a ModelOpt checkpoint): E4M3 scales per 16 inputs, a global per matrix
+            w.egroup = QGROUP_F4;
         } else {
+            w.egroup = int(H / st.get(e0 + "scale").dim(1));
             QW_CHECK(w.egroup == QGROUP || w.egroup == QGROUP_Z, e0 + "scale: unsupported group size");
         }
         QW_CHECK(w.egroup == QGROUP_Z || !st.has(e0 + "zero_point"), e0 + "zero_point: zero points need groups of 32");
@@ -405,15 +406,33 @@ void load_layer(WeightCache &wc, LayerW &w, const SafeTensors &st, ThreadPool &p
             pool.parallel_for(EXP_L, 1, [&](int64_t b, int64_t e) {
                 for (int64_t i = b; i < e; ++i) {
                     const std::string ep = mp + "experts." + std::to_string(expert(r * EXP_L + i)) + "." + proj;
-                    const TensorView &pw = st.get(ep + ".weight_packed", DType::I32, {rows, K / 8});
-                    pack_int4_words(pw.i32(), packed.data() + size_t(i) * words, words);
                     uint16_t *sc = scales.data() + size_t(i) * groups;
-                    if (G == QGROUP_F4) {  // two E4M3 bytes per word, the first 16 inputs' low (core/config.hpp)
-                        const uint8_t *b = st.get(ep + ".weight_scale", DType::U8, {rows, K / 16}).u8();
-                        for (size_t g = 0; g < groups; ++g) sc[g] = uint16_t(b[2 * g] | (b[2 * g + 1] << 8));
-                        glob[i] = st.get(ep + ".weight_global", DType::F32, {1}).f32()[0] * 128.f;  // exact
+                    if (G == QGROUP_F4) {
+                        // the E2M1 bytes as int4 words (same nibble order), two E4M3 codes per scale word (the first
+                        // 16 inputs' in the low byte, core/config.hpp), the scales from their csf form if stored so
+                        const TensorView &q = st.get(ep + ".weight", DType::U8, {rows, K / 2});
+                        std::vector<int32_t> ct(words);
+                        std::memcpy(ct.data(), q.u8(), words * 4);
+                        pack_int4_words(ct.data(), packed.data() + size_t(i) * words, words);
+                        std::vector<uint8_t> codes(size_t(rows) * K / 16);
+                        if (st.has(ep + ".weight_scale.nvfp4_csf_fixed")) {
+                            const TensorView &x = st.get(ep + ".weight_scale.nvfp4_csf_exceptions");
+                            QW_CHECK(x.dtype == DType::U32, ep + ": csf exceptions");
+                            csf_expand(st.get(ep + ".weight_scale.nvfp4_csf_fixed").u8(),
+                                       static_cast<const uint32_t *>(x.data), size_t(x.numel()), size_t(rows),
+                                       size_t(K / 16), codes.data());
+                        } else {
+                            std::memcpy(codes.data(), st.get(ep + ".weight_scale", DType::F8E4M3, {rows, K / 16}).u8(),
+                                        codes.size());
+                        }
+                        for (size_t g = 0; g < groups; ++g) sc[g] = uint16_t(codes[2 * g] | (codes[2 * g + 1] << 8));
+                        const TensorView &g2 = st.get(ep + ".weight_scale_2");
+                        QW_CHECK(g2.dtype == DType::F32 && g2.numel() == 1, ep + ".weight_scale_2");
+                        glob[i] = g2.f32()[0] * 128.f;  // exact
                         continue;
                     }
+                    const TensorView &pw = st.get(ep + ".weight_packed", DType::I32, {rows, K / 8});
+                    pack_int4_words(pw.i32(), packed.data() + size_t(i) * words, words);
                     const TensorView &sw = st.get(ep + ".weight_scale", DType::BF16, {rows, K / G});
                     for (size_t g = 0; g < groups; ++g) sc[g] = bf16_to_f16(sw.u16()[g]);
                     if (G == QGROUP) continue;

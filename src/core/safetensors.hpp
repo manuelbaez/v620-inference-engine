@@ -3,13 +3,14 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace qw {
 
-enum class DType { F32, F16, BF16, I32, I64, U8, I8 };
+enum class DType { F32, F16, BF16, I32, I64, U8, I8, F8E4M3, U32 };
 
 size_t dtype_size(DType t);
 const char *dtype_name(DType t);
@@ -63,12 +64,18 @@ public:
     void add_index(const std::string &dir, const std::vector<std::string> &extra = {});
 
     const std::vector<std::unique_ptr<MappedFile>> &files() const { return files_; }
-    bool has(const std::string &name) const { return tensors_.count(name) != 0; }
-    // Unmaps every file (views into them become invalid).
+    bool has(const std::string &name) const { return tensors_.count(name) != 0 || synthesized(name); }
+    // Unmaps every file (views into them become invalid) and frees the decoded tensors.
     void clear() {
+        std::lock_guard<std::mutex> lk(mu_);
+        decoded_.clear();
         tensors_.clear();
         files_.clear();
     }
+    // A ModelOpt checkpoint's tensors the loaders read as bf16 come back decoded (core/fp_decode.hpp), on first use,
+    // kept until clear(): MXFP8 and NVFP4 matrices other than the routed experts (whose loaders read NVFP4 as it is),
+    // F32 norms (rounded to bf16), and the MTP head's fused experts (mtp.layers.0.mlp.experts.gate_up_proj and
+    // down_proj, from its NVFP4 experts). Other checkpoints have none of these: their tensors are returned as stored.
     const TensorView &get(const std::string &name) const;
     // get() plus a dtype and shape check.
     const TensorView &get(const std::string &name, DType dt, std::vector<int64_t> shape) const;
@@ -76,8 +83,18 @@ public:
     const std::unordered_map<std::string, TensorView> &all() const { return tensors_; }
 
 private:
+    struct Decoded {
+        std::vector<uint16_t> data;
+        TensorView view;
+    };
+    bool synthesized(const std::string &name) const;  // the MTP fused experts of a ModelOpt checkpoint
+    bool needs_decoding(const TensorView &t) const;
+    void decode(const std::string &name, Decoded &d) const;
+
     std::vector<std::unique_ptr<MappedFile>> files_;
     std::unordered_map<std::string, TensorView> tensors_;
+    mutable std::mutex mu_;
+    mutable std::unordered_map<std::string, std::unique_ptr<Decoded>> decoded_;
 };
 
 std::string read_file(const std::string &path);

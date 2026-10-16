@@ -19,6 +19,7 @@ find_package(Threads REQUIRED)
 # ---------------------------------------------------------------- host libraries
 add_library(qw_core STATIC
   src/core/config.cpp
+  src/core/fp_decode.cpp
   src/core/json.cpp
   src/core/ple.cpp
   src/core/safetensors.cpp)
