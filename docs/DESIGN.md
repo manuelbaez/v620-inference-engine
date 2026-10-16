@@ -3156,7 +3156,8 @@ options' speed, then the task benchmarks (GPQA Diamond, LiveCodeBench v6) agains
   and in decode; `QW_DENSE_FP8=1` byte-identical prefill (the expanded matrices are the fp16 copies). Determinism:
   6 repeats of speculative decoding, same tokens, and equal to plain greedy. `test_fp8_dense --gpu`: the expansion
   bit for bit, the 8-bit GEMV within float rounding of the fp16 one. The branch-free E4M3 scale (45c0699) and the
-  GEMV unpacking once per block (5beea1c) are byte-identical too.
+  GEMV unpacking once per block (5beea1c) are byte-identical too; the branch-free scale is +0.4% in FP4 prefill
+  (2,284 -> 2,293 tok/s, two alternating rounds each): within noise.
 - *8-bit dense decode accuracy.* Token-by-token decode against the reference: plain 0.0914, 8-bit dense 0.1048 on
   tokens 1-1,000 (+0.013), but -0.004 on tokens 2,001-3,000: the two paths round differently and the recurrent
   state carries any difference forward, so each span is one draw; no systematic loss (the token-level CI is too
