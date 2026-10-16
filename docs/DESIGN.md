@@ -769,6 +769,13 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
          experts of a few layers and compare AWQ and NVFP4 reconstruction error weighted by
          typical inputs (hours); only if NVFP4 is clearly closer, build the kernels and measure
          against a reference with bf16 experts
+         2026-10-16, `nvidia/Qwen3.8-Flash-Next-FP4-Local` read (headers only): routed experts QAD-trained NVFP4
+         with the E4M3 block scales compressed losslessly ("csf": a 4-bit code per scale plus a short exception list
+         per matrix; the decoder is only in a community vLLM fork), ~4.26 bits per weight against our 4.125: experts
+         ~64.3 GB, +0.5 GiB per card with csf kept (kernels would have to apply the exceptions), +1.5 GiB with plain
+         FP8 scales. So no VRAM saving. Its PLE table is plain NVFP4 (E2M1, an E4M3 scale per 16, one FP32 scale):
+         28.8 GB against int8's 57.6, host RAM rather than VRAM; unmeasured. Model card: GPQA Diamond 91.5% against
+         92.2% for BF16 (one run each)
    - [ ] MTP drafts over a reduced vocabulary: most of a draft step (1.36 ms) is the lm_head over
          all 248k tokens; drafting over the ~32k most frequent ones would cut that ~8x (~1-1.5 ms
          a step, ~5% estimated). Output unchanged (verification is exact); acceptance may drop
