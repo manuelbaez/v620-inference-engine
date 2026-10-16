@@ -64,11 +64,11 @@ __device__ __forceinline__ uint32_t fp4_2_to_h2(uint32_t w) {
 }
 // An E4M3 scale byte -> fp16 of value x 2^7 (exact: 3 mantissa bits, 448 x 128 < 65504). Times an E2M1 value x 2^-14
 // that gives value x scale x 2^-7, exact in fp16 too (at most 5 significant bits, >= 2^-17); the 2^7 is in the FP32
-// scale per matrix (Rank weights `eglob`).
+// scale per matrix (Rank weights `eglob`). Without a branch: the byte's bits moved into fp16's read as value x 2^-8,
+// exactly (E4M3 subnormals land on fp16 subnormals; gemv.hip e4m3x4_to_h2x2), then x 2^15, exact.
 __device__ __forceinline__ _Float16 e4m3_x128(uint32_t b) {
-    const uint32_t e = (b >> 3) & 15, m = b & 7;
-    const _Float16 v = e ? __builtin_bit_cast(_Float16, uint16_t(((e + 15) << 10) | (m << 7))) : (_Float16)(0.25f * float(m));
-    return (b & 0x80) ? -v : v;
+    const _Float16 v = __builtin_bit_cast(_Float16, uint16_t(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8)));
+    return v * (_Float16)32768.0f;
 }
 __device__ __forceinline__ void dequant32_f4(const uint4 &w, uint32_t word, __half *dst) {
     typedef _Float16 h2 __attribute__((ext_vector_type(2)));
