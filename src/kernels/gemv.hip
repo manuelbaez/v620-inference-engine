@@ -64,20 +64,12 @@ __device__ __forceinline__ void e4m3x4_to_h2x2(uint32_t w, uint32_t &lo, uint32_
     hi = ((w >> 9) & 0x3F80u) | ((w >> 8) & 0x8000u) | ((w >> 1) & 0x3F800000u) | (w & 0x80000000u);
 }
 
-// 16 int8 (or E4M3) weights as 8 fp16 pairs.
-template <bool F8 = false>
+// 16 int8 weights as 8 fp16 pairs.
 __device__ __forceinline__ void unpack16_i8(const uint4 &w, uint32_t h[8]) {
-    if constexpr (F8) {
-        e4m3x4_to_h2x2(w.x, h[0], h[1]);
-        e4m3x4_to_h2x2(w.y, h[2], h[3]);
-        e4m3x4_to_h2x2(w.z, h[4], h[5]);
-        e4m3x4_to_h2x2(w.w, h[6], h[7]);
-    } else {
-        i8x4_to_h2x2(w.x, h[0], h[1]);
-        i8x4_to_h2x2(w.y, h[2], h[3]);
-        i8x4_to_h2x2(w.z, h[4], h[5]);
-        i8x4_to_h2x2(w.w, h[6], h[7]);
-    }
+    i8x4_to_h2x2(w.x, h[0], h[1]);
+    i8x4_to_h2x2(w.y, h[2], h[3]);
+    i8x4_to_h2x2(w.z, h[4], h[5]);
+    i8x4_to_h2x2(w.w, h[6], h[7]);
 }
 
 // ... against 16 fp16 activations (two uint4).
@@ -92,7 +84,57 @@ __device__ __forceinline__ float dot16_h(const uint32_t h[8], const uint4 &x0, c
     return dot2(h[7], x1.w, acc);
 }
 
-template <int M, bool F8>
+// E4M3 weights in gemv_rows_kernel's layout of work: 8 weights (8 bytes) per lane and chunk, two chunks per step,
+// each chunk expanded exactly to fp16 (value x 2^-8) and its dot product times the scale of its 32 weights. Half the
+// bytes of the fp16 kernel for the same arithmetic (gemv_rows_i8 in its e4m3 mode).
+template <int M>
+__global__ __launch_bounds__(256) void gemv_rows_e4m3_kernel(const uint2 *__restrict__ W, const float *__restrict__ scale,
+                                                             const uint4 *__restrict__ x, int xs16, float *__restrict__ y,
+                                                             int ys, int N, int K, int rpg, int accumulate) {
+    const int lane = threadIdx.x % WAVE;
+    const int row = blockIdx.x * (blockDim.x / WAVE) + threadIdx.x / WAVE;
+    if (row >= N) return;
+    const int chunks = K / 8;
+    constexpr int CPG = I8_GROUP / 8;  // chunks per scale group
+    const uint2 *w = W + size_t(row) * chunks;
+    const float *sc = scale + size_t(row) * (K / I8_GROUP);
+    if (rpg) x += size_t(row / rpg) * chunks;
+    float acc[M];
+#pragma unroll
+    for (int m = 0; m < M; ++m) acc[m] = 0.f;
+    auto expand = [](const uint2 &b) {
+        uint4 h;
+        e4m3x4_to_h2x2(b.x, h.x, h.y);
+        e4m3x4_to_h2x2(b.y, h.z, h.w);
+        return h;
+    };
+    int c = lane;
+    for (; c + WAVE < chunks; c += 2 * WAVE) {
+        const uint4 w0 = expand(w[c]), w1 = expand(w[c + WAVE]);
+        const float s0 = sc[c / CPG], s1 = sc[(c + WAVE) / CPG];
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            acc[m] += s0 * dot8(w0, x[size_t(m) * xs16 + c], 0.f);
+            acc[m] += s1 * dot8(w1, x[size_t(m) * xs16 + c + WAVE], 0.f);
+        }
+    }
+    if (c < chunks) {
+        const uint4 w0 = expand(w[c]);
+        const float s0 = sc[c / CPG];
+#pragma unroll
+        for (int m = 0; m < M; ++m) acc[m] += s0 * dot8(w0, x[size_t(m) * xs16 + c], 0.f);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        const float v = wave_sum(acc[m]);
+        if (lane == 0) {
+            float *o = y + size_t(m) * ys + row;
+            *o = accumulate ? *o + v : v;
+        }
+    }
+}
+
+template <int M>
 __global__ __launch_bounds__(256) void gemv_rows_i8_kernel(const uint4 *__restrict__ W, const float *__restrict__ scale,
                                                            const uint4 *__restrict__ x, int xs16, float *__restrict__ y,
                                                            int ys, int N, int K, int rpg, int accumulate) {
@@ -110,8 +152,8 @@ __global__ __launch_bounds__(256) void gemv_rows_i8_kernel(const uint4 *__restri
     int c = lane;
     for (; c + WAVE < chunks; c += 2 * WAVE) {
         uint32_t h0[8], h1[8];  // unpacked once for all M rows
-        unpack16_i8<F8>(w[c], h0);
-        unpack16_i8<F8>(w[c + WAVE], h1);
+        unpack16_i8(w[c], h0);
+        unpack16_i8(w[c + WAVE], h1);
         const float s0 = sc[c / CPG], s1 = sc[(c + WAVE) / CPG];
 #pragma unroll
         for (int m = 0; m < M; ++m) {
@@ -122,7 +164,7 @@ __global__ __launch_bounds__(256) void gemv_rows_i8_kernel(const uint4 *__restri
     }
     if (c < chunks) {
         uint32_t h0[8];
-        unpack16_i8<F8>(w[c], h0);
+        unpack16_i8(w[c], h0);
         const float s0 = sc[c / CPG];
 #pragma unroll
         for (int m = 0; m < M; ++m) {
@@ -149,9 +191,10 @@ void gemv_rows_i8(const int8_t *W8, const float *scale, const uint16_t *x, int x
 #define CASE(m)                                                                                                       \
     case m:                                                                                                           \
         if (e4m3)                                                                                                     \
-            gemv_rows_i8_kernel<m, true><<<grid, block, 0, s>>>(w, scale, xv, xs / 8, y, ys, N, K, rpg, accumulate);  \
+            gemv_rows_e4m3_kernel<m><<<grid, block, 0, s>>>(reinterpret_cast<const uint2 *>(W8), scale, xv, xs / 8, y, \
+                                                            ys, N, K, rpg, accumulate);                                   \
         else                                                                                                          \
-            gemv_rows_i8_kernel<m, false><<<grid, block, 0, s>>>(w, scale, xv, xs / 8, y, ys, N, K, rpg, accumulate); \
+            gemv_rows_i8_kernel<m><<<grid, block, 0, s>>>(w, scale, xv, xs / 8, y, ys, N, K, rpg, accumulate);        \
         break;
         CASE(1)
         CASE(2)

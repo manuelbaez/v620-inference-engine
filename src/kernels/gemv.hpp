@@ -19,8 +19,9 @@ void gemv_rows(const uint16_t *W, const uint16_t *x, int xs, float *y, int ys, i
 #define QW_I8_GROUP 32  // 16 or 32 (a multiple of the kernel's 16-weight chunks)
 #endif
 constexpr int I8_GROUP = QW_I8_GROUP;
-// e4m3: the bytes are E4M3 instead (MXFP8 matrices kept 8-bit, EngineOptions::dense_fp8), read as value x 2^-8
-// (exact in fp16): W[n][k] = E4M3(W8[n][k]) * 2^-8 * scale[n][k / I8_GROUP].
+// e4m3: the bytes are E4M3 instead (MXFP8 matrices kept 8-bit, QW_DENSE_FP8), read as value x 2^-8 (exact in fp16):
+// W[n][k] = E4M3(W8[n][k]) * 2^-8 * scale[n][k / I8_GROUP]; computed like gemv_rows with half its bytes. K: a
+// multiple of 32.
 void gemv_rows_i8(const int8_t *W8, const float *scale, const uint16_t *x, int xs, float *y, int ys, int N, int K, int M,
                   int rpg, bool accumulate, hipStream_t s, bool e4m3 = false);
 // The fp16 matrix of such E4M3 weights (prefill's GEMMs): out[n][k] = fp16(E4M3 * 2^-8 * scale), clamped to +-65504
