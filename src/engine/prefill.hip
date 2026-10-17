@@ -138,6 +138,12 @@ void Engine::run_prefill_rank(Rank &rk) {
         }
     }
     const bool staging = std::any_of(stage_off.begin(), stage_off.end(), [](int64_t o) { return o >= 0; });
+    for (size_t i = 0; i < segs.size(); ++i) {  // the spilled rows an unstaged segment's kernels write to the host
+        const Rank::Slot &sl = rk.slots[size_t(segs[i].slot)];
+        const int64_t a = std::max<int64_t>(segs[i].start, sl.vt), e = segs[i].start + segs[i].T;
+        if (stage_off[i] < 0 && !sl.Kh.empty() && e > a)
+            pcie::add(r, pcie::SpillWrite, uint64_t(e - a) * uint64_t(N_QSA + int(mtp_)) * SpillPool::token_bytes());
+    }
     // The rows of layer qi each staged segment already holds in host memory go into the buffer (rows [vt, first) with
     // `first` the first position the chunk writes in that layer), after the previous layer's write-back freed it.
     // first_of(i): that position for segment i (the MTP layer's rows start one early when the store holds a hidden).
@@ -150,8 +156,9 @@ void Engine::run_prefill_rank(Rank &rk) {
             const int64_t n = first_of(i) - sl.vt;
             if (n <= 0) continue;
             const size_t o = size_t(stage_off[i]) * HEAD_DIM;
-            CK(pcie::copy_async(rk.stage_k + o, sl.Kh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
-            CK(pcie::copy_async(rk.stage_v + o, sl.Vh[qi], size_t(n) * HEAD_DIM * 2, hipMemcpyHostToDevice, rk.s3));
+            const size_t bytes = size_t(n) * HEAD_DIM * 2;
+            CK(pcie::copy_async_as(pcie::SpillStageIn, r, rk.stage_k + o, sl.Kh[qi], bytes, hipMemcpyHostToDevice, rk.s3));
+            CK(pcie::copy_async_as(pcie::SpillStageIn, r, rk.stage_v + o, sl.Vh[qi], bytes, hipMemcpyHostToDevice, rk.s3));
         }
         CK(hipEventRecord(rk.stage_ready, rk.s3));
     };
@@ -166,10 +173,11 @@ void Engine::run_prefill_rank(Rank &rk) {
             const int64_t a = std::max<int64_t>(first_of(i), sl.vt) - sl.vt, e = end_of(i) - sl.vt;
             if (e <= a) continue;
             const size_t o = (size_t(stage_off[i]) + size_t(a)) * HEAD_DIM;
-            CK(pcie::copy_async(sl.Kh[qi] + size_t(a) * HEAD_DIM, rk.stage_k + o, size_t(e - a) * HEAD_DIM * 2,
-                                hipMemcpyDeviceToHost, rk.s3));
-            CK(pcie::copy_async(sl.Vh[qi] + size_t(a) * HEAD_DIM, rk.stage_v + o, size_t(e - a) * HEAD_DIM * 2,
-                                hipMemcpyDeviceToHost, rk.s3));
+            const size_t bytes = size_t(e - a) * HEAD_DIM * 2;
+            CK(pcie::copy_async_as(pcie::SpillStageOut, r, sl.Kh[qi] + size_t(a) * HEAD_DIM, rk.stage_k + o, bytes,
+                                   hipMemcpyDeviceToHost, rk.s3));
+            CK(pcie::copy_async_as(pcie::SpillStageOut, r, sl.Vh[qi] + size_t(a) * HEAD_DIM, rk.stage_v + o, bytes,
+                                   hipMemcpyDeviceToHost, rk.s3));
         }
         CK(hipEventRecord(rk.stage_free, rk.s3));
     };

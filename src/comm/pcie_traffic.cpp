@@ -64,4 +64,9 @@ hipError_t copy_async(void *dst, const void *src, size_t bytes, hipMemcpyKind ki
     return hipMemcpyAsync(dst, src, bytes, kind, s);
 }
 
+hipError_t copy_async_as(Kind as, int r, void *dst, const void *src, size_t bytes, hipMemcpyKind kind, hipStream_t s) {
+    add(r, as, bytes);
+    return hipMemcpyAsync(dst, src, bytes, kind, s);
+}
+
 }  // namespace qw::pcie

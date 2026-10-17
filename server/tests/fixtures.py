@@ -75,7 +75,7 @@ class FakeEngine:
         return [(0, 0)] * 4
 
     def pcie_bytes(self):
-        return [(0, 0, 0, 0, 0)] * 4
+        return [(0,) * 8] * 4
 
     def failure(self):
         return self.failed_with

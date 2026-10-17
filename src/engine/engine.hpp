@@ -317,6 +317,7 @@ private:
     void rank_loop(int r);
     void run_prefill_rank(Rank &rk);
     void run_decode_rank(Rank &rk);
+    void count_spill_writes(const Rank &rk, int M, int layers) const;
     void run_mtp_rank(Rank &rk);
     void run_draft_rank(Rank &rk);
     void run_vision_rank(Rank &rk);

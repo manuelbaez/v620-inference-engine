@@ -62,9 +62,10 @@ int qw_get_slot_timing(qw_handle *h, int slot, qw_slot_timing *out);
 // Routed-expert work per card since the start: out[2 * r] the (token, expert) pairs card r computed in prefill,
 // out[2 * r + 1] in decode (4 cards: 8 values). Uneven counts mean the cards wait for the busiest one.
 int qw_get_moe_use(qw_handle *h, unsigned long long *out);
-// PCIe bytes per card since the start, as counted by the engine (the cards have no byte counters): out[5 * r + k],
-// k = 0 host -> GPU copies, 1 GPU -> host copies, 2 from the peers (collectives), 3 to the peers, 4 spilled KV rows
-// decode read from host memory (4 cards: 20 values).
+// PCIe bytes per card since the start, as counted by the engine (the cards have no byte counters): out[8 * r + k],
+// k = 0 host -> GPU copies, 1 GPU -> host copies, 2 from the peers (collectives), 3 to the peers, then the spilled
+// KV's traffic with host memory: 4 rows decode read, 5 rows decode and prefill wrote, 6 the prefill staging's copies
+// in, 7 its copies back (4 cards: 32 values; 0-3 do not include 4-7).
 int qw_get_pcie_bytes(qw_handle *h, unsigned long long *out);
 // With QW_MOE_STATS (=quiet in a server): expert tiles since the start, summed over the prefill passes' micro-batches
 // and layers: out[0] the busiest card's, out[1] the cards' mean, out[2] the busiest card's had the experts not been

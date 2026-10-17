@@ -277,7 +277,7 @@ int qw_get_pcie_bytes(qw_handle *h, unsigned long long *out) {
     return guarded(
         h,
         [&] {
-            static_assert(qw::pcie::KINDS == 5, "capi.h documents 5 values per card");
+            static_assert(qw::pcie::KINDS == 8, "capi.h documents 8 values per card");
             const auto b = h->engine->pcie_bytes();
             for (int r = 0; r < qw::cfg::RANKS; ++r)
                 for (int k = 0; k < qw::pcie::KINDS; ++k) out[qw::pcie::KINDS * r + k] = b[size_t(r)][size_t(k)];

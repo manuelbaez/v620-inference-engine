@@ -41,7 +41,7 @@ function draw(canvas) {
   for (let i = 0; i <= 4; i++) {
     const y = T + ph * i / 4;
     g.beginPath(); g.moveTo(L, y); g.lineTo(w - R, y); g.stroke();
-    g.fillText((ymax * (1 - i / 4)).toFixed(whole ? 0 : 1), 4, y + 4);
+    g.fillText((ymax * (1 - i / 4)).toFixed(whole ? 0 : ymax < 1 ? 2 : 1), 4, y + 4);
   }
   g.fillText(`-${Math.round(windowS / 60)} min`, L, h - 4);
   g.fillText("now", w - R - 22, h - 4);

@@ -61,19 +61,26 @@ function renderCharts(d) {
     {key: "kv_pct", color: "--accent", label: "KV used", fmt: v => v.toFixed(1) + "%"}], win, 10);
   lineChart($("chart-pcie"), h, PCIE_COLORS.map((color, r) =>
     ({key: "pcie" + r, color, label: "GPU " + r, fmt: fmt.gbps})), win, 1);
-  lineChart($("chart-spill"), h, PCIE_COLORS.map((color, r) =>
-    ({key: "spill" + r, color, label: "GPU " + r, fmt: v => v.toFixed(1) + " MB/s"})), win, 10);
+  lineChart($("chart-spill"), h, [
+    {key: "kv_total", color: "--accent", label: "total", fmt: fmt.gbps},
+    {key: "kv_read", color: "--accent2", label: "decode reads", fmt: fmt.gbps},
+    {key: "kv_write", color: "--ok", label: "writes", fmt: fmt.gbps},
+    {key: "kv_stage_in", color: "--violet", label: "prefill staging in", fmt: fmt.gbps},
+    {key: "kv_stage_out", color: "--warn", label: "prefill staging back", fmt: fmt.gbps}], win, 0.1);
 }
 
 const PCIE_COLORS = ["--accent", "--accent2", "--ok", "--violet"];  // one per card, distinct in both themes
 
-// Per card over the last sample: in (host copies, peers, spilled KV reads) and out (host copies, peers).
+// Per card over the last sample: in (host copies, peers, spilled KV) and out (host copies, peers, spilled KV).
 function pcieLines(pcie) {
-  return (pcie || []).map(([h2d, d2h, fromPeers, toPeers, spill], r) => ui.line(`GPU ${r} PCIe (last 5 s)`,
-    `in ${fmt.gbps(h2d + fromPeers + spill)} (host ${fmt.gbps(h2d)}, peers ${fmt.gbps(fromPeers)}, ` +
-    `spilled KV ${fmt.gbps(spill)}) · ` +
-    `out ${fmt.gbps(d2h + toPeers)} (host ${fmt.gbps(d2h)}, peers ${fmt.gbps(toPeers)})`)
-  ).join("");
+  return (pcie || []).map(([h2d, d2h, fromPeers, toPeers, kvRead = 0, kvWrite = 0, stageIn = 0, stageOut = 0], r) => {
+    const kvIn = kvRead + stageIn, kvOut = kvWrite + stageOut;
+    return ui.line(`GPU ${r} PCIe (last 5 s)`,
+      `in ${fmt.gbps(h2d + fromPeers + kvIn)} (host ${fmt.gbps(h2d)}, peers ${fmt.gbps(fromPeers)}, ` +
+      `spilled KV ${fmt.gbps(kvIn)}) · ` +
+      `out ${fmt.gbps(d2h + toPeers + kvOut)} (host ${fmt.gbps(d2h)}, peers ${fmt.gbps(toPeers)}, ` +
+      `spilled KV ${fmt.gbps(kvOut)})`);
+  }).join("");
 }
 
 function renderSlots(m) {

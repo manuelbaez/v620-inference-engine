@@ -7,7 +7,8 @@ import json
 assert array.array("i").itemsize == 4  # the C API takes int32 token ids
 
 # qw_get_pcie_bytes's values per card, in order
-PCIE_KINDS = ("host_to_gpu", "gpu_to_host", "from_peers", "to_peers", "spill_read")
+PCIE_KINDS = ("host_to_gpu", "gpu_to_host", "from_peers", "to_peers", "spill_read", "spill_write", "spill_stage_in",
+              "spill_stage_out")
 
 
 class Tokens(list):
@@ -304,7 +305,8 @@ class Engine:
 
     def pcie_bytes(self):
         """PCIe bytes per card since the start, counted by the engine: for each of the 4 cards, a tuple of
-        PCIE_KINDS (host -> GPU and GPU -> host copies, from and to the peers, spilled KV read from host RAM)."""
+        PCIE_KINDS (host -> GPU and GPU -> host copies, from and to the peers, spilled KV: decode's reads, the rows
+        written to host RAM, the prefill staging's copies in and back)."""
         u = (ctypes.c_ulonglong * (4 * len(PCIE_KINDS)))()
         self._check(self.lib.qw_get_pcie_bytes(self.h, u))
         n = len(PCIE_KINDS)

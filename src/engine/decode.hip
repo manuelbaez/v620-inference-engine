@@ -208,6 +208,16 @@ struct DecodeTrace {
 DecodeTrace g_dtrace;
 }  // namespace
 
+// The K and V rows a step's kernels write into spilled parts: `layers` per row at a spilled position (PCIe count).
+void Engine::count_spill_writes(const Rank &rk, int M, int layers) const {
+    uint64_t rows = 0;
+    for (int i = 0; i < M; ++i) {
+        const Rank::Slot &sl = rk.slots[size_t(djob_.i32[size_t(i)])];
+        rows += !sl.Kh.empty() && djob_.pos[size_t(i)] >= sl.vt;
+    }
+    if (rows) pcie::add(rk.r, pcie::SpillWrite, rows * uint64_t(layers) * SpillPool::token_bytes());
+}
+
 void Engine::run_decode_rank(Rank &rk) {
     const int r = rk.r, M = djob_.M;
     hipStream_t s = rk.s;
@@ -229,6 +239,7 @@ void Engine::run_decode_rank(Rank &rk) {
     CK(pcie::copy_async(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
     CK(pcie::copy_async(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
     CK(pcie::copy_async(b.ple_e, b.h_ple, size_t(M) * H * 2, hipMemcpyHostToDevice, s));
+    count_spill_writes(rk, M, N_QSA);
     comm_->set_base(r, rk.seq_base, s);
     const int kind = djob_.save ? 1 : 0;
     auto &g = rk.graphs[size_t(kind)][size_t(M)];
@@ -288,6 +299,7 @@ void Engine::run_mtp_rank(Rank &rk) {
     CK(pcie::copy_async(b.row_pos, b.h_pos, MR * 8, hipMemcpyHostToDevice, s));
     CK(pcie::copy_async(b.emb, b.h_emb, size_t(M) * SH * 4, hipMemcpyHostToDevice, s));
     CK(pcie::copy_async(b.src_ptrs, b.h_src, size_t(M) * sizeof(float *), hipMemcpyHostToDevice, s));
+    count_spill_writes(rk, M, 1);  // the MTP layer's row
     gpu::gather_rows(b.src_ptrs, M, XW, b.m_hid, s);
     comm_->set_base(r, rk.seq_base, s);
     auto &g = rk.graphs[2][size_t(M)];

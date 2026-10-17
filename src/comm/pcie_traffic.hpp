@@ -1,9 +1,10 @@
 // PCIe traffic per card, counted by the engine (docs/DESIGN.md "PCIe traffic per card"). The V620s expose no PCIe
 // byte counters (no pcie_bw on Navi 21, gpu_metrics has only the link speed and width), so the engine counts what it
-// moves: host <-> GPU copies (through copy_async / copy below), the collectives' pushes to and from the peers, and
-// decode's reads of spilled KV rows from host memory (SpillCache misses, added by Engine::pcie_bytes). Not counted:
-// payload-free control words, decode's writes of new rows into spilled slots (~13 KB per row) and spilled rows read
-// without the spill cache.
+// moves: host <-> GPU copies (through copy_async / copy below), the collectives' pushes to and from the peers, and the
+// spilled KV's traffic with host memory by kind: decode's reads (SpillCache misses and fills, added by
+// Engine::pcie_bytes), the KV rows decode and prefill write there (SpillWrite), and the prefill staging's copies in and
+// back (SpillStageIn / SpillStageOut, not in HostToGpu / GpuToHost). Not counted: payload-free control words, spilled
+// rows read without the spill cache, and the attention reads of a prefill segment that is not staged.
 //
 // Counting is per rank. Copies find their rank from the current HIP device. Work recorded into a HIP graph counts into
 // the tally of the capture (Capture below), and the graph's launcher adds that tally on every replay.
@@ -19,7 +20,7 @@
 
 namespace qw::pcie {
 
-enum Kind { HostToGpu, GpuToHost, PeerIn, PeerOut, SpillRead, KINDS };
+enum Kind { HostToGpu, GpuToHost, PeerIn, PeerOut, SpillRead, SpillWrite, SpillStageIn, SpillStageOut, KINDS };
 using Bytes = std::array<uint64_t, KINDS>;
 
 // The HIP device of each rank, for the copies (before any copy is counted).
@@ -48,5 +49,7 @@ private:
 // hipMemcpy / hipMemcpyAsync that count host <-> GPU bytes for the current device's rank.
 hipError_t copy(void *dst, const void *src, size_t bytes, hipMemcpyKind kind);
 hipError_t copy_async(void *dst, const void *src, size_t bytes, hipMemcpyKind kind, hipStream_t s);
+// ... counted as `as` instead (rank r).
+hipError_t copy_async_as(Kind as, int r, void *dst, const void *src, size_t bytes, hipMemcpyKind kind, hipStream_t s);
 
 }  // namespace qw::pcie

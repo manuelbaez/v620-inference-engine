@@ -43,6 +43,15 @@ class Metrics:
         return [[round((c - l) / dt / 1e9, 3) for c, l in zip(card, prev)] for card, prev in zip(counts, last[1])]
 
     @staticmethod
+    def _spill_totals(pcie):
+        """All cards together, GB/s: decode's reads of spilled rows, the rows decode and prefill write to host RAM,
+        the prefill staging's copies in and back, and their sum (engine.PCIE_KINDS 4-7)."""
+        out = {k: round(sum(c[i] for c in pcie if len(c) > i), 4)
+               for k, i in (("kv_read", 4), ("kv_write", 5), ("kv_stage_in", 6), ("kv_stage_out", 7))}
+        out["kv_total"] = round(sum(out.values()), 4)
+        return out
+
+    @staticmethod
     def _new_window(t):
         return {"t": t, "prefill": 0, "gen": 0, "prefill_s": 0.0, "gen_s": 0.0}
 
@@ -107,10 +116,10 @@ class Metrics:
             "prompt_demand_tps": round(w["prefill"] / dt, 1), "gen_demand_tps": round(w["gen"] / dt, 1),
             "running": running, "waiting": waiting + prefilling,
             "kv_pct": round(100 * kv_used / max(1, kv_capacity), 1),
-            # both directions per card (GB/s), and the spilled KV decode read from host RAM (MB/s: it is small);
-            # the kinds are in snapshot()["pcie"]
+            # both directions per card (GB/s), and the spilled KV's traffic with host RAM summed over the cards
+            # (GB/s) by kind; the kinds per card are in snapshot()["pcie"]
             **({f"pcie{r}": round(sum(c), 3) for r, c in enumerate(pcie)} if pcie else {}),
-            **({f"spill{r}": round(c[4] * 1000, 1) for r, c in enumerate(pcie)} if pcie else {})})
+            **(self._spill_totals(pcie) if pcie else {})})
         self._win = self._new_window(now)
 
     def idle(self):

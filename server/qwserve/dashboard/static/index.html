@@ -57,9 +57,9 @@
         <div class="legend"><span style="--c:var(--accent)">GPU 0</span><span style="--c:var(--accent2)">GPU 1</span><span style="--c:var(--ok)">GPU 2</span><span style="--c:var(--violet)">GPU 3</span><em>bytes the engine moves, as it counts them (the cards have no counters)</em></div>
       </div>
       <div class="card">
-        <h2>Spilled KV read from host RAM per card (MB/s)</h2>
+        <h2>Spilled KV traffic with host RAM, all cards together (GB/s)</h2>
         <canvas id="chart-spill"></canvas>
-        <div class="legend"><span style="--c:var(--accent)">GPU 0</span><span style="--c:var(--accent2)">GPU 1</span><span style="--c:var(--ok)">GPU 2</span><span style="--c:var(--violet)">GPU 3</span><em>decode's spill-cache misses and the rows copied into the cache, counted by the engine</em></div>
+        <div class="legend"><span style="--c:var(--accent)">total</span><span style="--c:var(--accent2)">decode reads</span><span style="--c:var(--ok)">writes</span><span style="--c:var(--violet)">prefill staging in</span><span style="--c:var(--warn)">prefill staging back</span><em>counted by the engine; decode reads are spill-cache misses and fills; the two cards of a KV head each move the same rows</em></div>
       </div>
     </div>
     <div class="card">

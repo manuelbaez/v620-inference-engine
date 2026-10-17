@@ -98,6 +98,9 @@ int main() {
             CK(pcie::copy(a, host.data(), COPY, hipMemcpyHostToDevice));
             CK(pcie::copy_async(b, a, COPY, hipMemcpyDeviceToDevice, nullptr));
             CK(pcie::copy_async(host.data(), b, COPY / 2, hipMemcpyDeviceToHost, nullptr));
+            // the prefill staging's copies count as their own kind on the rank they are made for
+            CK(pcie::copy_async_as(pcie::SpillStageIn, 2, a, host.data(), COPY / 4, hipMemcpyHostToDevice, nullptr));
+            CK(pcie::copy_async_as(pcie::SpillStageOut, 2, host.data(), a, COPY / 8, hipMemcpyDeviceToHost, nullptr));
             CK(hipDeviceSynchronize());
             CK(hipFree(a));
             CK(hipFree(b));
@@ -106,6 +109,9 @@ int main() {
         check("copies count on the current device's rank, device-to-device not at all",
               d[2][pcie::HostToGpu] == COPY && d[2][pcie::GpuToHost] == COPY / 2 && d[0][pcie::HostToGpu] == 0 &&
                   d[1][pcie::HostToGpu] == 0 && d[3][pcie::HostToGpu] == 0);
+        check("copies made as a kind count as that kind only",
+              d[2][pcie::SpillStageIn] == COPY / 4 && d[2][pcie::SpillStageOut] == COPY / 8 &&
+                  d[0][pcie::SpillStageIn] == 0);
 
         // graphs: an allgather and a copy captured once, launched GRAPH_LAUNCHES times
         start = pcie::totals();
