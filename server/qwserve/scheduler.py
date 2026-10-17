@@ -145,6 +145,14 @@ class Scheduler:
     LOG_INTERVAL = float(os.environ.get("QW_LOG_INTERVAL", "10"))  # seconds between stats lines (0: off)
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
+    # A burst: at least QW_BURST_PROMPTS short prompts prefilling at once (default 4; 0: off). The running requests
+    # then decode for QW_BURST_DECODE_SHARE (default 0.05) of each pass's time, at least one step, and a pass is a
+    # whole prefill chunk even while they decode: the burst's prompts get the GPUs nearly to themselves, and the
+    # requests already answered slow down until it is through. Only short prompts count (SHORT_PASSES passes at
+    # most), so a burst lasts seconds; long prompts prefilling in parallel keep the normal share, and prompts
+    # waiting for a slot do not count (a slot frees only when a running request finishes).
+    BURST_PROMPTS = int(os.environ.get("QW_BURST_PROMPTS", "4"))
+    BURST_DECODE_SHARE = float(os.environ.get("QW_BURST_DECODE_SHARE", "0.05"))
     # A waiting request whose prompt starts like one being prefilled waits until that one is past the shared part,
     # then takes it from the block store (QW_SHARE_WAIT=0: off; QW_SHARE_MIN: the least shared tokens still to prefill
     # that are worth waiting for).
@@ -538,19 +546,32 @@ class Scheduler:
             return
         self.prefilling.append(r)
 
+    def _burst(self):
+        """Enough short prompts prefilling at once to count as a burst (BURST_PROMPTS)."""
+        if self.BURST_PROMPTS <= 0:
+            return False
+        most = self.SHORT_PASSES * self.e.prefill_chunk
+        return sum(1 for r in self.prefilling if r.left <= most and not r.media) >= self.BURST_PROMPTS
+
+    def _decode_share(self):
+        """The share of a prefill pass's time the running requests decode for after it."""
+        return self.BURST_DECODE_SHARE if self._burst() else self.DECODE_SHARE
+
     def _batch(self):
         """The prefills to advance in one engine pass, as [(request, tokens)]. A pass has `room` tokens
-        (QW_PREFILL_PIECE while others decode, else one prefill chunk) and at most MAX_SEGMENTS prompts.
+        (QW_PREFILL_PIECE while others decode, else, or in a burst, one prefill chunk) and at most MAX_SEGMENTS
+        prompts.
         Long prompts (more than SHORT_PASSES passes hold) share a pass in equal pieces, in arrival order, as many
-        as fit, and with KV spill only as many as the engine can stage the spilled KV of: they prefill in parallel. Short prompts go first (whole, or with SHORT_PASSES > 1 a piece when
-        they do not fit the pass), and when long ones are under way they get a
+        as fit, and with KV spill only as many as the engine can stage the spilled KV of: they prefill in parallel. Short prompts go first (whole, or a piece of the
+        next one filling what is left of the pass: its rest goes first in the next), and when long ones are under way they get a
         pass of their own (a short request's first token then waits for a short pass, not for the long
         prompts' pieces), but only every other pass: in the pass after it the long ones go, and short
         prompts that arrived meanwhile join that pass, where LONG_PARALLEL of its prompts and half of its
         tokens stay with the long ones. So short requests never wait behind long prompts and never stop
         them. (Prompts that share a prefix do not get here together: the later one waits at admission,
         _shares_prefill.)"""
-        room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if self.active else self.e.prefill_chunk
+        piece = self.active and not self._burst()  # a burst takes whole chunks even while others decode
+        room = min(self.PREFILL_PIECE, self.e.prefill_chunk) if piece else self.e.prefill_chunk
         full = room  # the pass, before anything is taken from it
         most = self.SHORT_PASSES * room  # a short prompt: this many tokens or fewer still to go
         short = [r for r in self.prefilling if r.left <= most and not r.media]
@@ -574,7 +595,7 @@ class Scheduler:
                     break
                 if r.left <= avail or (not whole and r.left <= full):
                     take = r.left
-                elif r.left > full and avail >= self.PIECE_ALIGN:  # SHORT_PASSES > 1: a piece of a short prompt
+                elif avail >= self.PIECE_ALIGN:  # a piece of it fills the pass; the rest goes first in the next
                     take = avail // self.PIECE_ALIGN * self.PIECE_ALIGN
                 else:
                     break
@@ -734,7 +755,8 @@ class Scheduler:
                 spent = self._prefill()
                 t0 = time.time()
                 self._step()
-                while self.prefilling and self.active and time.time() - t0 < self.DECODE_SHARE * spent:
+                share = self._decode_share()
+                while self.prefilling and self.active and time.time() - t0 < share * spent:
                     self._step()
                 self._observe(time.time() - t_pass - self._observed_s)
             except Exception as ex:  # noqa: BLE001  engine failure: fail everything in flight
