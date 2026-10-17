@@ -50,9 +50,10 @@ model's own `chat_template.jinja` and parses output like production vLLM's
 vLLM's `/tokenize` exactly on the test conversations (`server/tests/test_text.py`).
 
 Requests run concurrently with continuous batching, one per engine slot
-(default slots 262144, 65536, 32768, 32768 tokens; production since 2026-10-09: 8 slots of 512k tokens with KV
-spill, 45056 tokens of each in VRAM and a 960 MB cache of spilled rows, 4096-token prefill chunks). Each slot keeps its
-conversation's state (`--slots` are the tokens each slot keeps in VRAM; with `--kv-spill on` every slot holds up to
+(default slots 262144, 65536, 32768, 32768 tokens; production since 2026-10-17: 16 slots of 262k tokens with KV
+spill, none of it in VRAM (`--slots 0,...`) and a 4,864 MB cache of spilled rows, 4096-token prefill chunks; an
+experiment, before it 16,384 tokens of each in VRAM and a 960 MB cache). Each slot keeps its
+conversation's state (`--slots` are the tokens each slot keeps in VRAM, 0 for none; with `--kv-spill on` every slot holds up to
 `--slot-max-tokens`, default 524288, the part beyond its VRAM tokens in pinned host RAM that the GPUs read directly:
 docs/DESIGN.md "KV spill"; off by default), and a new request goes to the slot holding the longest
 prefix of its prompt; one that fits no free slot waits without holding up

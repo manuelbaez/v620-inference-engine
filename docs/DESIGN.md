@@ -559,8 +559,9 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [~] slots with no VRAM part (2026-10-17): `--slots 0,...` with KV spill puts all of a slot's K and V in
          pinned host RAM (vt 0); the cards keep its compressed keys, raw keys' ring and recurrent state. For KV
          computed in place by another set of GPUs (disaggregated prefill) and for using the slots' VRAM for the
-         spill cache instead. `test_spill` slot 4 compares it bit-exactly with a resident slot (GPU run pending).
-         Production A/B open. See
+         spill cache instead. `test_spill` slot 4: bit-exact against a resident slot (staging on and off).
+         In production since 2026-10-17 03:09 UTC with a 4,864 MB spill cache; idle probes equal to the
+         16,384-token layout, the gain under concurrent long streams not measured yet. See
          "KV spill", "Slots with no VRAM part"
    - [x] PLE n-gram table precision (`core/ple.cpp`: int4, int8 and bf16 layouts, chosen by the
          sidecar's META.json). Against a new fp32 reference with Qwen's original bf16 table
@@ -2058,7 +2059,31 @@ parts can go to the spill cache all slots share (the 2,048-token production expe
 computed elsewhere, e.g. by a second set of GPUs doing the prefill, can be written straight into the slot's host
 part, with only the compressed keys, the raw keys' tail and the recurrent state to copy to the cards (what
 `import_kv`/`import_recurrent` already take). `test_spill` slot 4 (0 + 24,576) checks prefill, appended prefill, decode,
-verification runs, `export_kv` and `slot_copy` both ways bit-exactly against the resident slot (GPU run pending).
+verification runs, `export_kv` and `slot_copy` both ways bit-exactly against the resident slot: all identical,
+with the prefill staging on and off (the batched-prefill hash 287027c10cf4e970 both, as on 2026-10-04).
+
+In production from 2026-10-17 03:09 UTC (`qw-engine:4c57515`): `--slots 0 x 16`, capacity 262,144 each,
+`QW_SPILL_CACHE_MB=4864` (was 960 with 16,384 in VRAM): 111.67 GB of spill pinned, 1.82 GiB of VRAM free per card
+after loading (2.40 before; the check wants 1.6). Idle probes (fresh prompts, 300 generated, nothing else running;
+prefill s / decode tok/s, two runs each):
+
+| layout | 586 | 26,588 | 79,056 |
+|---|---|---|---|
+| 0 in VRAM, 4,864 MB cache | 0.38 / 99.7, 0.39 / 95.9 | 12.49 / 86.1, 11.97 / 94.7 | 37.40 / 85.8, 37.45 / 88.2 |
+| 16,384 in VRAM, 960 MB cache | 0.84 / 90.0, 0.38 / 103.2 | 11.90 / 95.7, 12.51 / 88.7 | 37.78 / 77.8, 38.54 / 102.0 |
+
+Equal within the run-to-run spread of one request (decode varies by ±8 tok/s between identical runs). The layout is
+meant for many long streams at once, where the larger cache should keep more of the spilled rows each step reads;
+that needs the cache's hit rates under real load (`QW_SPILL_CACHE_STATS=1`), not measured yet. Undo:
+`config.yaml.bak-before-zero-1017` and `docker-compose.yaml.bak-before-zero-1017` in llm-backend-amd.
+
+**Page placement decides prefill speed with everything spilled.** The first start of this layout (02:46) came right
+after a dev-box `test_spill` had read its 32 GB n-gram table into the host's page cache: node 0 could not give its
+share without reclaiming, the `auto` policy fell back from bind to preferred, pinning took 480 s instead of 15, and
+65% of the sampled pages landed on the intended node (99.9-100% otherwise). Prefill then ran at 20.3-23.1 s for
+26,588 tokens and 46-60 s for 79,056 (12 and 37.4 s with the pages in place), decode unaffected. The same happened at
+2026-10-16 21:56 (855 s, 70%). A restart once the page cache had aged out placed them again. So: check the "sampled
+pages are on the intended node" line after a start, and do not start production right after a dev-box run.
 
 ## Converted-weights cache (built 2026-10-04; off, waiting for SSDs)
 
