@@ -3224,6 +3224,22 @@ not fit (2026-10-16 23:51): 1,602 MiB free after loading against the 1,638 the c
 it leaves 2.40 GiB. So the long slot costs ~1.2 GiB per card, not the ~0.84 estimated (staging, scoring buffers and
 compressed keys alone); reverted within 20 min. Next time: the exact VRAM of a layout from a dev-box run first.
 
+All slots spilled, the VRAM for the spill cache (2026-10-17, in production): 2,048 tokens of each slot in VRAM and
+`QW_SPILL_CACHE_MB=4096` (was 16,384 and 960) leave 2.17 GiB free after loading. One probe of fresh prompts of 586,
+26,588 and 79,055 tokens, 300 generated each, prefill s / decode tok/s:
+
+| layout | 586 | 26,588 | 79,055 |
+|---|---|---|---|
+| all spilled, 4 GB cache | 0.38 / 85.3, 0.38 / 96.4 | 13.23 / 72.8, 12.91 / 60.9 | 40.90 / 76.1, 36.70 / 93.7 |
+| 16,384 in VRAM, 960 MB | 0.84 / 90.0, 0.38 / 103.2 | 11.90 / 95.7, 12.51 / 88.7 | 37.78 / 77.8, 38.54 / 102.0 |
+
+During the all-spilled probes a user request (14,278 prompt tokens, 3,530 generated) ran too, so their decode is not
+comparable; prefill is the same within the noise. No gain shown, and the layout went back. A clean A/B needs both
+layouts idle. The switch back cost 18 min of downtime: llama-swap was restarted while it was starting the engine,
+its `docker compose run` container (`llm-5800`) outlived it, and the new llama-swap failed every start on the taken
+name (exit status 1 in a second, no engine log) until the container was stopped. After restarting llama-swap, check
+`docker ps` for a leftover `llm-*` container.
+
 ## Looping layers (2026-10-16)
 
 Could running some layers twice (a "looped" transformer) help on weights trained for one pass? The fp32 reference
