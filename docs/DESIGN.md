@@ -1697,7 +1697,23 @@ production (`qw-engine:44f0174` against 6d58a25, the same burst of 16 distinct
 
 The burst now runs at the single-request prefill rate (+20%), the last first
 token 3.8 s sooner, and the requests already answered decode slower while it
-lasts, as intended. Seen in the same data: a burst of 16 prompts of ~15k tokens
+lasts, as intended. The owner then found their decode too low; two more settings, the
+same burst, two runs each (prefill rate / answered requests' decode / all done):
+
+| burst setting | prefill rate | decode | all done |
+|---|---|---|---|
+| none (0.25, 2,048-token pieces; before) | 1,772, 1,716 tok/s | 16.8, 16.1 tok/s | 27.7, 28.7 s |
+| 0.05, whole 4,096 chunks | 2,062, 2,154 | 11.4, 11.9 | 26.4, 25.7 s |
+| 0.15, whole chunks | 1,915, 1,716 | 12.6, 11.8 | 27.5, 29.8 s |
+| 0.10, 2,048-token pieces | 1,784, 1,697 | 11.7, 11.1 | 29.0, 30.4 s |
+
+The decode share does not set the answered requests' speed here: every new
+setting decodes at ~11-12 tok/s, and only the old one, without the filled
+passes, at 16.5. A guess, not measured: filled passes finish more prompts
+early, so more rows decode in each step (longer steps, fewer tokens per
+stream). Kept: 0.05 with whole chunks (the best prefill and the shortest
+burst). Open: a run with `QW_BURST_PROMPTS=0` (filling only) would separate
+the two effects. Seen in the same data: a burst of 16 prompts of ~15k tokens
 (short with `QW_SHORT_PASSES=4`) prefills them one after another, a whole
 pass each, so the first tokens arrive in arrival order; the dashboard's
 "0 running" then was right (nothing had finished prefilling).

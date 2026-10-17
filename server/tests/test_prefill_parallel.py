@@ -2,7 +2,7 @@
 """How a prefill pass is shared (no GPU): long prompts waiting together prefill in parallel, in equal pieces of the
 pass; short prompts go first, whole or a piece filling the pass, and when they are there the long ones keep four of the pass's eight prompts
 and half of its tokens, after a pass of their own; QW_PREFILL_LONG_PARALLEL=0 is the old rule, one long prompt at a time.
-A burst of short prompts gets a smaller decode share while others decode.
+A burst of short prompts takes whole chunks and a smaller decode share while others decode.
 
   python3 server/tests/test_prefill_parallel.py
 """
@@ -102,11 +102,11 @@ def main():
     s.shutdown(1)
 
     # a burst of short prompts arriving together: idle passes are filled with a piece of the next prompt, and
-    # while some of them already decode the pieces are filled too and the decode share drops
+    # while some of them already decode the passes stay whole chunks and the decode share drops
     s, _ = sched([(f"b{i}", 2100) for i in range(16)])
     check("16 x 2,100 with nothing decoding: the pass is filled", shape(s), [("b0", 2100), ("b1", 1792)])
     s.active = [request("decoding", 5)]
-    check("... while one decodes: a filled piece", sum(n for _, n in s._batch()) == 2048, True)
+    check("... while one decodes: still a burst, a whole chunk", shape(s), [("b0", 2100), ("b1", 1792)])
     check("... and the decode share is the burst's", s._decode_share(), s.BURST_DECODE_SHARE)
     s.prefilling = s.prefilling[:3]
     check("3 short prompts left: no burst, at most a piece", sum(n for _, n in s._batch()) <= 2048, True)
