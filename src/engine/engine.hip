@@ -57,7 +57,7 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
             "(or for good); an experiment, not for serving", opt_.prefill_mb);
     QW_CHECK(!opt_.slot_tokens.empty() && opt_.slot_tokens.size() <= size_t(MAX_SLOTS), "1..16 slots");
     static_assert(N_QSA + 1 <= 16, "the spill cache's tags hold a QSA layer in 4 bits");
-    for (int c : opt_.slot_tokens) QW_CHECK(c > 0 && c % 256 == 0, "slot sizes must be positive multiples of 256");
+    for (int c : opt_.slot_tokens) QW_CHECK(c >= 0 && c % 256 == 0, "slot sizes must be multiples of 256 (0: all spilled)");
     const char *off = std::getenv("QW_SPILL");
     const bool spill_off = off && std::atoi(off) == 0;
     if (spill_off) {
@@ -81,9 +81,12 @@ Engine::Engine(const EngineOptions &opt) : opt_(opt) {
         QW_CHECK(opt_.slot_max_tokens >= 0 && opt_.slot_max_tokens % 256 == 0, "slot_max_tokens must be a multiple of 256");
         for (size_t i = named; i < opt_.slot_spill.size(); ++i)
             opt_.slot_spill[i] = std::max(0, opt_.slot_max_tokens - opt_.slot_tokens[i]);
-        for (size_t i = 0; i < opt_.slot_spill.size(); ++i)
+        for (size_t i = 0; i < opt_.slot_spill.size(); ++i) {
             QW_CHECK(int64_t(opt_.slot_tokens[i]) + opt_.slot_spill[i] <= (int64_t(1) << gpu::CACHE_POS_BITS),
                      "a slot's capacity does not fit the spill cache's position field");
+            QW_CHECK(opt_.slot_tokens[i] > 0 || opt_.slot_spill[i] > 0,
+                     "a slot with no VRAM tokens needs a spill (slot_spill or slot_max_tokens; not with QW_SPILL=0)");
+        }
     }
     if (const char *wd = std::getenv("QW_WEIGHT_CACHE_DIR"); wd && opt_.weight_cache_dir.empty()) opt_.weight_cache_dir = wd;
     if (const char *st = std::getenv("QW_SPILL_STAGE")) opt_.spill_stage = std::atoi(st) != 0;

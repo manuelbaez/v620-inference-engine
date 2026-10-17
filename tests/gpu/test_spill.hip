@@ -6,7 +6,8 @@
 //   2. decode steps (one row per slot) and verification-shaped runs (4 rows of one slot) give identical logits;
 //   3. export_kv of ranges inside, across and beyond the boundary gives identical bytes, and import_kv into a
 //      spilled slot reproduces a resident slot's bytes.
-// Slots: 0 resident, 1 spilled at 4096, 2 spilled at 8192, 3 (different content) spilled at 8192; 24576 tokens each.
+// Slots: 0 resident, 1 spilled at 4096, 2 spilled at 8192, 3 (different content) spilled at 8192, 4 all spilled (no
+// VRAM part: vt 0); 24576 tokens each.
 // With the prefill staging of the spill on (the default) and off (QW_SPILL_STAGE=0) the results must be the same.
 // Usage: test_spill [--n 20000]
 #include <algorithm>
@@ -50,8 +51,8 @@ int main(int argc, char **argv) {
         if (std::string(argv[i]) == "--n" && i + 1 < argc) n = std::atoi(argv[++i]);
     try {
         EngineOptions opt;
-        opt.slot_tokens = {24576, 4096, 8192, 8192};
-        opt.slot_spill = {0, 20480, 16384, 16384};
+        opt.slot_tokens = {24576, 4096, 8192, 8192, 0};
+        opt.slot_spill = {0, 20480, 16384, 16384, 24576};
         opt.warmup = false;
         Engine e(opt);
         int fails = 0;
@@ -59,23 +60,26 @@ int main(int argc, char **argv) {
             std::printf("%-62s %s\n", what, ok ? "ok" : "MISMATCH");
             fails += !ok;
         };
-        QW_CHECK(e.slot_capacity(1) == 24576 && e.slot_vram_tokens(1) == 4096, "capacities");
+        QW_CHECK(e.slot_capacity(1) == 24576 && e.slot_vram_tokens(1) == 4096 && e.slot_capacity(4) == 24576 &&
+                     e.slot_vram_tokens(4) == 0,
+                 "capacities");
 
         // ---- 1. prefill
         const auto P = text(n, 1), more = text(777, 2), other = text(10240, 9);
-        std::vector<std::vector<float>> lg(3);
-        for (int s = 0; s < 3; ++s) {
+        std::vector<std::vector<float>> lg(5);
+        for (int s : {0, 1, 2, 4}) {
             e.slot_reset(s);
             e.prefill(s, P);
             lg[size_t(s)] = e.logits();
         }
         check(lg[0] == lg[1], "prefill: slot 1 (spilled at 4096) == resident");
         check(lg[0] == lg[2], "prefill: slot 2 (spilled at 8192) == resident");
-        for (int s = 0; s < 3; ++s) {
+        check(lg[0] == lg[4], "prefill: slot 4 (all spilled) == resident");
+        for (int s : {0, 1, 2, 4}) {
             e.prefill(s, more);
             lg[size_t(s)] = e.logits();
         }
-        check(lg[0] == lg[1] && lg[0] == lg[2], "prefill appended (unaligned start): all three identical");
+        check(lg[0] == lg[1] && lg[0] == lg[2] && lg[0] == lg[4], "prefill appended (unaligned start): all four identical");
         e.slot_reset(3);
         e.prefill(3, other);
 
@@ -83,22 +87,22 @@ int main(int argc, char **argv) {
         int tok = argmax(lg[0].data());
         bool ok = true;
         for (int i = 0; i < 40 && ok; ++i) {
-            const auto &d = e.decode({{0, tok}, {1, tok}, {2, tok}});
-            ok = same(d.data(), d.data() + cfg::VOCAB) && same(d.data(), d.data() + 2 * size_t(cfg::VOCAB));
+            const auto &d = e.decode({{0, tok}, {1, tok}, {2, tok}, {4, tok}});
+            for (int k = 1; k < 4; ++k) ok = ok && same(d.data(), d.data() + size_t(k) * cfg::VOCAB);
             tok = argmax(d.data());
         }
         check(ok, "decode, 40 steps, one row per slot: identical logits");
         ok = true;
         for (int i = 0; i < 6 && ok; ++i) {  // runs of 4 rows of one slot: the speculative verification shape
             std::vector<Engine::Row> rows;
-            for (int sl = 0; sl < 3; ++sl)
+            for (int sl : {0, 1, 2, 4})
                 for (int k = 0; k < 4; ++k) rows.push_back({sl, tok + k});
             const auto &d = e.decode(rows);
             for (int r = 0; r < 4; ++r)
-                for (int sl = 1; sl < 3; ++sl)
-                    ok = ok && same(d.data() + size_t(r) * cfg::VOCAB, d.data() + size_t(r + 4 * sl) * cfg::VOCAB);
+                for (int j = 1; j < 4; ++j)
+                    ok = ok && same(d.data() + size_t(r) * cfg::VOCAB, d.data() + size_t(r + 4 * j) * cfg::VOCAB);
             tok = argmax(d.data() + 3 * size_t(cfg::VOCAB));
-            for (int sl = 0; sl < 3; ++sl) e.accept(sl, 2);  // roll two rows back: the next run rewrites those positions
+            for (int sl : {0, 1, 2, 4}) e.accept(sl, 2);  // roll two rows back: the next run rewrites those positions
         }
         check(ok, "decode, runs of 4 rows: identical logits");
 
@@ -141,8 +145,8 @@ int main(int argc, char **argv) {
             check(first && worst < 1.0f, "batched prefill: resident, staged and unstaged spilled slots agree (rounding)");
         }
 
-        // ---- 3. export / import of KV ranges (slot 0 and slot 1 hold the same positions)
-        const int64_t len = std::min(e.slot_len(0), e.slot_len(1));
+        // ---- 3. export / import of KV ranges (slots 0, 1 and 4 hold the same positions; 4 only up to before 2b)
+        const int64_t len = std::min({e.slot_len(0), e.slot_len(1), e.slot_len(4)});
         struct Range {
             int64_t p0, n;
             const char *name;
@@ -161,12 +165,17 @@ int main(int argc, char **argv) {
         };
         for (const Range &r : ranges) {
             QW_CHECK(r.p0 + r.n <= len, "test_spill: --n too small for the export ranges");
-            const auto a = dump(0, r), b = dump(1, r);
-            bool eq = true;
-            for (int k = 0; k < RANKS; ++k) eq = eq && a[size_t(k)] == b[size_t(k)];
+            const auto a = dump(0, r), b = dump(1, r), c = dump(4, r);
+            bool eq = true, eq4 = true;
+            for (int k = 0; k < RANKS; ++k) {
+                eq = eq && a[size_t(k)] == b[size_t(k)];
+                eq4 = eq4 && a[size_t(k)] == c[size_t(k)];
+            }
             char what[96];
             std::snprintf(what, sizeof what, "export_kv %s: spilled slot == resident", r.name);
             check(eq, what);
+            std::snprintf(what, sizeof what, "export_kv %s: all-spilled slot == resident", r.name);
+            check(eq4, what);
         }
         {  // import slot 0's blocks into slot 3 (other content, spilled at 8192) and read them back
             const Range r{6144, 4096, "[6144,10240)"};
@@ -229,6 +238,29 @@ int main(int argc, char **argv) {
             const std::vector<float> l3 = e.logits();
             e.prefill(0, more2);
             check(l3 == e.logits(), "... and a prefill appended to both: identical logits");
+            // slot 0 (resident) into slot 4 (all spilled): VRAM to host only; then slot 4 into slot 2 (spilled at
+            // 8192): host to VRAM below 8192, host to host above
+            e.slot_copy(4, 0);
+            eq = true;
+            for (int i = 0; i < 12 && eq; ++i) {
+                const auto &d = e.decode({{0, t}, {4, t}});
+                eq = same(d.data(), d.data() + cfg::VOCAB);
+                t = argmax(d.data());
+            }
+            check(eq, "slot_copy resident -> all spilled: 12 decode steps identical");
+            e.slot_copy(2, 4);
+            eq = true;
+            for (int i = 0; i < 12 && eq; ++i) {
+                const auto &d = e.decode({{4, t}, {2, t}});
+                eq = same(d.data(), d.data() + cfg::VOCAB);
+                t = argmax(d.data());
+            }
+            check(eq, "slot_copy all spilled -> spilled(8192): 12 decode steps identical");
+            const auto more3 = text(900, 13);
+            e.prefill(4, more3);
+            const std::vector<float> l4 = e.logits();
+            e.prefill(2, more3);
+            check(l4 == e.logits(), "... and a prefill appended to both: identical logits");
         }
         std::printf("%s\n", fails ? "FAILED" : "all spill checks passed");
         return fails ? 1 : 0;

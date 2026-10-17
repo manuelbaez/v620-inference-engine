@@ -101,8 +101,8 @@ void alloc_slots(Rank &rk, const EngineOptions &opt, const SpillPool *spill, boo
         if (mtp) sl.hist = zeros<float>(size_t(gpu::MTP_HIST) * XW);
         sl.pen = zeros<int32_t>(size_t(2) * VOCAB_L);
         for (int i = 0; i < N_QSA + int(mtp); ++i) {
-            sl.K.push_back(zeros<uint16_t>(cap * HEAD_DIM));
-            sl.V.push_back(zeros<uint16_t>(cap * HEAD_DIM));
+            sl.K.push_back(cap ? zeros<uint16_t>(cap * HEAD_DIM) : nullptr);  // vt 0: every row in the host part
+            sl.V.push_back(cap ? zeros<uint16_t>(cap * HEAD_DIM) : nullptr);
             sl.ck.push_back(zeros<uint16_t>(logical / IDX_RATIO * IDX_DIM + IDX_DIM));
             sl.raw_k.push_back(zeros<float>(size_t(raw_ring_rows(opt)) * IDX_DIM));
         }

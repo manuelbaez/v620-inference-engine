@@ -556,6 +556,12 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
    - [~] converted-weights cache: built 2026-10-04, off (`--weight-cache-dir`); a card's weights load in 7-13 s from
          the page cache against 48 s, but 340 s cold from the HDD pool. To enable when the model storage is on SSDs.
          See "Converted-weights cache"
+   - [~] slots with no VRAM part (2026-10-17): `--slots 0,...` with KV spill puts all of a slot's K and V in
+         pinned host RAM (vt 0); the cards keep its compressed keys, raw keys' ring and recurrent state. For KV
+         computed in place by another set of GPUs (disaggregated prefill) and for using the slots' VRAM for the
+         spill cache instead. `test_spill` slot 4 compares it bit-exactly with a resident slot (GPU run pending).
+         Production A/B open. See
+         "KV spill", "Slots with no VRAM part"
    - [x] PLE n-gram table precision (`core/ple.cpp`: int4, int8 and bf16 layouts, chosen by the
          sidecar's META.json). Against a new fp32 reference with Qwen's original bf16 table
          (4,000 tokens): engine with the int4 table 0.065 mean |dlogprob| / 96.8% top-1, int8
@@ -2041,6 +2047,18 @@ that touches spill overwrites it, so with interleaved prefill (long prompts go i
 decoders start cold after each piece, and the handover needs its own invalidation and bit-exact tests with prefill and
 decode alternating. Under mixed load it would do worse than the two separate buffers. The simpler lever when VRAM is
 short is `QW_SPILL_CACHE_MB=128` (85% hits).
+
+**Slots with no VRAM part (2026-10-17).** `slot_tokens` may be 0 when the slot spills (`slot_spill` or
+`slot_max_tokens` gives it a capacity): `vt` is then 0, every K and V row goes through the host branch of `kv_row`,
+and the VRAM K/V arrays are not allocated. Nothing else changed: the kernels, the prefill staging (`end - vt`
+positions), `export_kv`/`import_kv` (`copy_split_*`), `slot_copy` and the slot choice already worked with any split
+point. What stays on the cards per slot: the compressed keys for the whole capacity (0.83 KB per token, 218 MB for
+262,144), the raw keys' ring, the GDN and PLE states and the MTP history. Why: (1) the VRAM of the slots' resident
+parts can go to the spill cache all slots share (the 2,048-token production experiment in "The FP4 checkpoint", now without the 2,048); (2) KV
+computed elsewhere, e.g. by a second set of GPUs doing the prefill, can be written straight into the slot's host
+part, with only the compressed keys, the raw keys' tail and the recurrent state to copy to the cards (what
+`import_kv`/`import_recurrent` already take). `test_spill` slot 4 (0 + 24,576) checks prefill, appended prefill, decode,
+verification runs, `export_kv` and `slot_copy` both ways bit-exactly against the resident slot (GPU run pending).
 
 ## Converted-weights cache (built 2026-10-04; off, waiting for SSDs)
 

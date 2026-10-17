@@ -42,7 +42,8 @@ struct EngineOptions {
     std::string model_dir = std::getenv("QW_MODEL_DIR") ? std::getenv("QW_MODEL_DIR") : "/mnt/llms/qwen3.8-flash-next-awq";
     std::string ple_dir = "/mnt/llms/qwen3.8-flash-next-ple/ples_int4";
     std::array<int, RANKS> devices{0, 1, 2, 3};
-    // KV tokens of each sequence slot held in VRAM; multiples of 256.
+    // KV tokens of each sequence slot held in VRAM; multiples of 256. 0: all of the slot's K and V in pinned host
+    // memory (slot_spill or slot_max_tokens gives it its capacity), e.g. for KV computed elsewhere and imported.
     std::vector<int> slot_tokens{262144, 65536, 32768, 32768};
     // Tokens a slot holds beyond its VRAM, in pinned host memory the kernels read directly (multiples of 256; empty or
     // 0: none). A slot's capacity is slot_tokens + slot_spill; the compressed keys stay in VRAM for all of it.
