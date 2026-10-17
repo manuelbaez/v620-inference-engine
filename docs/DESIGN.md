@@ -531,10 +531,10 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 8. **CacheBlend experiment.** Done: rejected on quality (see above); exact
    block-level reuse shipped instead.
 9. **Performance, next** (details and estimates in "Next steps" below):
-   - [~] bursts of short prompts (2026-10-17): whole chunks and a 0.05 decode share while 4+ short prompts
+   - [x] bursts of short prompts (2026-10-17): whole chunks and a 0.05 decode share while 4+ short prompts
          prefill, and passes filled with a piece of the next short prompt (`QW_BURST_PROMPTS`,
-         `QW_BURST_DECODE_SHARE`); scheduler tests pass, production measurement pending. See "Interleaved
-         prefill"
+         `QW_BURST_DECODE_SHARE`); in production since 04:52 UTC: 16 x 2.6k prompts 1,740 -> 2,110 tok/s,
+         last first token 23.6 -> 19.8 s. See "Interleaved prefill"
    - [~] int8 dense weights: built (+16% decode), fails the quality gate; opt-in `QW_INT8_DENSE=1`
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [x] fewer, bigger decode kernels: tried (SwiGLU into down GEMV, ring into scan, shared-expert graph branch), no gain; see Next steps 1
@@ -1686,9 +1686,18 @@ passes are whole chunks even while others decode; only short prompts count
 and prompts waiting for a slot do not (a slot frees only when a running
 request finishes). And a short prompt that does not fit what is left of a
 pass takes a piece of it (its rest goes first in the next pass): with
-nothing decoding a 4,096-token pass held one 2,100-token prompt. Expected:
-the burst's last first token ~3-5 s sooner, the answered requests a few
-tok/s meanwhile. Seen in the same data: a burst of 16 prompts of ~15k tokens
+nothing decoding a 4,096-token pass held one 2,100-token prompt. Measured in
+production (`qw-engine:44f0174` against 6d58a25, the same burst of 16 distinct
+~2,600-token prompts, 128 generated, nothing else running, two runs each):
+
+| | last first token | median first token | prompt tokens / last first token | answered requests' decode |
+|---|---|---|---|---|
+| before | 23.20, 24.08 s | 11.68, 13.20 s | 1,772, 1,716 tok/s | 16.8, 16.1 tok/s |
+| after | 20.18, 19.46 s | 10.96, 11.07 s | 2,062, 2,154 tok/s | 11.4, 11.9 tok/s |
+
+The burst now runs at the single-request prefill rate (+20%), the last first
+token 3.8 s sooner, and the requests already answered decode slower while it
+lasts, as intended. Seen in the same data: a burst of 16 prompts of ~15k tokens
 (short with `QW_SHORT_PASSES=4`) prefills them one after another, a whole
 pass each, so the first tokens arrive in arrival order; the dashboard's
 "0 running" then was right (nothing had finished prefilling).
