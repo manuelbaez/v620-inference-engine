@@ -3219,6 +3219,11 @@ directory mounted, `QW_EXPERT_PERM` off (AWQ's placement). The prefix cache stay
 restarted the engine in a loop for ~1 h. Back to AWQ: `config.yaml.bak-before-fp4-1016`,
 `docker-compose.yaml.bak-before-fp4-1016`, image `qw-engine:278fa01`.
 
+One slot of 524,288 tokens (`QW_SLOT_SPILL=508928`, the others 262,144) with 15,360 tokens of each slot in VRAM did
+not fit (2026-10-16 23:51): 1,602 MiB free after loading against the 1,638 the check wants, where 16 x 16,384 without
+it leaves 2.40 GiB. So the long slot costs ~1.2 GiB per card, not the ~0.84 estimated (staging, scoring buffers and
+compressed keys alone); reverted within 20 min. Next time: the exact VRAM of a layout from a dev-box run first.
+
 ## Looping layers (2026-10-16)
 
 Could running some layers twice (a "looped" transformer) help on weights trained for one pass? The fp32 reference
