@@ -146,13 +146,13 @@ class Scheduler:
     PREFILL_PIECE = int(os.environ.get("QW_PREFILL_PIECE", "2048"))
     DECODE_SHARE = float(os.environ.get("QW_DECODE_SHARE", "0.25"))
     # A burst: at least QW_BURST_PROMPTS short prompts prefilling at once (default 4; 0: off). The running requests
-    # then decode for QW_BURST_DECODE_SHARE (default 0.05) of each pass's time, at least one step, and a pass is a
-    # whole prefill chunk even while they decode: the burst's prompts get the GPUs nearly to themselves, and the
+    # then decode for QW_BURST_DECODE_SHARE (default 0.15; 0.05 left them ~12 tok/s) of each pass's time, at least
+    # one step, and a pass is a whole prefill chunk even while they decode: the burst's prompts get most of the GPUs, and the
     # requests already answered slow down until it is through. Only short prompts count (SHORT_PASSES passes at
     # most), so a burst lasts seconds; long prompts prefilling in parallel keep the normal share, and prompts
     # waiting for a slot do not count (a slot frees only when a running request finishes).
     BURST_PROMPTS = int(os.environ.get("QW_BURST_PROMPTS", "4"))
-    BURST_DECODE_SHARE = float(os.environ.get("QW_BURST_DECODE_SHARE", "0.05"))
+    BURST_DECODE_SHARE = float(os.environ.get("QW_BURST_DECODE_SHARE", "0.15"))
     # A waiting request whose prompt starts like one being prefilled waits until that one is past the shared part,
     # then takes it from the block store (QW_SHARE_WAIT=0: off; QW_SHARE_MIN: the least shared tokens still to prefill
     # that are worth waiting for).
