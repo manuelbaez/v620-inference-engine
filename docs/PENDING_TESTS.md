@@ -42,3 +42,22 @@ the table is page cache (`ulimit -l` 8 MB, "mlock refused"), production locks it
 
 A standing pinned reserve that refills only while the engine is idle (the Session knows); the QSA attention kernel (20.7%
 of GPU time at 60k of context); the SSD for the disk tier.
+
+## The spilled KV's PCIe counters (2026-10-17): `test_spill` and `test_pcie_traffic`
+
+Built (commits 79ba602, 6d58a25) and in production since 2026-10-17 04:24 UTC, never run on the GPUs: the dev
+container llm-experiments was stopped by a power outage. Run on the dev box (4 GPUs, a window; production unloaded):
+`build/test_spill` and `QW_SPILL_STAGE=0 build/test_spill` (section 5: a 1,000-token prompt into the all-spilled slot
+must count 12-13 x 500,500 rows of prefill direct reads without staging, 0 with it; everything else must stay
+bit-identical, batched-prefill hash 287027c10cf4e970), and `build/test_pcie_traffic` (the new copy kinds count as
+themselves only). If section 5 fails by a factor near 499,500 / 500,500, the dense lists exclude the query's own
+position: fix the expected count, not the counter. Use the production checkpoint for it
+(`QW_MODEL_DIR=QW_PLE_DIR=/mnt/llms/qwen3.8-flash-next-fp4 QW_DENSE_FP8=1 QW_F4_PACKED=1`): another checkpoint's 32 GB
+table fills the host's page cache and the next production start places its spill pages badly (65%, prefill -45%).
+
+## Many long streams on the all-in-RAM layout (2026-10-17)
+
+Production runs `--slots 0 x 16` with `QW_SPILL_CACHE_MB=4864` (DESIGN "Slots with no VRAM part"); idle single
+requests equal the 16,384-in-VRAM layout. Not measured: 8-16 streams decoding at 50-200k of context, where the larger
+cache should pay. Run with `QW_SPILL_CACHE_STATS=1` (hit rates) on both layouts and compare decode tok/s and the
+dashboard's summed spilled-KV reads.
