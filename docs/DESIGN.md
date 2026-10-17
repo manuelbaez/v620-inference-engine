@@ -533,8 +533,8 @@ requests: 223 tok/s aggregate vs 180-207 with 16-row steps.
 9. **Performance, next** (details and estimates in "Next steps" below):
    - [x] bursts of short prompts (2026-10-17): whole chunks and a 0.05 decode share while 4+ short prompts
          prefill, and passes filled with a piece of the next short prompt (`QW_BURST_PROMPTS`,
-         `QW_BURST_DECODE_SHARE`); in production since 04:52 UTC: 16 x 2.6k prompts 1,740 -> 2,110 tok/s,
-         last first token 23.6 -> 19.8 s. See "Interleaved prefill"
+         `QW_BURST_DECODE_SHARE`); in production (561198a): 16 x 2.6k prompts 1,745 -> ~1,990 tok/s (+13%,
+         four runs), the answered requests 16.5 -> ~11 tok/s meanwhile. See "Interleaved prefill"
    - [~] int8 dense weights: built (+16% decode), fails the quality gate; opt-in `QW_INT8_DENSE=1`
    - [x] collectives: one kernel per small collective (small gain; see Next steps 2)
    - [x] fewer, bigger decode kernels: tried (SwiGLU into down GEMV, ring into scan, shared-expert graph branch), no gain; see Next steps 1
@@ -1712,7 +1712,11 @@ setting decodes at ~11-12 tok/s, and only the old one, without the filled
 passes, at 16.5. A guess, not measured: filled passes finish more prompts
 early, so more rows decode in each step (longer steps, fewer tokens per
 stream). Kept: 0.05 with whole chunks (the best prefill and the shortest
-burst). Open: a run with `QW_BURST_PROMPTS=0` (filling only) would separate
+burst), in production again since 13:54 UTC (`qw-engine:561198a`); two more
+runs of it there, nothing else running: 1,800 and 1,957 tok/s, last first token
+23.3 and 21.1 s, decode 10.7 and 10.9 tok/s. Over its four runs it is ~1,990
+tok/s against ~1,745 before: +13% (the first two runs' +20% was partly the
+spread between runs, about +-8%). Open: a run with `QW_BURST_PROMPTS=0` (filling only) would separate
 the two effects. Seen in the same data: a burst of 16 prompts of ~15k tokens
 (short with `QW_SHORT_PASSES=4`) prefills them one after another, a whole
 pass each, so the first tokens arrive in arrival order; the dashboard's
