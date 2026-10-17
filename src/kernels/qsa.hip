@@ -153,6 +153,25 @@ void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, 
                                                                        reinterpret_cast<__half *>(out));
 }
 
+// One block per query: its list's entries at positions >= vt (host rows the attention reads) added to *total.
+__global__ __launch_bounds__(256) void qsa_count_from_kernel(const int32_t *lists, const int32_t *counts, int32_t vt,
+                                                             unsigned long long *total) {
+    __shared__ unsigned n;
+    if (threadIdx.x == 0) n = 0;
+    __syncthreads();
+    const int q = blockIdx.x, c = counts[q];
+    unsigned mine = 0;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) mine += lists[size_t(q) * LIST_W + i] >= vt;
+    if (mine) atomicAdd(&n, mine);
+    __syncthreads();
+    if (threadIdx.x == 0 && n) atomicAdd(total, (unsigned long long)n);
+}
+
+void qsa_count_from(const int32_t *lists, const int32_t *counts, int Q, int32_t vt, unsigned long long *total,
+                    hipStream_t s) {
+    qsa_count_from_kernel<<<Q, 256, 0, s>>>(lists, counts, vt, total);
+}
+
 // ---- batched decode rows
 __global__ __launch_bounds__(256) void qsa_prep_B_kernel(const float *proj_all, const float *qn, const float *kn,
                                                          const float *iqn, const SlotPtrs *tab, int qi, Rows rows,

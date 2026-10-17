@@ -3127,15 +3127,16 @@ the bytes it moves (`src/comm/pcie_traffic.{hpp,cpp}`), per rank and kind:
   copies: the rows decode writes into spilled parts (12 QSA layers per row at a spilled position, 1 for the MTP draft
   step; counted on the host from the step's positions, the kernels write them over the bus), the rows an unstaged
   prefill segment's kernels write there, and the prefill staging's copies in (each chunk copies the spilled rows its
-  attention can read, per layer) and back (the rows the chunk wrote).
+  attention can read, per layer) and back (the rows the chunk wrote); and the rows the attention of a segment that
+  did not fit the staging buffer reads from host memory directly: a small kernel counts its lists' entries at or
+  beyond vt (1 KiB per entry, K and V) on a counter per micro-batch stream, launched only for such segments.
 
 Decode runs as captured graphs, whose collectives are enqueued once: while a graph is captured its bytes go to a
-tally (`pcie::Capture`), added on every launch. Not counted: spilled rows read without the spill cache, the attention
-reads of a prefill segment that did not fit the staging buffer (it reads host memory directly), control words.
-`Engine::pcie_bytes`, `qw_get_pcie_bytes` (8 kinds per card); the scheduler reads the counts when the dashboard
+tally (`pcie::Capture`), added on every launch. Not counted: spilled rows read without the spill cache (spill cache
+off), control words. `Engine::pcie_bytes`, `qw_get_pcie_bytes` (9 kinds per card); the scheduler reads the counts when the dashboard
 records a sample (every 5 s), and the dashboard charts both directions per card and lists the kinds per card, and
 under the PCIe chart the spilled KV's traffic summed over the four cards by kind (decode reads, writes, staging in,
-staging back, total; the owner asked for the sum, to size other storage for the KV). Both cards of a KV head read
+staging back, prefill's direct reads, total; the owner asked for the sum, to size other storage for the KV). Both cards of a KV head read
 and write the same rows of the one host copy, so the sum is the bus traffic, and twice what a store holding each
 group once would see written. The CLI (`qw_gpu`) prints the bytes of its prompt and decode phases.
 

@@ -165,6 +165,9 @@ struct Rank {
     unsigned moe_use_tick = 0;
     // the spill cache's host_rows, copied with moe_use (Engine::pcie_bytes)
     unsigned long long *host_rows_host = nullptr;
+    // spilled rows prefill's attention read from host memory (segments not staged), one counter per micro-batch
+    // stream (each copied on its own stream, so the host copy never goes back); null without spill
+    unsigned long long *pf_host_rows = nullptr, *pf_host_rows_host = nullptr;
     // export_kv packs a block of up to KV_PACK_TOKENS positions here in the block store's layout, then copies it once
     static constexpr int KV_PACK_TOKENS = 256;
     uint8_t *pack = nullptr;

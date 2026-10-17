@@ -527,6 +527,9 @@ std::array<pcie::Bytes, RANKS> Engine::pcie_bytes() const {
     for (size_t r = 0; r < ranks_.size(); ++r)
         if (const unsigned long long *rows = ranks_[r]->host_rows_host)
             out[r][pcie::SpillRead] += rows[0] * SpillPool::token_bytes();
+    for (size_t r = 0; r < ranks_.size(); ++r)
+        if (const unsigned long long *rows = ranks_[r]->pf_host_rows_host)
+            for (int k = 0; k < Rank::MAX_MB; ++k) out[r][pcie::SpillPrefillRead] += rows[k] * SpillPool::token_bytes();
     return out;
 }
 

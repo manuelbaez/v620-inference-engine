@@ -323,6 +323,11 @@ void Engine::run_prefill_rank(Rank &rk) {
                     }
                     gpu::qsa_attend_T(b.q16 + row * QW, b.qgate + row * QW, sub_kv(sb, qi), b.lists,
                                       b.lcounts, Q, b.att_partial, b.act + row * QW, s);
+                    if (rk.pf_host_rows && stage_off[size_t(sb.seg)] < 0 && !sb.sl->Kh.empty() && p0 + Q > sb.sl->vt) {
+                        unsigned long long *c = rk.pf_host_rows + mb_index(m);
+                        gpu::qsa_count_from(b.lists, b.lcounts, Q, sb.sl->vt, c, s);
+                        CK(hipMemcpyAsync(rk.pf_host_rows_host + mb_index(m), c, 8, hipMemcpyDeviceToHost, s));
+                    }
                 }
             if (staging) CK(hipEventRecord(rk.stage_done[mb_index(m)], s));
             if (calib) cal(m, ln + ".qsa_o", b.act, QH_L * HEAD_DIM, T, QH_L * HEAD_DIM);

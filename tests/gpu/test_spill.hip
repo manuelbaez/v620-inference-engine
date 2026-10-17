@@ -19,6 +19,7 @@
 
 #include "core/common.hpp"
 #include "core/config.hpp"
+#include "comm/pcie_traffic.hpp"
 #include "engine/engine.hpp"
 
 using namespace qw;
@@ -261,6 +262,23 @@ int main(int argc, char **argv) {
             const std::vector<float> l4 = e.logits();
             e.prefill(2, more3);
             check(l4 == e.logits(), "... and a prefill appended to both: identical logits");
+        }
+        // ---- 5. the PCIe count of prefill's direct host reads: a 1,000-token prompt into the all-spilled slot has dense
+        // lists (every query attends to positions 0..itself), so without staging each QSA layer reads 500,500 host
+        // rows, 1 KiB each (the MTP layer adds at most as many again); with staging the segment reads none directly
+        {
+            const auto before = e.pcie_bytes();
+            e.slot_reset(4);
+            e.prefill(4, text(1000, 17));
+            const auto after = e.pcie_bytes();
+            const uint64_t per_layer = 500500ull * 1024, got = after[0][pcie::SpillPrefillRead] - before[0][pcie::SpillPrefillRead];
+            std::printf("prefill direct reads, rank 0: %llu bytes = %.3f x %llu (one layer's)\n", (unsigned long long)got,
+                        double(got) / double(per_layer), (unsigned long long)per_layer);
+            if (e.spill_stage_tokens() == 0)
+                check(got >= uint64_t(cfg::N_QSA) * per_layer && got <= uint64_t(cfg::N_QSA + 1) * per_layer,
+                      "unstaged prefill: direct host reads counted exactly per layer");
+            else
+                check(got == 0, "staged prefill: no direct host reads counted");
         }
         std::printf("%s\n", fails ? "FAILED" : "all spill checks passed");
         return fails ? 1 : 0;

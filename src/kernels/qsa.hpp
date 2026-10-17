@@ -38,6 +38,10 @@ void qsa_select_merge_T(const IdxCand *cand_all, int64_t q0, int Q, int32_t *lis
 // Attention for Q queries (q16/gate rows), partial scratch [Q][33][6][258].
 void qsa_attend_T(const uint16_t *q16, const uint16_t *gate, const KvSplit &kv, const int32_t *lists,
                   const int32_t *counts, int Q, float *partial, uint16_t *out, hipStream_t s);
+// Adds to *total the entries of Q queries' lists at positions >= vt: the rows qsa_attend_T reads from the host part
+// of a slot that is not staged (PCIe count).
+void qsa_count_from(const int32_t *lists, const int32_t *counts, int Q, int32_t vt, unsigned long long *total,
+                    hipStream_t s);
 
 // ---- batched decode rows (layer index qi into SlotPtrs)
 // proj f32 [M][4224]; writes q16 [M][1536], gate f32 [M][1536], iq f32 [M][512],

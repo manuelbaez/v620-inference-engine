@@ -66,15 +66,17 @@ function renderCharts(d) {
     {key: "kv_read", color: "--accent2", label: "decode reads", fmt: fmt.gbps},
     {key: "kv_write", color: "--ok", label: "writes", fmt: fmt.gbps},
     {key: "kv_stage_in", color: "--violet", label: "prefill staging in", fmt: fmt.gbps},
-    {key: "kv_stage_out", color: "--warn", label: "prefill staging back", fmt: fmt.gbps}], win, 0.1);
+    {key: "kv_stage_out", color: "--warn", label: "prefill staging back", fmt: fmt.gbps},
+    {key: "kv_prefill_read", color: "--bad", label: "prefill direct reads", fmt: fmt.gbps}], win, 0.1);
 }
 
 const PCIE_COLORS = ["--accent", "--accent2", "--ok", "--violet"];  // one per card, distinct in both themes
 
 // Per card over the last sample: in (host copies, peers, spilled KV) and out (host copies, peers, spilled KV).
 function pcieLines(pcie) {
-  return (pcie || []).map(([h2d, d2h, fromPeers, toPeers, kvRead = 0, kvWrite = 0, stageIn = 0, stageOut = 0], r) => {
-    const kvIn = kvRead + stageIn, kvOut = kvWrite + stageOut;
+  return (pcie || []).map(([h2d, d2h, fromPeers, toPeers, kvRead = 0, kvWrite = 0, stageIn = 0, stageOut = 0,
+                           pfRead = 0], r) => {
+    const kvIn = kvRead + stageIn + pfRead, kvOut = kvWrite + stageOut;
     return ui.line(`GPU ${r} PCIe (last 5 s)`,
       `in ${fmt.gbps(h2d + fromPeers + kvIn)} (host ${fmt.gbps(h2d)}, peers ${fmt.gbps(fromPeers)}, ` +
       `spilled KV ${fmt.gbps(kvIn)}) · ` +

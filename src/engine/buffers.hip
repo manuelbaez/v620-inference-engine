@@ -312,6 +312,11 @@ void alloc_rank_buffers(Rank &rk, const EngineOptions &opt, const SpillPool *spi
         rk.host_rows_host = pinned<unsigned long long>(1);
         rk.host_rows_host[0] = 0;
     }
+    if (spill) {
+        rk.pf_host_rows = zeros<unsigned long long>(Rank::MAX_MB);
+        rk.pf_host_rows_host = pinned<unsigned long long>(Rank::MAX_MB);
+        for (int k = 0; k < Rank::MAX_MB; ++k) rk.pf_host_rows_host[k] = 0;
+    }
     if (const size_t n = spill_stage_tokens(opt)) {
         rk.stage_tokens = n;
         rk.stage_k = zeros<uint16_t>(n * HEAD_DIM);

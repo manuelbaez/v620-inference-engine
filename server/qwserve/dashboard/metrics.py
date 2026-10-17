@@ -45,9 +45,11 @@ class Metrics:
     @staticmethod
     def _spill_totals(pcie):
         """All cards together, GB/s: decode's reads of spilled rows, the rows decode and prefill write to host RAM,
-        the prefill staging's copies in and back, and their sum (engine.PCIE_KINDS 4-7)."""
+        the prefill staging's copies in and back, prefill's direct reads (segments not staged), and their sum
+        (engine.PCIE_KINDS 4-8)."""
         out = {k: round(sum(c[i] for c in pcie if len(c) > i), 4)
-               for k, i in (("kv_read", 4), ("kv_write", 5), ("kv_stage_in", 6), ("kv_stage_out", 7))}
+               for k, i in (("kv_read", 4), ("kv_write", 5), ("kv_stage_in", 6), ("kv_stage_out", 7),
+                            ("kv_prefill_read", 8))}
         out["kv_total"] = round(sum(out.values()), 4)
         return out
 

@@ -59,7 +59,7 @@
       <div class="card">
         <h2>Spilled KV traffic with host RAM, all cards together (GB/s)</h2>
         <canvas id="chart-spill"></canvas>
-        <div class="legend"><span style="--c:var(--accent)">total</span><span style="--c:var(--accent2)">decode reads</span><span style="--c:var(--ok)">writes</span><span style="--c:var(--violet)">prefill staging in</span><span style="--c:var(--warn)">prefill staging back</span><em>counted by the engine; decode reads are spill-cache misses and fills; the two cards of a KV head each move the same rows</em></div>
+        <div class="legend"><span style="--c:var(--accent)">total</span><span style="--c:var(--accent2)">decode reads</span><span style="--c:var(--ok)">writes</span><span style="--c:var(--violet)">prefill staging in</span><span style="--c:var(--warn)">prefill staging back</span><span style="--c:var(--bad)">prefill direct reads</span><em>counted by the engine; decode reads are spill-cache misses and fills; the two cards of a KV head each move the same rows</em></div>
       </div>
     </div>
     <div class="card">
